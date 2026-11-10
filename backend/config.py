@@ -48,14 +48,8 @@ class Settings(BaseSettings):
     # Reports directory
     REPORTS_DIR: str = os.getenv("REPORTS_DIR", str(BASE_DIR / "reports"))
 
-    # Deprecated: integrations read credentials through backend.integration_config
-    # (Configuration page value, then these environment variables).
-    VIRUSTOTAL_API_KEY: str = os.getenv("VIRUSTOTAL_API_KEY", "")
-    ABUSEIPDB_API_KEY: str = os.getenv("ABUSEIPDB_API_KEY", "")
-    ALIENVAULT_OTX_API_KEY: str = os.getenv("ALIENVAULT_OTX_API_KEY", "")
-    THREATFOX_API_KEY: str = os.getenv("THREATFOX_API_KEY", "")
-    NVD_API_KEY: str = os.getenv("NVD_API_KEY", "")
-    JIRA_WEBHOOK_URL: str = os.getenv("JIRA_WEBHOOK_URL", "")
+    # Integration credentials are not settings here: they are read through
+    # backend.integration_config (Configuration page value, then environment variable).
 
     # CORS: explicit origins from PHANTOM_CORS_ORIGINS, never "*"
     BACKEND_CORS_ORIGINS: List[str] = Field(
