@@ -132,7 +132,7 @@ def test_multi_tip_aggregation_and_sources():
     # 1. Test IP enrichment across 3 TIPs (VirusTotal, AlienVault OTX, AbuseIPDB)
     ip_res = tip_client.enrich_ioc("IP", "198.51.100.45")
     assert ip_res["artifact_type"] == "IP"
-    assert ip_res["providers_queried"] == 3
+    assert len(ip_res["providers"]) == 3  # lab fixture in simulation mode: no live provider contacted
     assert ip_res["virustotal"]["provider"] == "VirusTotal"
     assert ip_res["alienvault_otx"]["provider"] == "AlienVault OTX"
     assert ip_res["abuseipdb"]["provider"] == "AbuseIPDB"
@@ -144,7 +144,7 @@ def test_multi_tip_aggregation_and_sources():
     # 2. Test File Hash enrichment across 3 TIPs (VirusTotal, AlienVault OTX, ThreatFox)
     hash_res = tip_client.enrich_ioc("Hash", "44d88612fea8a8f36de82e1278abb02f")
     assert hash_res["artifact_type"] == "HASH"
-    assert hash_res["providers_queried"] == 3
+    assert len(hash_res["providers"]) == 3
     assert hash_res["threatfox"]["provider"] == "ThreatFox (abuse.ch)"
     assert hash_res["threat_score"] >= 80
 
@@ -168,12 +168,13 @@ def test_nvd_integration_and_hotl_execution():
     cves = nvd_client.extract_cves_from_text("Detected exploit attempt targeting CVE-2024-3094 in sshd process")
     assert "CVE-2024-3094" in cves
 
+    # No NVD key in tests: no live lookup, and no CVSS is invented.
     cve_details = nvd_client.get_vulnerability_details("CVE-2024-3094")
     assert cve_details["cve_id"] == "CVE-2024-3094"
-    assert cve_details["cvss_score"] == 10.0
-    assert cve_details["severity"] == "CRITICAL"
+    assert cve_details["status"] == "not_configured"
+    assert cve_details["cvss_score"] is None
     assert len(cve_details["hitl_remediation"]) >= 2
-    assert cve_details["hotl_action"] == "isolate_endpoint"
+    assert cve_details["hotl_action"] == "none"
 
     # 2. Test Alert NVD vulnerability analysis endpoint
     from backend.database import SessionLocal

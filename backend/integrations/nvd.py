@@ -1,253 +1,260 @@
-import re
+"""NIST NVD (API 2.0) lookups for CVEs that appear in an alert.
+
+CVE identifiers are only ever taken from the alert's own text (rule, logs, payload fields);
+nothing is inferred from keywords or severity. CVSS data comes from a live NVD lookup, which
+needs ``nvd_api_key`` (Configuration page or NVD_API_KEY). Each CVE result has a status:
+
+    live            NVD returned the CVE record
+    not_found       NVD has no record of this CVE id
+    not_configured  no NVD API key is set, so no lookup was made
+    unavailable     the lookup failed (timeout, rate limit, auth failure, bad response)
+
+Only live CVSS data can make an alert eligible for the HOTL isolation recommendation
+(CVSS >= 9.0 with a NETWORK attack vector); the response policy still decides what runs.
+"""
+import json
 import logging
-import httpx
+import re
+import threading
+import time
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
-from backend.config import settings
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+
+from backend import integration_config
 
 logger = logging.getLogger(__name__)
 
+CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
+HOTL_CVSS_THRESHOLD = 9.0
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _pick_metric(metrics: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
+    """Prefer the NVD primary CVSS v3.1 metric, then v4.0, v3.0, v2."""
+    for key, version in (("cvssMetricV31", "3.1"), ("cvssMetricV40", "4.0"), ("cvssMetricV30", "3.0"), ("cvssMetricV2", "2.0")):
+        entries = metrics.get(key) or []
+        if entries:
+            primary = next((m for m in entries if m.get("type") == "Primary"), entries[0])
+            return version, primary
+    return None, {}
+
+
 class NationalVulnerabilityDatabase:
-    """
-    NVD (National Vulnerability Database) Integration Connector:
-    - Queries official NIST NVD API 2.0 (services.nvd.nist.gov/rest/json/cves/2.0)
-    - Extracts CVE indicators from alert payload, rule descriptions, and logs
-    - Evaluates CVSS v3.1 metrics for Human-in-the-Loop (HITL) remediation advice
-    - Evaluates critical severity for Human-out-of-the-Loop (HOTL) automated containment
-    """
+    BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    MAX_CVES_PER_ALERT = 10
 
-    def __init__(self):
-        self.api_key = settings.NVD_API_KEY
-        self.base_url = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    def __init__(self, transport: Optional[httpx.BaseTransport] = None, timeout: float = 8.0, cache_ttl: float = 6 * 3600):
+        self.transport = transport  # tests inject httpx.MockTransport here
+        self.timeout = timeout
+        self.cache_ttl = cache_ttl
+        self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._lock = threading.Lock()
 
-        # Curated Offline/Lab Knowledgebase for resilient deterministic scoring
-        self.cve_knowledgebase = {
-            "CVE-2024-3094": {
-                "cve_id": "CVE-2024-3094",
-                "title": "XZ Utils Malicious Code Injection / SSH Backdoor",
-                "cvss_score": 10.0,
-                "severity": "CRITICAL",
-                "attack_vector": "NETWORK",
-                "cwe": "CWE-506: Embedded Malicious Code",
-                "description": "Malicious code was discovered in the upstream tarballs of xz, starting with version 5.6.0. Through complex obfuscations, the liblzma build process extracts a prebuilt test file, modifying functions in liblzma to intercept OpenSSH authentication.",
-                "hitl_remediation": [
-                    "Downgrade xz-utils / liblzma to version 5.4.x immediately.",
-                    "Audit authorized_keys and all active SSH sessions.",
-                    "Rotate all SSH host keys and administrator credentials."
-                ],
-                "hotl_action": "isolate_endpoint",
-                "hotl_action_description": "Immediately isolate endpoint from network to prevent unauthorized remote root SSH takeover.",
-                "patches": ["https://nvd.nist.gov/vuln/detail/CVE-2024-3094", "Debian Security Advisory DSA-5649-1"]
-            },
-            "CVE-2021-44228": {
-                "cve_id": "CVE-2021-44228",
-                "title": "Apache Log4j2 JNDI Remote Code Execution (Log4Shell)",
-                "cvss_score": 10.0,
-                "severity": "CRITICAL",
-                "attack_vector": "NETWORK",
-                "cwe": "CWE-502: Deserialization of Untrusted Data",
-                "description": "Apache Log4j2 2.0-beta9 through 2.15.0 JNDI features used in configuration, log messages, and parameters do not protect against attacker controlled LDAP and other JNDI related endpoints, allowing unauthenticated RCE.",
-                "hitl_remediation": [
-                    "Upgrade Log4j to >= 2.17.1 or apply log4j2.formatMsgNoLookups=true flag.",
-                    "Block outbound LDAP (389), RMI (1099), and DNS egress to unauthorized external IP addresses.",
-                    "Review application logs for ${jndi:ldap://} and ${jndi:rmi://} artifacts."
-                ],
-                "hotl_action": "block_ip",
-                "hotl_action_description": "Block external LDAP/RMI adversary callback IP at boundary firewall.",
-                "patches": ["https://logging.apache.org/log4j/2.x/security.html"]
-            },
-            "CVE-2023-34362": {
-                "cve_id": "CVE-2023-34362",
-                "title": "Progress MOVEit Transfer SQL Injection Vulnerability",
-                "cvss_score": 9.8,
-                "severity": "CRITICAL",
-                "attack_vector": "NETWORK",
-                "cwe": "CWE-89: SQL Injection",
-                "description": "SQL injection vulnerability in the MOVEit Transfer web application could allow an unauthenticated attacker to gain access to MOVEit Transfer's database and execute arbitrary SQL commands.",
-                "hitl_remediation": [
-                    "Apply the latest vendor cumulative service pack patch.",
-                    "Disable all HTTP/HTTPS inbound traffic to MOVEit transfer until patched.",
-                    "Delete human2.aspx webshell if present in wwwroot."
-                ],
-                "hotl_action": "isolate_endpoint",
-                "hotl_action_description": "Sever host network connectivity to stop active database exfiltration.",
-                "patches": ["https://community.progress.com/s/article/MOVEit-Transfer-Critical-Vulnerability-31-May-2023"]
-            },
-            "CVE-2020-1472": {
-                "cve_id": "CVE-2020-1472",
-                "title": "Microsoft Netlogon Elevation of Privilege (Zerologon)",
-                "cvss_score": 10.0,
-                "severity": "CRITICAL",
-                "attack_vector": "NETWORK",
-                "cwe": "CWE-287: Improper Authentication",
-                "description": "An elevation of privilege vulnerability exists when an attacker establishes a vulnerable Netlogon secure channel connection to a domain controller using the Netlogon Remote Protocol (MS-NRPC).",
-                "hitl_remediation": [
-                    "Deploy Microsoft security update KB4557222 to Domain Controllers.",
-                    "Enforce secure RPC communication with Netlogon (Full Enforcement Mode).",
-                    "Audit event ID 5829 on domain controllers."
-                ],
-                "hotl_action": "isolate_endpoint",
-                "hotl_action_description": "Isolate compromised host to prevent domain controller password reset.",
-                "patches": ["https://msrc.microsoft.com/update-guide/vulnerability/CVE-2020-1472"]
-            }
-        }
+    def clear_cache(self) -> None:
+        with self._lock:
+            self._cache.clear()
 
     def extract_cves_from_text(self, text: str) -> List[str]:
-        """Extract all CVE identifiers matching standard regex CVE-YYYY-NNNN+."""
+        """CVE identifiers in order of first appearance, upper-cased and de-duplicated."""
         if not text:
             return []
-        matches = re.findall(r"CVE-\d{4}-\d{4,7}", text, re.IGNORECASE)
-        return list({m.upper() for m in matches})
+        seen: List[str] = []
+        for match in CVE_RE.findall(text):
+            cve = match.upper()
+            if cve not in seen:
+                seen.append(cve)
+        return seen
 
-    def query_nvd_api(self, cve_id: str) -> Optional[Dict[str, Any]]:
-        """Query official NIST NVD API 2.0 for live CVE metrics and descriptions."""
-        headers = {}
-        if self.api_key:
-            headers["apiKey"] = self.api_key
-
-        try:
-            with httpx.Client(timeout=4.0) as client:
-                resp = client.get(f"{self.base_url}?cveId={cve_id}", headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    vulnerabilities = data.get("vulnerabilities", [])
-                    if vulnerabilities:
-                        cve_item = vulnerabilities[0].get("cve", {})
-                        metrics = cve_item.get("metrics", {})
-                        cvss_v31 = metrics.get("cvssMetricV31", [{}])[0].get("cvssData", {})
-
-                        cvss_score = cvss_v31.get("baseScore", 7.5)
-                        severity = cvss_v31.get("baseSeverity", "HIGH")
-                        attack_vector = cvss_v31.get("attackVector", "NETWORK")
-
-                        descriptions = cve_item.get("descriptions", [])
-                        desc_text = next((d.get("value") for d in descriptions if d.get("lang") == "en"), "")
-
-                        return {
-                            "cve_id": cve_id,
-                            "title": f"NVD Entry {cve_id}",
-                            "cvss_score": cvss_score,
-                            "severity": severity,
-                            "attack_vector": attack_vector,
-                            "description": desc_text,
-                            "hitl_remediation": [
-                                f"Apply vendor security update for {cve_id}.",
-                                "Restrict ingress network access to vulnerable port.",
-                                "Verify host integrity and review system event logs."
-                            ],
-                            "hotl_action": "isolate_endpoint" if cvss_score >= 9.0 else "none",
-                            "hotl_action_description": "Automated host isolation recommended due to CVSS >= 9.0 Critical rating." if cvss_score >= 9.0 else "No autonomous containment required.",
-                            "status": "Online (NIST NVD Live API)",
-                            "queried_at": datetime.now(timezone.utc).isoformat()
-                        }
-        except Exception as e:
-            logger.debug(f"NVD live query error for {cve_id}: {e}")
-
-        return None
-
-    def get_vulnerability_details(self, cve_id: str) -> Dict[str, Any]:
-        """Fetch CVE information from live NVD API or fall back to curated database."""
-        cve_id = cve_id.strip().upper()
-
-        # Check offline curated database first for instant response
-        if cve_id in self.cve_knowledgebase:
-            res = self.cve_knowledgebase[cve_id].copy()
-            res["status"] = "Knowledgebase Curated"
-            res["queried_at"] = datetime.now(timezone.utc).isoformat()
-            return res
-
-        # Try live NVD API
-        live_result = self.query_nvd_api(cve_id)
-        if live_result:
-            return live_result
-
-        # Generic heuristic fallback
+    def _base_record(self, cve_id: str, status: str, error: Optional[str] = None) -> Dict[str, Any]:
+        nvd_url = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
         return {
             "cve_id": cve_id,
-            "title": f"Vulnerability {cve_id}",
-            "cvss_score": 7.5,
-            "severity": "HIGH",
-            "attack_vector": "NETWORK",
-            "cwe": "CWE-Generic",
-            "description": f"National Vulnerability Database indicator for {cve_id}.",
+            "status": status,
+            "title": cve_id,
+            "cvss_score": None,
+            "cvss_version": None,
+            "cvss_vector": None,
+            "severity": None,
+            "attack_vector": None,
+            "cwe": None,
+            "description": None,
+            "published": None,
+            "last_modified": None,
+            "known_exploited": None,
+            "patches": [nvd_url],
             "hitl_remediation": [
-                f"Review patch release notes from vendor regarding {cve_id}.",
-                "Monitor endpoint process activity and outbound network telemetry.",
-                "Apply principle of least privilege on affected application."
+                f"Review {cve_id} at {nvd_url} and confirm whether the affected product and version are present on the alerting host.",
+                "Apply the vendor fix or documented mitigation before closing the alert.",
             ],
             "hotl_action": "none",
-            "hotl_action_description": "Severity threshold below autonomous containment trigger (< 9.0).",
-            "status": "Heuristic Model",
-            "queried_at": datetime.now(timezone.utc).isoformat()
+            "hotl_action_description": "No live CVSS data, so no autonomous containment is recommended.",
+            "nvd_url": nvd_url,
+            "source": None,
+            "error": error,
+            "queried_at": _now_iso(),
         }
+
+    def query_nvd_api(self, cve_id: str, api_key: str) -> Dict[str, Any]:
+        headers = {"apiKey": api_key, "Accept": "application/json"}
+        try:
+            with httpx.Client(timeout=httpx.Timeout(self.timeout, connect=3.0), transport=self.transport) as client:
+                resp = client.get(self.BASE_URL, params={"cveId": cve_id}, headers=headers)
+        except httpx.TimeoutException:
+            return self._base_record(cve_id, "unavailable", "NVD request timed out")
+        except httpx.HTTPError as exc:
+            return self._base_record(cve_id, "unavailable", f"NVD unreachable ({type(exc).__name__})")
+
+        if resp.status_code == 404:
+            return self._base_record(cve_id, "not_found")
+        if resp.status_code in (401, 403):
+            return self._base_record(cve_id, "unavailable", f"NVD rejected the request (HTTP {resp.status_code}); check the API key or rate limit")
+        if resp.status_code == 429:
+            return self._base_record(cve_id, "unavailable", "NVD rate limit reached (HTTP 429)")
+        if resp.status_code != 200:
+            return self._base_record(cve_id, "unavailable", f"unexpected NVD response (HTTP {resp.status_code})")
+
+        try:
+            vulns = (resp.json() or {}).get("vulnerabilities") or []
+        except ValueError:
+            return self._base_record(cve_id, "unavailable", "NVD returned an unreadable response")
+        if not vulns:
+            return self._base_record(cve_id, "not_found")
+        return self._parse_cve(cve_id, vulns[0].get("cve") or {})
+
+    def _parse_cve(self, cve_id: str, cve: Dict[str, Any]) -> Dict[str, Any]:
+        record = self._base_record(cve_id, "live")
+        version, metric = _pick_metric(cve.get("metrics") or {})
+        data = metric.get("cvssData") or {}
+        score = data.get("baseScore")
+        attack_vector = data.get("attackVector") or data.get("accessVector")
+        severity = data.get("baseSeverity") or metric.get("baseSeverity")
+
+        description = next(
+            (d.get("value") for d in cve.get("descriptions") or [] if d.get("lang") == "en"), None
+        )
+        cwes = [
+            d.get("value")
+            for w in cve.get("weaknesses") or []
+            for d in w.get("description") or []
+            if d.get("value") and d.get("value").startswith("CWE-")
+        ]
+        references = [r.get("url") for r in cve.get("references") or [] if r.get("url")]
+        known_exploited = bool(cve.get("cisaExploitAdd"))
+
+        record.update({
+            "title": cve.get("cisaVulnerabilityName") or cve_id,
+            "cvss_score": float(score) if score is not None else None,
+            "cvss_version": version,
+            "cvss_vector": data.get("vectorString"),
+            "severity": severity,
+            "attack_vector": attack_vector,
+            "cwe": ", ".join(dict.fromkeys(cwes)) or None,
+            "description": description,
+            "published": cve.get("published"),
+            "last_modified": cve.get("lastModified"),
+            "known_exploited": known_exploited,
+            "patches": [record["nvd_url"]] + references[:5],
+            "source": "NIST NVD API 2.0",
+        })
+        if known_exploited and cve.get("cisaRequiredAction"):
+            record["hitl_remediation"].append(f"CISA KEV required action: {cve['cisaRequiredAction']}")
+
+        eligible = record["cvss_score"] is not None and record["cvss_score"] >= HOTL_CVSS_THRESHOLD and attack_vector == "NETWORK"
+        record["hotl_action"] = "isolate_endpoint" if eligible else "none"
+        record["hotl_action_description"] = (
+            f"CVSS {record['cvss_score']} with a network attack vector: host isolation is recommended (subject to response policy)."
+            if eligible else
+            "CVSS below the autonomous-isolation threshold (9.0, network vector): analyst review required."
+        )
+        return record
+
+    def get_vulnerability_details(self, cve_id: str) -> Dict[str, Any]:
+        """Look up a CVE in NVD. Never raises and never invents CVSS data."""
+        cve_id = cve_id.strip().upper()
+        if not CVE_RE.fullmatch(cve_id):
+            return self._base_record(cve_id, "not_found", "not a valid CVE identifier")
+
+        with self._lock:
+            hit = self._cache.get(cve_id)
+            if hit and time.monotonic() - hit[0] < self.cache_ttl:
+                return {**hit[1], "cached": True}
+
+        api_key = integration_config.get_setting("nvd_api_key")
+        if not api_key:
+            return self._base_record(cve_id, "not_configured", "NVD API key is not configured; no live lookup was made")
+
+        record = self.query_nvd_api(cve_id, api_key)
+        if record["status"] in ("live", "not_found"):
+            with self._lock:
+                self._cache[cve_id] = (time.monotonic(), record)
+        return record
 
     def analyze_alert_vulnerabilities(self, alert_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Analyze an alert's raw payload, rule, and IoCs to identify linked CVEs,
-        produce actionable HITL remediation advice, and determine HOTL autonomous actions.
-        """
+        """CVE context for an alert: CVEs named in its payload, their NVD data, and HOTL eligibility."""
         raw = alert_dict.get("raw_payload") or {}
-        rule = raw.get("rule", {})
-        rule_desc = rule.get("description", "")
-        rule_id = str(alert_dict.get("rule_id", ""))
-        full_log = str(raw.get("full_log", ""))
-        raw_text = f"{rule_desc} {full_log} {rule_id}"
+        try:
+            payload_text = json.dumps(raw, default=str)
+        except (TypeError, ValueError):
+            payload_text = str(raw)
+        found = self.extract_cves_from_text(f"{alert_dict.get('rule_id', '')} {payload_text}")
+        truncated = max(0, len(found) - self.MAX_CVES_PER_ALERT)
+        cves = found[: self.MAX_CVES_PER_ALERT]
+        details = [self.get_vulnerability_details(c) for c in cves]
 
-        # Extract explicit CVE IDs
-        found_cves = self.extract_cves_from_text(raw_text)
+        scores = [d["cvss_score"] for d in details if d["cvss_score"] is not None]
+        max_cvss = max(scores) if scores else None
+        statuses = {d["status"] for d in details}
+        if not details:
+            lookup_status = "no_cves"
+        elif statuses <= {"live", "not_found"}:
+            lookup_status = "live"
+        elif statuses & {"live", "not_found"}:
+            lookup_status = "partial"
+        elif statuses == {"not_configured"}:
+            lookup_status = "not_configured"
+        else:
+            lookup_status = "unavailable"
 
-        # Context-based mapping if no explicit CVE found
-        if not found_cves:
-            lower_text = raw_text.lower()
-            if "log4j" in lower_text or "jndi" in lower_text:
-                found_cves.append("CVE-2021-44228")
-            elif "xz" in lower_text or "liblzma" in lower_text or "backdoor" in lower_text:
-                found_cves.append("CVE-2024-3094")
-            elif "mimikatz" in lower_text or "lsass" in lower_text or "zerologon" in lower_text:
-                found_cves.append("CVE-2020-1472")
-            elif "moveit" in lower_text or "sqli" in lower_text:
-                found_cves.append("CVE-2023-34362")
-            else:
-                # Default demonstration reference for Critical/High alerts
-                if alert_dict.get("severity") in ["Critical", "High"]:
-                    found_cves.append("CVE-2024-3094")
-
-        cve_details = [self.get_vulnerability_details(cve) for cve in found_cves]
-
-        # Determine highest CVSS score
-        max_cvss = max([c["cvss_score"] for c in cve_details], default=0.0)
-
-        # Evaluate HOTL (Human-Out-of-the-Loop) Automation Trigger
-        # Threshold: CVSS >= 9.0 (Critical) + Network Attack Vector triggers autonomous containment
-        should_hotl_contain = any(
-            c["cvss_score"] >= 9.0 and c.get("attack_vector") == "NETWORK"
-            for c in cve_details
-        )
-
-        hotl_recommendation = {
-            "eligible_for_hotl": should_hotl_contain,
-            "action_type": "isolate_endpoint" if should_hotl_contain else "none",
-            "justification": (
-                f"CVSS score {max_cvss} qualifies as CRITICAL with network exploitability. "
-                "Autonomous host isolation policy triggered per HOTL rules."
-                if should_hotl_contain else
-                "Vulnerability does not meet autonomous HOTL isolation criteria. Requires standard HITL review."
+        eligible = [d for d in details if d["hotl_action"] == "isolate_endpoint"]
+        if eligible:
+            justification = (
+                f"{eligible[0]['cve_id']} has live NVD CVSS {eligible[0]['cvss_score']} with a network attack vector; "
+                "host isolation is recommended, subject to the response policy."
             )
-        }
+        elif not details:
+            justification = "No CVE identifiers appear in this alert."
+        elif not scores:
+            justification = "No live CVSS data is available for the CVEs in this alert; analyst review required."
+        else:
+            justification = "No CVE in this alert meets the autonomous-isolation threshold (CVSS >= 9.0, network vector); analyst review required."
 
-        # Aggregate HITL (Human-in-the-Loop) Remediation steps
-        all_remediations = []
-        for c in cve_details:
-            for rem in c.get("hitl_remediation", []):
-                if rem not in all_remediations:
-                    all_remediations.append(rem)
+        remediation: List[str] = []
+        for d in details:
+            for step in d["hitl_remediation"]:
+                if step not in remediation:
+                    remediation.append(step)
 
         return {
-            "cves_detected": found_cves,
+            "cves_detected": cves,
+            "cves_truncated": truncated,
+            "lookup_status": lookup_status,
             "max_cvss_score": max_cvss,
-            "vulnerabilities": cve_details,
-            "hitl_remediation_steps": all_remediations,
-            "hotl_autonomous_policy": hotl_recommendation
+            "cvss_max_score": max_cvss,  # alias read by the current UI
+            "vulnerabilities": details,
+            "hitl_remediation_steps": remediation,
+            "hitl_remediation_advice": " ".join(remediation) or None,
+            "hotl_autonomous_policy": {
+                "eligible_for_hotl": bool(eligible),
+                "action_type": "isolate_endpoint" if eligible else "none",
+                "justification": justification,
+                "action_description": justification,
+            },
         }
+
 
 nvd_client = NationalVulnerabilityDatabase()
