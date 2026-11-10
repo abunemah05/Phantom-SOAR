@@ -1,340 +1,282 @@
+"""Incident PDF report (ReportLab Platypus).
+
+The report only shows what the platform recorded for the alert: telemetry,
+IOC verdicts and their evidence sources, the MITRE mapping from telemetry or
+the matched playbook, every response action with its target, connector and
+execution mode, and the real MTTR. When any action was simulated the report
+carries a prominent SIMULATED notice.
+"""
 import os
-from pathlib import Path
-from datetime import datetime
-from reportlab.lib.pagesizes import letter
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from xml.sax.saxutils import escape
+
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import (
-    SimpleDocTemplate,
+    HRFlowable,
+    KeepTogether,
     Paragraph,
+    SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
-    HRFlowable,
-    KeepTogether
 )
 
 from backend.config import settings
 
-def generate_pdf_report(alert_data: dict, output_path: str = None) -> str:
-    """
-    Generate an enterprise-grade Executive Incident Report using ReportLab Platypus.
-    Includes:
-    - SANS PICERL Incident Response summary
-    - MITRE ATT&CK framework mapping
-    - Threat Intelligence (VirusTotal / AbuseIPDB) Scorecard
-    - IoC Artifacts inventory
-    - Containment & Playbook Execution timeline
-    """
-    alert_id = alert_data.get("alert_id", 0)
+PRIMARY = colors.HexColor("#0f172a")
+ACCENT_BLUE = colors.HexColor("#2563eb")
+ACCENT_RED = colors.HexColor("#dc2626")
+ACCENT_AMBER = colors.HexColor("#d97706")
+ACCENT_GREEN = colors.HexColor("#16a34a")
+MUTED = colors.HexColor("#64748b")
+HEADER_BG = colors.HexColor("#1e293b")
+ROW_ALT_BG = colors.HexColor("#f8fafc")
+
+STATUS_COLORS = {
+    "Success": ACCENT_GREEN,
+    "Simulated": ACCENT_AMBER,
+    "Awaiting Approval": ACCENT_AMBER,
+    "Skipped": MUTED,
+    "Blocked": ACCENT_RED,
+    "Failed": ACCENT_RED,
+}
+VERDICT_COLORS = {"Malicious": ACCENT_RED, "Suspicious": ACCENT_AMBER, "Clean": ACCENT_GREEN, "Unknown": MUTED}
+
+
+def _text(value: Any, default: str = "N/A") -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    return escape(str(value))
+
+
+def _grid_style(header: bool = True, background: Optional[colors.Color] = None) -> TableStyle:
+    commands = [
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+    ]
+    if background is not None:
+        commands.append(("BACKGROUND", (0, 0), (-1, -1), background))
+    if header:
+        commands.append(("BACKGROUND", (0, 0), (-1, 0), HEADER_BG))
+    return TableStyle(commands)
+
+
+def _mttr_text(mttr: Any) -> str:
+    try:
+        value = float(mttr)
+    except (TypeError, ValueError):
+        return "Not contained"
+    if value <= 0:
+        return "Not contained"
+    if value < 120:
+        return f"{value:.2f} s (alert creation to containment)"
+    if value < 7200:
+        return f"{value / 60:.1f} min (alert creation to containment)"
+    return f"{value / 3600:.1f} h (alert creation to containment)"
+
+
+def generate_pdf_report(alert_data: Dict[str, Any], output_path: Optional[str] = None) -> str:
+    """Render the incident report for one alert and return the PDF path."""
+    alert_id = int(alert_data.get("alert_id") or 0)
     if not output_path:
         os.makedirs(settings.REPORTS_DIR, exist_ok=True)
         output_path = os.path.join(settings.REPORTS_DIR, f"incident_report_alert_{alert_id}.pdf")
 
-    doc = SimpleDocTemplate(
-        output_path,
-        pagesize=letter,
-        rightMargin=40,
-        leftMargin=40,
-        topMargin=40,
-        bottomMargin=40
-    )
-
+    doc = SimpleDocTemplate(output_path, pagesize=letter, rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
     styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("DocTitle", parent=styles["Heading1"], fontName="Helvetica-Bold",
+                                 fontSize=20, leading=24, textColor=PRIMARY, spaceAfter=4)
+    subtitle_style = ParagraphStyle("DocSubTitle", parent=styles["Normal"], fontName="Helvetica",
+                                    fontSize=10, leading=14, textColor=MUTED)
+    section = ParagraphStyle("SectionHeading", parent=styles["Heading2"], fontName="Helvetica-Bold",
+                             fontSize=13, leading=17, textColor=ACCENT_BLUE, spaceBefore=12, spaceAfter=6)
+    cell = ParagraphStyle("CellNormal", parent=styles["Normal"], fontName="Helvetica",
+                          fontSize=8.5, leading=11, textColor=colors.HexColor("#1e293b"))
+    cell_small = ParagraphStyle("CellSmall", parent=cell, fontSize=7.5, leading=9.5, textColor=MUTED)
+    cell_bold = ParagraphStyle("CellBold", parent=cell, fontName="Helvetica-Bold")
+    cell_header = ParagraphStyle("CellHeader", parent=cell, fontName="Helvetica-Bold", textColor=colors.white)
+    notice_style = ParagraphStyle("Notice", parent=cell, fontName="Helvetica-Bold", fontSize=10,
+                                  leading=13, textColor=ACCENT_RED)
 
-    # Custom styling
-    primary_color = colors.HexColor("#0f172a")  # Slate 900
-    accent_blue = colors.HexColor("#2563eb")    # Blue 600
-    accent_red = colors.HexColor("#dc2626")     # Red 600
-    accent_amber = colors.HexColor("#d97706")   # Amber 600
-    accent_green = colors.HexColor("#16a34a")   # Green 600
-    table_header_bg = colors.HexColor("#1e293b")
-    row_alt_bg = colors.HexColor("#f8fafc")
+    iocs: List[Dict[str, Any]] = alert_data.get("ioc_artifacts") or []
+    actions: List[Dict[str, Any]] = alert_data.get("containment_actions") or []
+    simulated_actions = [a for a in actions if a.get("execution_mode") == "simulated" or a.get("status") == "Simulated"]
 
-    title_style = ParagraphStyle(
-        "DocTitle",
-        parent=styles["Heading1"],
-        fontName="Helvetica-Bold",
-        fontSize=20,
-        leading=24,
-        textColor=primary_color,
-        spaceAfter=4
-    )
-
-    subtitle_style = ParagraphStyle(
-        "DocSubTitle",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=10,
-        leading=14,
-        textColor=colors.HexColor("#64748b")
-    )
-
-    section_heading = ParagraphStyle(
-        "SectionHeading",
-        parent=styles["Heading2"],
-        fontName="Helvetica-Bold",
-        fontSize=13,
-        leading=17,
-        textColor=accent_blue,
-        spaceBefore=12,
-        spaceAfter=6
-    )
-
-    cell_style = ParagraphStyle(
-        "CellNormal",
-        parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=8.5,
-        leading=11,
-        textColor=colors.HexColor("#1e293b")
-    )
-
-    cell_bold = ParagraphStyle(
-        "CellBold",
-        parent=cell_style,
-        fontName="Helvetica-Bold"
-    )
-
-    cell_header = ParagraphStyle(
-        "CellHeader",
-        parent=cell_style,
-        fontName="Helvetica-Bold",
-        textColor=colors.white
-    )
-
-    story = []
-
-    # 1. Header Banner & Classification
-    classification_banner = Paragraph(
-        "<para align='center'><b>CONFIDENTIAL // SOC INTERNAL USE ONLY // PHANTOM SOAR IR REPORT</b></para>",
-        ParagraphStyle("Banner", parent=styles["Normal"], fontSize=8, textColor=accent_red)
-    )
-    story.append(classification_banner)
-    story.append(Spacer(1, 8))
-
-    story.append(Paragraph("PHANTOM SOAR | Executive Incident Report", title_style))
+    story: List[Any] = []
     story.append(Paragraph(
-        f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} | Platform Version: 2.0.0-Enterprise",
-        subtitle_style
+        "<para align='center'><b>CONFIDENTIAL // SOC INTERNAL USE ONLY // PHANTOM SOAR IR REPORT</b></para>",
+        ParagraphStyle("Banner", parent=styles["Normal"], fontSize=8, textColor=ACCENT_RED),
     ))
     story.append(Spacer(1, 8))
-    story.append(HRFlowable(width="100%", thickness=1.5, color=accent_blue, spaceBefore=4, spaceAfter=10))
+    story.append(Paragraph("PHANTOM SOAR | Incident Report", title_style))
+    story.append(Paragraph(
+        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} | "
+        f"Platform Version: {escape(settings.PROJECT_VERSION)}",
+        subtitle_style,
+    ))
+    story.append(Spacer(1, 8))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=ACCENT_BLUE, spaceBefore=4, spaceAfter=10))
 
-    # 2. Executive Incident Overview Table
-    severity = alert_data.get("severity", "Unknown")
-    sev_color = accent_red if severity in ["Critical", "High"] else accent_amber
+    if simulated_actions:
+        notice = Table([[Paragraph(
+            f"SIMULATED: {len(simulated_actions)} of {len(actions)} response action(s) in this report were "
+            "simulated because the connector is not configured. No command was sent to any real system "
+            "for those actions.",
+            notice_style,
+        )]], colWidths=[530])
+        notice.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 1.2, ACCENT_RED),
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fef2f2")),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(notice)
+        story.append(Spacer(1, 10))
 
-    overview_data = [
-        [
-            Paragraph("<b>Incident ID:</b>", cell_style),
-            Paragraph(f"ALERT-{alert_id:04d}", cell_bold),
-            Paragraph("<b>Severity:</b>", cell_style),
-            Paragraph(f"<font color='{sev_color.hexval()}'><b>{severity.upper()}</b></font>", cell_bold),
-        ],
-        [
-            Paragraph("<b>Source SIEM:</b>", cell_style),
-            Paragraph(alert_data.get("source", "Wazuh SIEM"), cell_style),
-            Paragraph("<b>Status:</b>", cell_style),
-            Paragraph(f"<b>{alert_data.get('status', 'Triaged').upper()}</b>", cell_bold),
-        ],
-        [
-            Paragraph("<b>Rule ID:</b>", cell_style),
-            Paragraph(alert_data.get("rule_id", "N/A"), cell_style),
-            Paragraph("<b>Calculated MTTR:</b>", cell_style),
-            Paragraph(f"{alert_data.get('mttr_seconds', 1.8):.2f} seconds (SOAR Automated)", cell_bold),
-        ],
-        [
-            Paragraph("<b>Detection Time:</b>", cell_style),
-            Paragraph(str(alert_data.get("created_at", "N/A"))[:19], cell_style),
-            Paragraph("<b>SOAPA Automation:</b>", cell_style),
-            Paragraph(alert_data.get("execution_mode", "HOTL (Autonomous)") or "HOTL", cell_style),
-        ]
+    severity = str(alert_data.get("severity") or "Unknown")
+    sev_color = ACCENT_RED if severity in ("Critical", "High") else ACCENT_AMBER
+    overview = [
+        [Paragraph("<b>Incident ID:</b>", cell), Paragraph(f"ALERT-{alert_id:04d}", cell_bold),
+         Paragraph("<b>Severity:</b>", cell),
+         Paragraph(f"<font color='{sev_color.hexval()}'><b>{escape(severity.upper())}</b></font>", cell_bold)],
+        [Paragraph("<b>Source:</b>", cell), Paragraph(_text(alert_data.get("source")), cell),
+         Paragraph("<b>Status:</b>", cell), Paragraph(f"<b>{_text(alert_data.get('status')).upper()}</b>", cell_bold)],
+        [Paragraph("<b>Rule ID:</b>", cell), Paragraph(_text(alert_data.get("rule_id")), cell),
+         Paragraph("<b>MTTR:</b>", cell), Paragraph(escape(_mttr_text(alert_data.get("mttr_seconds"))), cell_bold)],
+        [Paragraph("<b>Detected:</b>", cell), Paragraph(_text(str(alert_data.get("created_at") or "")[:19]), cell),
+         Paragraph("<b>Response mode:</b>", cell), Paragraph(_text(alert_data.get("execution_mode"), "Not processed"), cell)],
+        [Paragraph("<b>Threat:</b>", cell), Paragraph(_text(alert_data.get("threat_name")), cell),
+         Paragraph("<b>Playbook:</b>", cell), Paragraph(_text(alert_data.get("playbook_name"), "None matched"), cell)],
     ]
-
-    t_overview = Table(overview_data, colWidths=[100, 160, 100, 170])
-    t_overview.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#f1f5f9")),
-        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
-        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ('TOPPADDING', (0, 0), (-1, -1), 5),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-        ('LEFTPADDING', (0, 0), (-1, -1), 6),
-        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
-    ]))
+    t_overview = Table(overview, colWidths=[90, 175, 90, 175])
+    t_overview.setStyle(_grid_style(header=False, background=colors.HexColor("#f1f5f9")))
     story.append(t_overview)
     story.append(Spacer(1, 10))
 
-    # 3. SANS PICERL & MITRE ATT&CK Mapping
-    story.append(Paragraph("1. SANS PICERL Lifecycle & Threat Classification", section_heading))
-    picerl_text = (
-        "<b>Phase Status:</b> Containment Completed & Verified | "
-        "<b>SANS IR Phase:</b> Containment & Eradication.<br/>"
-        "The automated SOAR orchestrator intercepted the Wazuh detection telemetry, extracted threat IoCs, "
-        "evaluated Threat Intelligence reputation scores, and triggered automated perimeter & host containment."
-    )
-    story.append(Paragraph(picerl_text, cell_style))
+    story.append(Paragraph("1. Triage Summary", section))
+    story.append(Paragraph(_text(alert_data.get("triage_summary"), "No triage summary was recorded."), cell))
     story.append(Spacer(1, 6))
 
-    mitre_data = [
-        [Paragraph("Tactic", cell_header), Paragraph("Technique", cell_header), Paragraph("ID", cell_header), Paragraph("Target / Vector", cell_header)],
-        [
-            Paragraph("Impact / Execution", cell_style),
-            Paragraph(alert_data.get("threat_name", "Data Encrypted for Impact / C2 Communication"), cell_style),
-            Paragraph("T1486 / T1059", cell_bold),
-            Paragraph("Production Endpoint & Host Subnet", cell_style)
-        ]
-    ]
-    t_mitre = Table(mitre_data, colWidths=[110, 220, 80, 120])
-    t_mitre.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), table_header_bg),
-        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('LEFTPADDING', (0, 0), (-1, -1), 6),
-    ]))
-    story.append(t_mitre)
-    story.append(Spacer(1, 10))
+    story.append(Paragraph("2. MITRE ATT&amp;CK Mapping", section))
+    mitre = alert_data.get("mitre_attack") or {}
+    ids = list(mitre.get("id") or [])
+    if ids:
+        tactics = list(mitre.get("tactic") or [])
+        techniques = list(mitre.get("technique") or [])
+        rows = [[Paragraph("Technique ID", cell_header), Paragraph("Technique", cell_header),
+                 Paragraph("Tactic", cell_header)]]
+        for idx, technique_id in enumerate(ids):
+            rows.append([
+                Paragraph(_text(technique_id), cell_bold),
+                Paragraph(_text(techniques[idx] if idx < len(techniques) else None, "-"), cell),
+                Paragraph(_text(tactics[idx] if idx < len(tactics) else None, "-"), cell),
+            ])
+        t_mitre = Table(rows, colWidths=[110, 260, 160])
+        t_mitre.setStyle(_grid_style())
+        story.append(t_mitre)
+        source = mitre.get("source")
+        if source:
+            story.append(Paragraph(
+                "Source: " + ("alert telemetry (rule.mitre)" if source == "telemetry" else "matched playbook's technique"),
+                cell_small,
+            ))
+    else:
+        story.append(Paragraph("No MITRE ATT&amp;CK mapping was present in the telemetry or the matched playbook.", cell))
+    story.append(Spacer(1, 6))
 
-    # 4. Threat Intelligence (VirusTotal & AbuseIPDB) Scorecard
-    story.append(Paragraph("2. Threat Intelligence Scorecard (TIP)", section_heading))
-    iocs = alert_data.get("ioc_artifacts", [])
-    max_vt_score = max([i.get("threat_score", 0) for i in iocs], default=85)
-    
-    tip_summary = [
-        [
-            Paragraph("<b>Max Threat Score:</b>", cell_style),
-            Paragraph(f"<font color='{accent_red.hexval()}'><b>{max_vt_score} / 100</b> (Critical Risk)</font>", cell_bold),
-            Paragraph("<b>VirusTotal Verdict:</b>", cell_style),
-            Paragraph("<b>Confirmed Malicious (64/70 Engines)</b>", cell_bold),
-        ],
-        [
-            Paragraph("<b>AbuseIPDB Confidence:</b>", cell_style),
-            Paragraph("94% Abuse Probability", cell_style),
-            Paragraph("<b>C2 Infrastructure:</b>", cell_style),
-            Paragraph("Known Ransomware / Cobalt Strike Beacon", cell_style),
-        ]
-    ]
-    t_tip = Table(tip_summary, colWidths=[130, 140, 110, 150])
-    t_tip.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor("#fff7ed")),
-        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#fdba74")),
-        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#fed7aa")),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('LEFTPADDING', (0, 0), (-1, -1), 6),
-    ]))
-    story.append(t_tip)
-    story.append(Spacer(1, 10))
-
-    # 5. IoC Artifacts Table
-    story.append(Paragraph("3. Extracted Indicators of Compromise (IoCs)", section_heading))
-    ioc_table_data = [
-        [
-            Paragraph("Type", cell_header),
-            Paragraph("Indicator Value", cell_header),
-            Paragraph("VT Threat Score", cell_header),
-            Paragraph("Verdict", cell_header),
-        ]
-    ]
-
+    story.append(Paragraph("3. Indicators of Compromise &amp; Threat Intelligence", section))
     if iocs:
-        for idx, ioc in enumerate(iocs):
-            score = ioc.get("threat_score", 0)
-            score_color = accent_red if score >= 50 else (accent_amber if score >= 20 else accent_green)
-            row_bg = row_alt_bg if idx % 2 == 1 else colors.white
-            ioc_table_data.append([
-                Paragraph(ioc.get("artifact_type", "IP"), cell_bold),
-                Paragraph(ioc.get("value", "N/A"), cell_style),
-                Paragraph(f"<font color='{score_color.hexval()}'><b>{score}/100</b></font>", cell_bold),
-                Paragraph("Malicious" if score >= 50 else ("Suspicious" if score >= 20 else "Clean"), cell_style)
+        rows = [[Paragraph("Type", cell_header), Paragraph("Indicator", cell_header), Paragraph("Score", cell_header),
+                 Paragraph("Verdict", cell_header), Paragraph("Evidence", cell_header)]]
+        for ioc in iocs:
+            verdict = ioc.get("verdict") or "Unknown"
+            color = VERDICT_COLORS.get(verdict, MUTED)
+            sources = ioc.get("evidence_sources") or []
+            if sources:
+                evidence = (f"{ioc['evidence_kind']}: " if ioc.get("evidence_kind") else "") + ", ".join(sources)
+            else:
+                evidence = f"no evidence ({ioc.get('enrichment_status') or 'not enriched'})"
+            rows.append([
+                Paragraph(_text(ioc.get("artifact_type")), cell_bold),
+                Paragraph(_text(ioc.get("value")), cell),
+                Paragraph(f"{int(ioc.get('threat_score') or 0)}/100", cell),
+                Paragraph(f"<font color='{color.hexval()}'><b>{escape(verdict)}</b></font>", cell_bold),
+                Paragraph(escape(str(evidence)), cell_small),
             ])
+        t_ioc = Table(rows, colWidths=[50, 210, 50, 70, 150])
+        t_ioc.setStyle(_grid_style())
+        story.append(t_ioc)
     else:
-        ioc_table_data.append([
-            Paragraph("IP", cell_style),
-            Paragraph("198.51.100.45", cell_style),
-            Paragraph(f"<font color='{accent_red.hexval()}'><b>92/100</b></font>", cell_bold),
-            Paragraph("Malicious", cell_style)
-        ])
+        story.append(Paragraph("No indicators were extracted from this alert.", cell))
+    story.append(Spacer(1, 6))
 
-    t_ioc = Table(ioc_table_data, colWidths=[70, 260, 100, 100])
-    t_ioc.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), table_header_bg),
-        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('LEFTPADDING', (0, 0), (-1, -1), 6),
-    ]))
-    story.append(t_ioc)
-    story.append(Spacer(1, 10))
-
-    # 6. Containment & Playbook Actions
-    story.append(Paragraph("4. Automated Containment & Playbook Execution Logs", section_heading))
-    actions = alert_data.get("containment_actions", [])
-    act_table_data = [
-        [
-            Paragraph("Timestamp", cell_header),
-            Paragraph("Action Type", cell_header),
-            Paragraph("Target / Connector", cell_header),
-            Paragraph("Status", cell_header),
-        ]
-    ]
-
+    story.append(Paragraph("4. Response Actions", section))
     if actions:
+        rows = [[Paragraph("Time (UTC)", cell_header), Paragraph("Action", cell_header), Paragraph("Target", cell_header),
+                 Paragraph("Connector / Mode", cell_header), Paragraph("Outcome", cell_header)]]
         for idx, act in enumerate(actions):
-            act_table_data.append([
-                Paragraph(str(act.get("timestamp", datetime.utcnow().strftime("%H:%M:%S")))[:19], cell_style),
-                Paragraph(act.get("action_type", "N/A"), cell_bold),
-                Paragraph("Perimeter / Host EDR", cell_style),
-                Paragraph(f"<font color='{accent_green.hexval()}'><b>{act.get('status', 'Executed')}</b></font>", cell_bold),
+            status = str(act.get("status") or "Unknown")
+            color = STATUS_COLORS.get(status, MUTED)
+            note = act.get("error") or "; ".join(act.get("reasons") or []) or ""
+            outcome = f"<font color='{color.hexval()}'><b>{escape(status)}</b></font>"
+            if note:
+                outcome += f"<br/><font size='7'>{escape(str(note)[:180])}</font>"
+            mode = act.get("execution_mode")
+            rows.append([
+                Paragraph(_text(str(act.get("timestamp") or "")[:19].replace("T", " "), "-"), cell_small),
+                Paragraph(_text(act.get("action_type")), cell_bold),
+                Paragraph(_text(act.get("target"), "-"), cell),
+                Paragraph(f"{_text(act.get('connector'), '-')} / "
+                          f"{'<b>SIMULATED</b>' if mode == 'simulated' else _text(mode, '-')}", cell),
+                Paragraph(outcome, cell),
             ])
+        t_act = Table(rows, colWidths=[80, 105, 115, 95, 135])
+        t_act.setStyle(_grid_style())
+        story.append(t_act)
+        story.append(Paragraph(
+            "Modes: live = command accepted by the real system; simulated = connector not configured, nothing sent; "
+            "skipped = not run; blocked = held or denied by policy; failed = the connector reported an error.",
+            cell_small,
+        ))
     else:
-        act_table_data.append([
-            Paragraph(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), cell_style),
-            Paragraph("isolate_endpoint", cell_bold),
-            Paragraph("Host EDR (CrowdStrike / Wazuh)", cell_style),
-            Paragraph(f"<font color='{accent_green.hexval()}'><b>Executed</b></font>", cell_bold),
-        ])
-        act_table_data.append([
-            Paragraph(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), cell_style),
-            Paragraph("block_ip", cell_bold),
-            Paragraph("Edge Firewall (Palo Alto)", cell_style),
-            Paragraph(f"<font color='{accent_green.hexval()}'><b>Executed</b></font>", cell_bold),
-        ])
+        story.append(Paragraph("No response actions have been recorded for this alert.", cell))
+    story.append(Spacer(1, 6))
 
-    t_act = Table(act_table_data, colWidths=[120, 150, 160, 100])
-    t_act.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), table_header_bg),
-        ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-        ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
-        ('TOPPADDING', (0, 0), (-1, -1), 4),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
-        ('LEFTPADDING', (0, 0), (-1, -1), 6),
-    ]))
-    story.append(t_act)
-    story.append(Spacer(1, 12))
-
-    # 7. Analyst Sign-off & Recommendations
-    story.append(Paragraph("5. Eradication & Post-Incident Action Items", section_heading))
-    recommendations = (
-        "1. <b>Credential Invalidation:</b> Force password resets and revoke active OAuth tokens for involved users.<br/>"
-        "2. <b>Forensic Preservation:</b> Retain memory dumps and EDR sensor telemetry for offline artifact extraction.<br/>"
-        "3. <b>Signature Distribution:</b> Distribute extracted hashes to perimeter proxies and DNS firewalls.<br/>"
-        "4. <b>Jira Tracking:</b> Incident ticket filed under SEC project. SLA compliance recorded within threshold."
-    )
-    story.append(Paragraph(recommendations, cell_style))
+    story.append(Paragraph("5. Analyst Decision &amp; Next Steps", section))
+    decision = alert_data.get("analyst_decision")
+    resolved_by = alert_data.get("resolved_by")
+    story.append(Paragraph(
+        f"<b>Decision:</b> {_text(decision, 'No analyst decision recorded')}"
+        + (f" &nbsp; <b>By:</b> {_text(resolved_by)}" if resolved_by else ""),
+        cell,
+    ))
+    next_steps = []
+    pending = [a for a in actions if a.get("status") in ("Failed", "Blocked", "Awaiting Approval", "Skipped")]
+    if pending:
+        next_steps.append(f"Review {len(pending)} action(s) that did not execute (failed, blocked, held for approval or skipped).")
+    if simulated_actions:
+        next_steps.append("Configure the relevant connectors and repeat the simulated actions to contain the threat for real.")
+    unknown = [i for i in iocs if (i.get("verdict") or "Unknown") == "Unknown"]
+    if unknown:
+        next_steps.append(f"{len(unknown)} indicator(s) have no threat-intelligence verdict; investigate them manually.")
+    next_steps.append("Preserve host and network telemetry for forensic analysis before remediation.")
+    story.append(Spacer(1, 4))
+    story.append(Paragraph("<br/>".join(f"{n}. {escape(s)}" for n, s in enumerate(next_steps, start=1)), cell))
     story.append(Spacer(1, 14))
 
-    # Signature line
-    sign_table = Table([
-        [
-            Paragraph("<b>Automated SOAR Approval:</b> SYSTEM / HOTL Engine", cell_style),
-            Paragraph("<b>Lead SOC Analyst Signature:</b> ___________________________", cell_style)
-        ]
-    ], colWidths=[260, 270])
+    sign_table = Table([[
+        Paragraph(f"<b>Response mode:</b> {_text(alert_data.get('execution_mode'), 'Not processed')}", cell),
+        Paragraph("<b>Lead SOC Analyst Signature:</b> ___________________________", cell),
+    ]], colWidths=[260, 270])
     story.append(KeepTogether([sign_table]))
 
     doc.build(story)

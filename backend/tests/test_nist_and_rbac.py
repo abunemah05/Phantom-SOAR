@@ -234,13 +234,10 @@ def test_nvd_integration_and_hotl_execution(client, admin_headers):
     assert "hitl_remediation_steps" in vuln_data
     assert "hotl_autonomous_policy" in vuln_data
 
-    # 3. Test HOTL Programmatic Containment Action Execution
+    # 3. Without a real CVSS score NVD recommends nothing, so no containment is executed or claimed.
     hotl_res = client.post(f"/api/alerts/{first_id}/vulnerabilities/execute-hotl", headers=admin_headers)
-    assert hotl_res.status_code == 200
-    hotl_data = hotl_res.json()
-    assert hotl_data["status"] == "Success"
-    assert hotl_data["action_executed"] == "isolate_endpoint"
-    assert hotl_data["new_status"] == "Contained"
+    assert hotl_res.status_code == 409
+    assert hotl_res.json()["detail"]["nvd_policy"]["eligible_for_hotl"] is False
 
 
 def test_playbook_rbac_sec_eng_vs_soc_analyst(client, admin_headers):

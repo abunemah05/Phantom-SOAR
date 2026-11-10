@@ -290,7 +290,16 @@ def get_incident_report_by_alert(db: Session, alert_id: int) -> Optional[Inciden
 
 # --- Dashboard Metrics ---
 
+def get_active_playbooks(db: Session) -> List[Playbook]:
+    return db.query(Playbook).filter(Playbook.is_active == True).order_by(Playbook.playbook_id).all()  # noqa: E712
+
 def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
+    """SOC metrics computed from recorded rows only.
+
+    avg_mttr_seconds averages executions that actually contained an alert (mttr_seconds > 0)
+    and is None when there are none; mttr_sample_size says how many runs it covers.
+    automated_actions counts actions that ran live or simulated; the per-mode counts say which.
+    """
     total_alerts = db.query(Alert).count()
     new_alerts = db.query(Alert).filter(Alert.status == "New").count()
     triaged_alerts = db.query(Alert).filter(Alert.status == "Triaged").count()
@@ -299,9 +308,19 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
     unresolved_alerts = db.query(Alert).filter(~Alert.status.in_(["Resolved", "Closed"])).count()
     review_gates_count = db.query(Alert).filter(Alert.status.in_(["Triaged", "New"])).count()
 
-    automated_actions = db.query(ContainmentAction).count()
+    mode_counts = dict(
+        db.query(ContainmentAction.execution_mode, func.count(ContainmentAction.action_id))
+        .group_by(ContainmentAction.execution_mode)
+        .all()
+    )
+    live_actions = int(mode_counts.get("live", 0))
+    simulated_actions = int(mode_counts.get("simulated", 0))
 
-    avg_mttr = db.query(func.avg(PlaybookExecution.mttr_seconds)).scalar() or 0.0
+    mttr_avg, mttr_count = (
+        db.query(func.avg(PlaybookExecution.mttr_seconds), func.count(PlaybookExecution.execution_id))
+        .filter(PlaybookExecution.mttr_seconds > 0)
+        .one()
+    )
 
     critical_count = db.query(Alert).filter(Alert.severity == "Critical").count()
     high_count = db.query(Alert).filter(Alert.severity == "High").count()
@@ -316,8 +335,14 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
         "resolved_alerts": resolved_alerts,
         "unresolved_alerts": unresolved_alerts,
         "review_gates_count": review_gates_count,
-        "automated_actions": automated_actions,
-        "avg_mttr_seconds": round(float(avg_mttr), 2),
+        "automated_actions": live_actions + simulated_actions,
+        "live_actions": live_actions,
+        "simulated_actions": simulated_actions,
+        "blocked_actions": int(mode_counts.get("blocked", 0)),
+        "failed_actions": int(mode_counts.get("failed", 0)),
+        "skipped_actions": int(mode_counts.get("skipped", 0)),
+        "avg_mttr_seconds": round(float(mttr_avg), 2) if mttr_count else None,
+        "mttr_sample_size": int(mttr_count or 0),
         "critical_count": critical_count,
         "high_count": high_count,
         "medium_count": medium_count,
