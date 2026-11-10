@@ -184,7 +184,7 @@ def get_current_user_allow_password_change(
     db: Session = Depends(get_db),
 ) -> User:
     """Like get_current_user, but also accepts sessions that still have to change their password
-    (used only by /auth/me and /auth/logout so the console can render the change-password screen)."""
+    (used only by /auth/me, so the console can render the change-password screen)."""
     return _resolve_user(payload, db, allow_password_change_pending=True)
 
 
