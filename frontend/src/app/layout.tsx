@@ -1,11 +1,10 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import Sidebar from "@/components/Sidebar";
-import Navbar from "@/components/Navbar";
+import AppShell from "@/components/AppShell";
 
 export const metadata: Metadata = {
-  title: "Phantom SOAR | Autonomous Enterprise SecOps Platform",
-  description: "Security Orchestration, Automation, and Response platform built for modern SOCs. SANS PICERL & MITRE ATT&CK native.",
+  title: "Phantom SOAR | Security Orchestration, Automation & Response",
+  description: "Security Orchestration, Automation, and Response platform: SIEM alert intake, threat-intel enrichment, policy-guarded playbooks and analyst review.",
 };
 
 export default function RootLayout({
@@ -16,13 +15,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body className="bg-slate-950 text-slate-100 min-h-screen flex antialiased">
-        <Sidebar />
-        <div className="flex-1 ml-64 flex flex-col min-h-screen min-w-0">
-          <Navbar />
-          <main className="flex-1 p-6 lg:p-8 max-w-7xl w-full mx-auto">
-            {children}
-          </main>
-        </div>
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );

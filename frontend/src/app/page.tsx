@@ -16,13 +16,25 @@ import {
   Play,
   Cpu,
   ChevronRight,
-  Trash2
+  Trash2,
+  FlaskConical,
+  AlertCircle
 } from "lucide-react";
 import { DashboardMetrics, Alert } from "@/lib/types";
 import { api } from "@/lib/api";
+import { isAdmin } from "@/lib/roles";
+import { formatDuration } from "@/lib/format";
 import InvestigateModal from "@/components/InvestigateModal";
+import { useAuth } from "@/components/AuthGate";
+import { useRuntimeStatus } from "@/components/RuntimeStatusProvider";
 
 export default function DashboardPage() {
+  const { user } = useAuth();
+  const { status: runtime } = useRuntimeStatus();
+  const admin = isAdmin(user);
+  const simulationMode = runtime?.simulation_mode === true;
+  const canSeedDemo = admin && simulationMode;
+
   const [metrics, setMetrics] = useState<DashboardMetrics | null>(null);
   const [recentAlerts, setRecentAlerts] = useState<Alert[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -31,6 +43,7 @@ export default function DashboardPage() {
   const [selectedAlertId, setSelectedAlertId] = useState<number | null>(null);
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
   const [seedSuccessMsg, setSeedSuccessMsg] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const loadData = async () => {
     try {
@@ -56,13 +69,17 @@ export default function DashboardPage() {
   const handleSeedDemo = async () => {
     setSeeding(true);
     setSeedSuccessMsg(null);
+    setActionError(null);
     try {
       const res = await api.seedDemoData();
-      setSeedSuccessMsg("Demo presentation test cases & playbooks injected successfully!");
+      setSeedSuccessMsg(
+        res?.message ||
+          "Lab alerts were sent through the ingestion pipeline. Their enrichment uses lab fixtures and any response actions are simulated."
+      );
       await loadData();
-      setTimeout(() => setSeedSuccessMsg(null), 5000);
+      setTimeout(() => setSeedSuccessMsg(null), 8000);
     } catch (err: any) {
-      alert("Failed to seed demo data: " + err.message);
+      setActionError(`Demo data was not generated: ${err.message || "request failed"}`);
     } finally {
       setSeeding(false);
     }
@@ -72,13 +89,14 @@ export default function DashboardPage() {
     if (!confirm("Are you sure you want to purge all alert cases and reset the queue?")) return;
     setPurging(true);
     setSeedSuccessMsg(null);
+    setActionError(null);
     try {
       const res = await api.purgeAlerts();
-      setSeedSuccessMsg(res.message || "All alert cases successfully purged from database.");
+      setSeedSuccessMsg(res?.message || "All alert cases were purged.");
       await loadData();
       setTimeout(() => setSeedSuccessMsg(null), 5000);
     } catch (err: any) {
-      alert("Failed to purge alerts: " + err.message);
+      setActionError(`Purge failed: ${err.message || "request failed"}`);
     } finally {
       setPurging(false);
     }
@@ -125,38 +143,67 @@ export default function DashboardPage() {
             <h1 className="text-2xl font-black text-white tracking-tight">
               Phantom SOAR Mission Control
             </h1>
-            <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold border border-emerald-500/30">
-              LIVE SOC
-            </span>
+            {runtime && (
+              simulationMode ? (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-fuchsia-500/20 text-fuchsia-300 font-bold border border-fuchsia-500/30 flex items-center gap-1">
+                  <FlaskConical className="h-3 w-3" />
+                  SIMULATION
+                </span>
+              ) : (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold border border-emerald-500/30">
+                  LIVE CONNECTORS ONLY
+                </span>
+              )
+            )}
           </div>
           <p className="text-sm text-slate-400 max-w-2xl leading-relaxed">
-            Enterprise Security Orchestration, Automation, and Response. Autonomous HOTL containment,
-            HITL analyst verification, Wazuh telemetry enrichment, and executive ReportLab intelligence.
+            SIEM / EDR alert intake, multi-provider threat-intel enrichment, policy-guarded playbooks,
+            analyst review gates (HITL) and optional autonomous containment (HOTL) with PDF incident reports.
           </p>
+          {simulationMode && (
+            <p className="text-[11px] text-fuchsia-300/90 max-w-2xl">
+              Simulation mode is on: actions against connectors that are not configured are recorded as SIMULATED and change nothing on real systems.
+            </p>
+          )}
         </div>
 
         {/* PROMINENT DEMO SEEDER & DATA CONTROLS */}
-        <div className="flex flex-col sm:flex-row items-center gap-3">
-          <button
-            onClick={handleSeedDemo}
-            disabled={seeding || purging}
-            className="w-full sm:w-auto flex items-center justify-center space-x-2.5 px-6 py-3.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-sm shadow-xl shadow-blue-600/30 transition transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50"
-          >
-            <Zap className={`h-4 w-4 ${seeding ? "animate-spin text-amber-300" : "text-amber-400"}`} />
-            <span>{seeding ? "Injecting Live Demo Data..." : "Generate Demo Data"}</span>
-          </button>
+        {admin && (
+          <div className="flex flex-col sm:flex-row items-center gap-3">
+            {canSeedDemo && (
+              <button
+                onClick={handleSeedDemo}
+                disabled={seeding || purging}
+                title="Sends lab alert payloads through the real ingestion pipeline (simulation mode only)"
+                className="w-full sm:w-auto flex items-center justify-center space-x-2.5 px-6 py-3.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-sm shadow-xl shadow-blue-600/30 transition transform hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50"
+              >
+                <Zap className={`h-4 w-4 ${seeding ? "animate-spin text-amber-300" : "text-amber-400"}`} />
+                <span>{seeding ? "Ingesting Lab Alerts..." : "Generate Demo Data"}</span>
+              </button>
+            )}
 
-          <button
-            onClick={handlePurgeData}
-            disabled={seeding || purging}
-            className="w-full sm:w-auto flex items-center justify-center space-x-2 px-4 py-3.5 rounded-xl bg-slate-800/80 hover:bg-rose-950/40 text-slate-300 hover:text-rose-400 border border-slate-700 hover:border-rose-500/40 font-semibold text-xs transition disabled:opacity-50"
-            title="Empty all test/fake alerts and reset queue"
-          >
-            <Trash2 className={`h-3.5 w-3.5 ${purging ? "animate-spin text-rose-400" : ""}`} />
-            <span>{purging ? "Purging Cases..." : "Purge All Cases"}</span>
-          </button>
-        </div>
+            <button
+              onClick={handlePurgeData}
+              disabled={seeding || purging}
+              className="w-full sm:w-auto flex items-center justify-center space-x-2 px-4 py-3.5 rounded-xl bg-slate-800/80 hover:bg-rose-950/40 text-slate-300 hover:text-rose-400 border border-slate-700 hover:border-rose-500/40 font-semibold text-xs transition disabled:opacity-50"
+              title="Delete all alert cases (admin only)"
+            >
+              <Trash2 className={`h-3.5 w-3.5 ${purging ? "animate-spin text-rose-400" : ""}`} />
+              <span>{purging ? "Purging Cases..." : "Purge All Cases"}</span>
+            </button>
+          </div>
+        )}
       </div>
+
+      {actionError && (
+        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs font-semibold flex items-center justify-between animate-fade-in">
+          <span className="flex items-center gap-2">
+            <AlertCircle className="h-4 w-4 flex-shrink-0" />
+            {actionError}
+          </span>
+          <button onClick={() => setActionError(null)} className="text-slate-400 hover:text-white">✕</button>
+        </div>
+      )}
 
       {seedSuccessMsg && (
         <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-xs font-semibold flex items-center justify-between animate-fade-in">
@@ -239,7 +286,7 @@ export default function DashboardPage() {
             <span className="text-3xl font-black text-emerald-400">
               {metrics ? metrics.automated_actions : "--"}
             </span>
-            <span className="text-xs text-slate-500 font-medium">firewall / EDR / IAM</span>
+            <span className="text-xs text-slate-500 font-medium">EDR / firewall / IAM / ITSM</span>
           </div>
           <div className="mt-3 text-[11px] text-slate-400 flex items-center justify-between pt-2 border-t border-slate-800/60 group-hover:text-emerald-300 transition">
             <span>Contained Cases:</span>
@@ -261,13 +308,13 @@ export default function DashboardPage() {
           </div>
           <div className="flex items-baseline space-x-2">
             <span className="text-3xl font-black text-indigo-400">
-              {metrics ? `${metrics.avg_mttr_seconds}s` : "--"}
+              {metrics ? formatDuration(metrics.avg_mttr_seconds) : "--"}
             </span>
-            <span className="text-xs text-slate-500 font-medium">autonomous</span>
+            <span className="text-xs text-slate-500 font-medium">alert to response</span>
           </div>
           <div className="mt-3 text-[11px] text-slate-400 flex items-center justify-between pt-2 border-t border-slate-800/60 group-hover:text-indigo-300 transition">
-            <span>SLA Performance:</span>
-            <span className="font-bold text-slate-300">&lt; 3.0s SOAR SLA</span>
+            <span>Resolved Cases:</span>
+            <span className="font-bold text-slate-300">{metrics?.resolved_alerts ?? 0}</span>
           </div>
         </Link>
       </div>
@@ -286,12 +333,12 @@ export default function DashboardPage() {
 
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2 pt-2">
             {[
-              { phase: "Preparation", desc: "12 Playbooks Loaded", color: "border-blue-500/40 bg-blue-500/5 text-blue-300" },
-              { phase: "Identification", desc: "Wazuh SIEM Ingest", color: "border-indigo-500/40 bg-indigo-500/5 text-indigo-300" },
+              { phase: "Preparation", desc: "Playbooks & policy", color: "border-blue-500/40 bg-blue-500/5 text-blue-300" },
+              { phase: "Identification", desc: "SIEM ingest + TIP", color: "border-indigo-500/40 bg-indigo-500/5 text-indigo-300" },
               { phase: "Containment", desc: "HOTL / HITL Gate", color: "border-emerald-500/40 bg-emerald-500/5 text-emerald-300" },
-              { phase: "Eradication", desc: "Proc Kill / IP Drop", color: "border-purple-500/40 bg-purple-500/5 text-purple-300" },
-              { phase: "Recovery", desc: "Session Invalidation", color: "border-amber-500/40 bg-amber-500/5 text-amber-300" },
-              { phase: "Lessons", desc: "ReportLab PDF Generated", color: "border-rose-500/40 bg-rose-500/5 text-rose-300" },
+              { phase: "Eradication", desc: "Proc Kill / IP Block", color: "border-purple-500/40 bg-purple-500/5 text-purple-300" },
+              { phase: "Recovery", desc: "Session Revocation", color: "border-amber-500/40 bg-amber-500/5 text-amber-300" },
+              { phase: "Lessons", desc: "PDF Incident Report", color: "border-rose-500/40 bg-rose-500/5 text-rose-300" },
             ].map((p, idx) => (
               <div key={idx} className={`p-3 rounded-lg border flex flex-col justify-between ${p.color}`}>
                 <span className="text-[10px] font-mono font-bold uppercase opacity-75">Phase 0{idx + 1}</span>
@@ -380,7 +427,7 @@ export default function DashboardPage() {
                 <th className="py-3 px-4">Rule / Description</th>
                 <th className="py-3 px-4">Severity</th>
                 <th className="py-3 px-4">Status</th>
-                <th className="py-3 px-4">IoCs & VT Score</th>
+                <th className="py-3 px-4">IoCs & Max TIP Score</th>
                 <th className="py-3 px-4">Source</th>
                 <th className="py-3 px-4 text-right">Actions</th>
               </tr>
@@ -397,7 +444,7 @@ export default function DashboardPage() {
                         No active alerts in queue
                       </span>
                       <p className="text-[11px] text-slate-500 max-w-sm">
-                        SOAR intake pipeline is listening for live Wazuh SIEM, EDR, and Suricata telemetry.
+                        Alerts arrive through the authenticated webhooks (/api/webhooks/wazuh, /edr, /xdr).
                       </p>
                     </div>
                   </td>
@@ -431,7 +478,7 @@ export default function DashboardPage() {
                           </span>
                           {(alert.max_threat_score || 0) > 0 && (
                             <span className="text-[10px] px-1.5 py-0.2 rounded bg-rose-500/10 text-rose-400 font-mono font-bold">
-                              VT: {alert.max_threat_score}
+                              TIP: {alert.max_threat_score}/100
                             </span>
                           )}
                         </div>

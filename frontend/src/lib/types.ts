@@ -10,29 +10,77 @@ export interface User {
   is_active?: boolean;
   mfa_enabled?: boolean;
   compromised_reset_required?: boolean;
+  is_service_account?: boolean;
+  api_key_prefix?: string | null;
   password_changed_at?: string;
   created_at?: string;
 }
 
+export interface LoginResponse {
+  access_token: string;
+  token_type: string;
+  mfa_required?: boolean;
+  user: User;
+}
+
 export interface TestConnectionResult {
+  /** "Connected" | "Not Configured" | "Auth failed" | "Unreachable" | "Error" | "Configured (not tested to avoid posting)" */
   status: string;
   is_connected: boolean;
+  service?: string;
   service_name: string;
   category: string;
-  latency_ms: number;
-  health: string;
+  latency_ms?: number | null;
+  http_status?: number | null;
+  health?: string;
   message: string;
   tested_at?: string;
+}
+
+// --- Threat intelligence ---------------------------------------------------
+
+export type IocVerdict = 'Malicious' | 'Suspicious' | 'Clean' | 'Unknown';
+export type EnrichmentStatus = 'enriched' | 'partial' | 'unavailable' | 'not_configured' | 'pending';
+export type ProviderStatus = 'live' | 'not_found' | 'not_configured' | 'error' | 'lab_fixture' | 'skipped';
+
+export interface TipProviderResult {
+  provider: string;
+  status: ProviderStatus | string;
+  threat_score: number | null;
+  verdict: string | null;
+  summary?: Record<string, unknown> | null;
+  error?: string | null;
+  queried_at?: string | null;
+}
+
+/** Full enrich_ioc() result as stored on IocArtifact.tip_results. */
+export interface TipResults {
+  artifact_type?: string;
+  value?: string;
+  threat_score?: number;
+  verdict?: IocVerdict;
+  severity?: Severity | null;
+  enrichment_status?: EnrichmentStatus;
+  providers?: Record<string, TipProviderResult>;
+  consensus?: Record<string, unknown>;
+  [legacyKey: string]: unknown;
 }
 
 export interface IocArtifact {
   artifact_id: number;
   alert_id: number;
-  artifact_type: 'IP' | 'Hash' | 'URL' | 'Domain';
+  artifact_type: 'IP' | 'Hash' | 'URL' | 'Domain' | string;
   value: string;
   threat_score: number;
+  verdict?: IocVerdict | string;
+  enrichment_status?: EnrichmentStatus | string;
+  tip_results?: TipResults | null;
   created_at: string;
 }
+
+// --- Response actions ------------------------------------------------------
+
+export type ActionExecutionMode = 'live' | 'simulated' | 'skipped' | 'blocked' | 'failed';
 
 export interface ContainmentAction {
   action_id: number;
@@ -40,6 +88,10 @@ export interface ContainmentAction {
   action_type: string;
   status: string;
   executed_by?: string;
+  target?: string | null;
+  connector?: string | null;
+  execution_mode?: ActionExecutionMode | string | null;
+  details?: unknown;
   timestamp: string;
 }
 
@@ -62,28 +114,33 @@ export interface IncidentReport {
 
 export interface VulnerabilityDetail {
   cve_id: string;
-  title: string;
-  cvss_score: number;
-  severity: string;
-  attack_vector: string;
-  cwe?: string;
-  description: string;
-  hitl_remediation: string[];
-  hotl_action: string;
-  hotl_action_description: string;
+  title?: string;
+  cvss_score?: number | null;
+  severity?: string | null;
+  attack_vector?: string | null;
+  cwe?: string | null;
+  description?: string | null;
+  hitl_remediation?: string[];
+  hotl_action?: string;
+  hotl_action_description?: string;
   patches?: string[];
+  status?: string;
+  queried_at?: string;
 }
 
 export interface VulnerabilityIntel {
   cves_detected: string[];
-  max_cvss_score: number;
+  max_cvss_score?: number | null;
   vulnerabilities: VulnerabilityDetail[];
-  hitl_remediation_steps: string[];
-  hotl_autonomous_policy: {
+  hitl_remediation_steps?: string[];
+  hotl_autonomous_policy?: {
     eligible_for_hotl: boolean;
-    action_type: string;
-    justification: string;
+    action_type?: string;
+    justification?: string;
+    action_description?: string;
   };
+  status?: string;
+  message?: string;
 }
 
 export interface Alert {
@@ -102,18 +159,31 @@ export interface Alert {
   max_threat_score?: number;
 }
 
+export interface MitreAttack {
+  id: string[];
+  tactic: string[];
+  technique: string[];
+}
+
 export interface AlertDetail extends Alert {
   ioc_artifacts: IocArtifact[];
   playbook_executions: PlaybookExecution[];
   containment_actions: ContainmentAction[];
   incident_report?: IncidentReport | null;
-  mitre_attack?: {
-    id: string[];
-    tactic: string[];
-    technique: string[];
-  };
-  ai_summary?: string;
+  mitre_attack?: MitreAttack;
+  triage_summary?: string;
+  simulation_mode?: boolean;
+  playbook?: Playbook | null;
   vulnerability_intel?: VulnerabilityIntel;
+}
+
+export interface PlaybookStep {
+  order?: number;
+  step?: number;
+  action: string;
+  connector?: string;
+  params?: Record<string, unknown>;
+  [extra: string]: unknown;
 }
 
 export interface Playbook {
@@ -142,13 +212,52 @@ export interface DashboardMetrics {
   low_count: number;
 }
 
+// --- Configuration ---------------------------------------------------------
+
 export interface ConfigEntry {
   value: string;
   is_secret: boolean;
-  updated_at?: string;
+  is_set: boolean;
+  preview: string | null;
+  updated_at: string | null;
 }
 
+/** GET /api/configuration: {CATEGORY: {key_name: ConfigEntry}} */
 export type SystemConfigGroup = Record<string, Record<string, ConfigEntry>>;
+
+export interface ConfigUpdateItem {
+  category: string;
+  key_name: string;
+  key_value: string;
+  is_secret: boolean;
+  clear?: boolean;
+}
+
+export interface RuntimeStatus {
+  simulation_mode: boolean;
+  hotl_enabled: boolean;
+  integrations: {
+    virustotal: boolean;
+    abuseipdb: boolean;
+    otx: boolean;
+    threatfox: boolean;
+    nvd: boolean;
+    wazuh: boolean;
+    okta: boolean;
+    jira: boolean;
+    slack: boolean;
+    [name: string]: boolean;
+  };
+  agent_autonomy?: 'recommend_only' | 'low_impact' | 'policy' | string;
+  agent_min_confidence?: number;
+}
+
+export interface HotlStatus {
+  hotl_enabled: boolean;
+  mode: string;
+  status: string;
+  message?: string;
+}
 
 export interface SystemLog {
   log_id: number;

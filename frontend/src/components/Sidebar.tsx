@@ -1,114 +1,67 @@
 "use client";
 
-import React, { useEffect, useState, useCallback } from "react";
+import React from "react";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
-import { 
-  LayoutDashboard, 
-  ShieldAlert, 
-  ScrollText, 
-  Sliders, 
-  Shield, 
-  Radio, 
-  LogOut, 
-  Users, 
-  Terminal, 
+import { usePathname } from "next/navigation";
+import {
+  LayoutDashboard,
+  ShieldAlert,
+  ScrollText,
+  Sliders,
+  Shield,
+  LogOut,
+  Users,
+  Terminal,
   BarChart3,
   Lock,
-  UserCheck
+  FlaskConical
 } from "lucide-react";
-import { User } from "@/lib/types";
-import { getStoredUser, clearAuth, subscribeToAuth } from "@/lib/auth";
-import { syncCurrentUser } from "@/lib/api";
+import { useAuth } from "@/components/AuthGate";
+import { useRuntimeStatus } from "@/components/RuntimeStatusProvider";
+import { isAdmin, isSecEngOrAdmin } from "@/lib/roles";
+
+type Access = "all" | "sec_eng" | "admin";
 
 interface NavItem {
   name: string;
   href: string;
   icon: React.ElementType;
-  badge?: string;
-  adminOnly?: boolean;
+  access: Access;
 }
 
 const navItems: NavItem[] = [
-  { name: "Dashboard", href: "/", icon: LayoutDashboard },
-  { name: "Alerts & Cases", href: "/alerts", icon: ShieldAlert },
-  { name: "Playbooks", href: "/playbooks", icon: ScrollText },
-  { name: "Logs & Telemetry", href: "/logs", icon: Terminal },
-  { name: "Admin Reports", href: "/reports", icon: BarChart3, badge: "Admin", adminOnly: true },
-  { name: "Configuration", href: "/configuration", icon: Sliders },
-  { name: "Accounts & IAM", href: "/accounts", icon: Users, badge: "Admin", adminOnly: true },
+  { name: "Dashboard", href: "/", icon: LayoutDashboard, access: "all" },
+  { name: "Alerts & Cases", href: "/alerts", icon: ShieldAlert, access: "all" },
+  { name: "Playbooks", href: "/playbooks", icon: ScrollText, access: "all" },
+  { name: "Logs & Telemetry", href: "/logs", icon: Terminal, access: "all" },
+  { name: "Admin Reports", href: "/reports", icon: BarChart3, access: "admin" },
+  { name: "Configuration", href: "/configuration", icon: Sliders, access: "sec_eng" },
+  { name: "Accounts & IAM", href: "/accounts", icon: Users, access: "admin" },
 ];
+
+const ACCESS_BADGE: Record<Access, string | null> = {
+  all: null,
+  sec_eng: "Sec Eng",
+  admin: "Admin",
+};
+
+const TIP_PROVIDERS = ["virustotal", "abuseipdb", "otx", "threatfox"] as const;
 
 export default function Sidebar() {
   const pathname = usePathname();
-  const router = useRouter();
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [mounted, setMounted] = useState<boolean>(false);
+  const { user, logout } = useAuth();
+  const { status } = useRuntimeStatus();
 
-  // Sync user state from local storage and backend
-  const refreshUser = useCallback(async () => {
-    // 1. Immediate sync from local storage
-    const stored = getStoredUser();
-    if (stored) {
-      setCurrentUser(stored);
-    } else {
-      setCurrentUser(null);
-    }
+  const admin = isAdmin(user);
+  const secEng = isSecEngOrAdmin(user);
 
-    // 2. Reconcile with live backend token verification if not on login page
-    if (pathname !== "/login") {
-      try {
-        const liveUser = await syncCurrentUser();
-        if (liveUser) {
-          setCurrentUser(liveUser);
-        } else if (!stored) {
-          setCurrentUser(null);
-        }
-      } catch {
-        // Fallback to local storage if network glitch
-      }
-    }
-  }, [pathname]);
+  const hasAccess = (access: Access) =>
+    access === "all" || (access === "admin" ? admin : secEng);
 
-  useEffect(() => {
-    setMounted(true);
-    refreshUser();
+  const userInitials = user?.username ? user.username.trim().slice(0, 2).toUpperCase() : "??";
 
-    // Listen for custom auth events and storage modifications
-    const unsubscribe = subscribeToAuth((updatedUser) => {
-      setCurrentUser(updatedUser);
-    });
-
-    return () => {
-      unsubscribe();
-    };
-  }, [refreshUser]);
-
-  // Re-verify whenever pathname changes (e.g., returning from /login)
-  useEffect(() => {
-    if (mounted && pathname !== "/login") {
-      refreshUser();
-    }
-  }, [pathname, mounted, refreshUser]);
-
-  const handleLogout = () => {
-    clearAuth();
-    setCurrentUser(null);
-    router.push("/login");
-  };
-
-  if (pathname === "/login") return null;
-
-  const isAdmin = Boolean(
-    currentUser?.role && (
-      currentUser.role.toLowerCase().includes("admin") || 
-      currentUser.role.toLowerCase().includes("lead")
-    )
-  );
-
-  const userInitials = currentUser?.username
-    ? currentUser.username.trim().slice(0, 2).toUpperCase()
-    : "??";
+  const integrations = status?.integrations;
+  const tipConfigured = integrations ? TIP_PROVIDERS.filter((p) => integrations[p]).length : null;
 
   return (
     <aside className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col h-screen fixed left-0 top-0 select-none z-30">
@@ -126,7 +79,7 @@ export default function Sidebar() {
               </span>
             </div>
             <p className="text-[10px] text-slate-400 uppercase tracking-widest font-semibold mt-0.5">
-              Enterprise SecOps v2.0
+              SecOps Console v2.0
             </p>
           </div>
         </div>
@@ -139,11 +92,9 @@ export default function Sidebar() {
         </div>
         {navItems.map((item) => {
           const Icon = item.icon;
-          const isActive = item.href === "/" 
-            ? pathname === "/" 
-            : pathname.startsWith(item.href) || (item.href === "/configuration" && pathname.startsWith("/configration"));
-
-          const isRestrictedForAnalyst = item.adminOnly && !isAdmin;
+          const isActive = item.href === "/" ? pathname === "/" : pathname.startsWith(item.href);
+          const restricted = !hasAccess(item.access);
+          const badge = ACCESS_BADGE[item.access];
 
           return (
             <Link
@@ -152,62 +103,76 @@ export default function Sidebar() {
               className={`flex items-center justify-between px-3.5 py-2.5 rounded-lg text-sm font-medium transition-all duration-150 group ${
                 isActive
                   ? "bg-blue-600 text-white shadow-md shadow-blue-600/25"
-                  : isRestrictedForAnalyst
+                  : restricted
                   ? "text-slate-500 hover:text-slate-400 hover:bg-slate-900/40 opacity-80"
                   : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/80"
               }`}
             >
               <div className="flex items-center space-x-3">
                 <Icon className={`h-4 w-4 ${
-                  isActive 
-                    ? "text-white" 
-                    : isRestrictedForAnalyst 
-                    ? "text-slate-600" 
+                  isActive
+                    ? "text-white"
+                    : restricted
+                    ? "text-slate-600"
                     : "text-slate-400 group-hover:text-slate-200"
                 }`} />
                 <span>{item.name}</span>
               </div>
-              {item.badge && (
+              {badge && (
                 <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1 ${
-                  isActive 
-                    ? "bg-white/20 text-white" 
-                    : isRestrictedForAnalyst
+                  isActive
+                    ? "bg-white/20 text-white"
+                    : restricted
                     ? "bg-amber-950/40 text-amber-400 border border-amber-800/40"
                     : "bg-blue-950/60 text-blue-400 border border-blue-800/40"
                 }`}>
-                  {isRestrictedForAnalyst && <Lock className="h-2.5 w-2.5" />}
-                  {item.badge}
+                  {restricted && <Lock className="h-2.5 w-2.5" />}
+                  {badge}
                 </span>
               )}
             </Link>
           );
         })}
 
-        {/* Frameworks & Architecture Standards */}
+        {/* Live platform status (from /api/configuration/runtime-status) */}
         <div className="pt-6 px-3">
           <div className="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-2">
-            Standards & Frameworks
+            Platform Status
           </div>
           <div className="bg-slate-900/60 border border-slate-800/80 rounded-lg p-3 space-y-2 text-xs">
+            {status ? (
+              <>
+                <div className="flex items-center justify-between text-slate-300">
+                  <span className="flex items-center gap-1.5 font-medium">
+                    {status.simulation_mode && <FlaskConical className="h-3 w-3 text-fuchsia-400" />}
+                    Response connectors
+                  </span>
+                  <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${
+                    status.simulation_mode ? "text-fuchsia-300 bg-fuchsia-500/10" : "text-emerald-400 bg-emerald-500/10"
+                  }`}>
+                    {status.simulation_mode ? "Simulated" : "Live only"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-slate-300">
+                  <span className="font-medium">Threat intel</span>
+                  <span className="text-[10px] text-blue-400 bg-blue-500/10 px-1.5 py-0.5 rounded font-mono">
+                    {tipConfigured}/{TIP_PROVIDERS.length} configured
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-slate-300">
+                  <span className="font-medium">NVD CVE lookup</span>
+                  <span className="text-[10px] text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded font-mono">
+                    {integrations?.nvd ? "API key set" : "No API key"}
+                  </span>
+                </div>
+              </>
+            ) : (
+              <div className="text-[11px] text-slate-500">Runtime status unavailable.</div>
+            )}
             <div className="flex items-center justify-between text-slate-300">
-              <span className="flex items-center gap-1.5 font-medium">
-                <Radio className="h-3 w-3 text-emerald-400 animate-pulse" />
-                NIST SP 800-63B
-              </span>
-              <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded font-mono">Enforced</span>
-            </div>
-            <div className="flex items-center justify-between text-slate-300">
-              <span className="font-medium">Multi-TIP Engine</span>
-              <span className="text-[10px] text-blue-400 bg-blue-500/10 px-1.5 py-0.5 rounded font-mono">3 TIPs</span>
-            </div>
-            <div className="flex items-center justify-between text-slate-300">
-              <span className="font-medium">NVD CVE Intel</span>
-              <span className="text-[10px] text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded font-mono">API 2.0</span>
-            </div>
-            <div className="flex items-center justify-between text-slate-300">
-              <span className="font-medium">RBAC Security</span>
+              <span className="font-medium">Your access</span>
               <span className="text-[10px] text-purple-400 bg-purple-500/10 px-1.5 py-0.5 rounded font-mono">
-                {isAdmin ? "Admin Role" : "Analyst Role"}
+                {admin ? "Admin" : secEng ? "Sec Eng" : "Analyst"}
               </span>
             </div>
           </div>
@@ -217,45 +182,27 @@ export default function Sidebar() {
       {/* User Profile & Logout Footer */}
       <div className="p-3 border-t border-slate-800/80 bg-slate-950/80 space-y-2">
         <div className="flex items-center justify-between p-2 rounded-xl bg-slate-900 border border-slate-800/80">
-          {currentUser ? (
-            <div className="flex items-center space-x-2.5 overflow-hidden">
-              <div className="h-8 w-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center font-bold text-xs text-white flex-shrink-0 shadow-sm shadow-blue-500/20">
-                {userInitials}
-              </div>
-              <div className="overflow-hidden">
-                <span className="text-xs font-bold text-white block truncate" title={currentUser.username}>
-                  {currentUser.username}
-                </span>
-                <span className="text-[10px] text-slate-400 block truncate" title={currentUser.role}>
-                  {currentUser.role}
-                </span>
-              </div>
+          <div className="flex items-center space-x-2.5 overflow-hidden">
+            <div className="h-8 w-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center font-bold text-xs text-white flex-shrink-0 shadow-sm shadow-blue-500/20">
+              {userInitials}
             </div>
-          ) : (
-            <Link href="/login" className="flex items-center space-x-2.5 overflow-hidden group">
-              <div className="h-8 w-8 rounded-lg bg-slate-800 flex items-center justify-center font-bold text-xs text-slate-400 flex-shrink-0 group-hover:bg-blue-600 group-hover:text-white transition">
-                <UserCheck className="h-4 w-4" />
-              </div>
-              <div className="overflow-hidden">
-                <span className="text-xs font-bold text-slate-300 group-hover:text-blue-400 block truncate">
-                  Unauthenticated
-                </span>
-                <span className="text-[10px] text-slate-500 block truncate">
-                  Click to Sign In
-                </span>
-              </div>
-            </Link>
-          )}
+            <div className="overflow-hidden">
+              <span className="text-xs font-bold text-white block truncate" title={user?.username}>
+                {user?.username || "Unknown operator"}
+              </span>
+              <span className="text-[10px] text-slate-400 block truncate" title={user?.role}>
+                {user?.role || ""}
+              </span>
+            </div>
+          </div>
 
-          {currentUser && (
-            <button
-              onClick={handleLogout}
-              className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-950/40 text-slate-400 hover:text-rose-400 transition"
-              title="Log Out of SOC Session"
-            >
-              <LogOut className="h-4 w-4" />
-            </button>
-          )}
+          <button
+            onClick={logout}
+            className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-950/40 text-slate-400 hover:text-rose-400 transition"
+            title="Sign out (revokes this session token)"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
         </div>
       </div>
     </aside>

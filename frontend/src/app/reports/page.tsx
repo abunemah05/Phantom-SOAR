@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { 
   BarChart3, 
   Calendar, 
@@ -20,6 +20,8 @@ import {
 import { api } from "@/lib/api";
 import { AdminReportData, User } from "@/lib/types";
 import { getStoredUser, subscribeToAuth } from "@/lib/auth";
+import { isAdmin } from "@/lib/roles";
+import { formatDuration } from "@/lib/format";
 
 export default function AdminReportsPage() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -36,6 +38,7 @@ export default function AdminReportsPage() {
   const [report, setReport] = useState<AdminReportData | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState<boolean>(false);
 
   const evaluateAuth = (user: User | null) => {
     setCurrentUser(user);
@@ -43,8 +46,7 @@ export default function AdminReportsPage() {
       setIsAuthorized(false);
       return false;
     }
-    const roleLower = (user.role || "").toLowerCase();
-    const authorized = roleLower.includes("admin") || roleLower.includes("lead");
+    const authorized = isAdmin(user);
     setIsAuthorized(authorized);
     return authorized;
   };
@@ -71,7 +73,7 @@ export default function AdminReportsPage() {
     }
   };
 
-  const loadReport = async () => {
+  const loadReport = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -87,12 +89,32 @@ export default function AdminReportsPage() {
     } finally {
       setLoading(false);
     }
-  };
+    // Custom date ranges are applied explicitly through the filter form.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [period, selectedAnalyst]);
 
   useEffect(() => {
+    if (!isAuthorized) return;
     loadAnalysts();
     loadReport();
-  }, [period, selectedAnalyst]);
+  }, [isAuthorized, loadReport]);
+
+  const handleDownloadPdf = async () => {
+    setDownloading(true);
+    setError(null);
+    try {
+      await api.downloadAdminReportPdf({
+        analyst: selectedAnalyst,
+        period,
+        start_date: period === "custom" ? startDate : undefined,
+        end_date: period === "custom" ? endDate : undefined,
+      });
+    } catch (err: any) {
+      setError(`PDF export failed: ${err.message || "request failed"}`);
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   const handleApplyCustomFilter = (e: React.FormEvent) => {
     e.preventDefault();
@@ -113,13 +135,6 @@ export default function AdminReportsPage() {
     );
   }
 
-  const pdfDownloadUrl = api.getAdminReportPdfUrl({
-    analyst: selectedAnalyst,
-    period,
-    start_date: period === "custom" ? startDate : undefined,
-    end_date: period === "custom" ? endDate : undefined,
-  });
-
   return (
     <div className="space-y-6">
       {/* Top Header */}
@@ -138,15 +153,14 @@ export default function AdminReportsPage() {
 
         {/* Export PDF Button */}
         <div className="flex items-center space-x-3">
-          <a
-            href={pdfDownloadUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center space-x-2 px-4 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shadow-lg shadow-blue-600/20 transition duration-150"
+          <button
+            onClick={handleDownloadPdf}
+            disabled={downloading}
+            className="flex items-center space-x-2 px-4 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shadow-lg shadow-blue-600/20 transition duration-150 disabled:opacity-50"
           >
-            <Download className="h-4 w-4" />
-            <span>Export Executive PDF Report</span>
-          </a>
+            <Download className={`h-4 w-4 ${downloading ? "animate-pulse" : ""}`} />
+            <span>{downloading ? "Preparing PDF..." : "Export Executive PDF Report"}</span>
+          </button>
           <button
             onClick={loadReport}
             disabled={loading}
@@ -265,7 +279,7 @@ export default function AdminReportsPage() {
           <div className="text-2xl font-black text-emerald-400">
             {report?.total_containment_actions ?? 0}
           </div>
-          <span className="text-[11px] text-slate-500 mt-1 block">Host & IP isolations</span>
+          <span className="text-[11px] text-slate-500 mt-1 block">Response actions recorded (live and simulated)</span>
         </div>
 
         <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
@@ -274,7 +288,7 @@ export default function AdminReportsPage() {
             <Clock className="h-4 w-4 text-amber-400" />
           </div>
           <div className="text-2xl font-black text-amber-400">
-            {report?.average_mttr_seconds ? `${report.average_mttr_seconds}s` : "0.0s"}
+            {formatDuration(report?.average_mttr_seconds)}
           </div>
           <span className="text-[11px] text-slate-500 mt-1 block">Mean Time to Remediate</span>
         </div>
@@ -337,7 +351,7 @@ export default function AdminReportsPage() {
                     <td className="py-3 px-4 text-amber-400 font-semibold">{a.monitored_count}</td>
                     <td className="py-3 px-4 text-slate-400">{a.dismissed_count}</td>
                     <td className="py-3 px-4 text-emerald-400 font-bold">{a.containment_actions_taken}</td>
-                    <td className="py-3 px-4 font-mono text-slate-300">{a.avg_mttr_seconds}s</td>
+                    <td className="py-3 px-4 font-mono text-slate-300">{formatDuration(a.avg_mttr_seconds)}</td>
                   </tr>
                 ))
               ) : (

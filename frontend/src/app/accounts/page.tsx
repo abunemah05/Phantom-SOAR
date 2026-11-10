@@ -17,11 +17,13 @@ import {
   Clock, 
   X,
   Search,
-  BadgeCheck
+  BadgeCheck,
+  Bot
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { User } from "@/lib/types";
 import { getStoredUser, subscribeToAuth } from "@/lib/auth";
+import { ASSIGNABLE_ROLES, ROLE_SOC_ANALYST, isAdmin, roleLevel } from "@/lib/roles";
 
 export default function AccountsPage() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -35,7 +37,7 @@ export default function AccountsPage() {
   // Modal State
   const [showCreateModal, setShowCreateModal] = useState<boolean>(false);
   const [newUsername, setNewUsername] = useState<string>("");
-  const [newRole, setNewRole] = useState<string>("Tier 1 Analyst (Triage & Monitoring)");
+  const [newRole, setNewRole] = useState<string>(ROLE_SOC_ANALYST);
   const [createLoading, setCreateLoading] = useState<boolean>(false);
   const [modalError, setModalError] = useState<string | null>(null);
 
@@ -45,8 +47,7 @@ export default function AccountsPage() {
       setIsAuthorized(false);
       return false;
     }
-    const roleLower = (user.role || "").toLowerCase();
-    const authorized = roleLower.includes("admin") || roleLower.includes("lead");
+    const authorized = isAdmin(user);
     setIsAuthorized(authorized);
     return authorized;
   };
@@ -92,14 +93,19 @@ export default function AccountsPage() {
     setModalError(null);
 
     try {
-      await api.createUser({
+      const created = await api.createUser({
         username: newUsername.trim(),
         role: newRole,
       });
+      const tempPassword = created?.temporary_password || created?.default_password;
       setShowCreateModal(false);
       setNewUsername("");
-      setNewRole("Tier 1 Analyst (Triage & Monitoring)");
-      setSuccessMsg(`Operator account created successfully with default password 'PhantomSOAR1@'.`);
+      setNewRole(ROLE_SOC_ANALYST);
+      setSuccessMsg(
+        tempPassword
+          ? `Operator '${created.username}' created. One-time password: ${tempPassword} (shown once; the operator must change it at first sign-in).`
+          : `Operator '${created?.username || newUsername.trim()}' created. The operator must change the initial password at first sign-in.`
+      );
       loadUsers();
     } catch (err: any) {
       setModalError(err.message || "Failed to create user account.");
@@ -108,14 +114,20 @@ export default function AccountsPage() {
     }
   };
 
-  const handleResetPassword = async (userId: number, username: string) => {
-    if (!confirm(`Are you sure you want to reset the password for '${username}' back to default 'PhantomSOAR1@'? The user will be required to change it on their next login.`)) {
+  const handleResetPassword = async (target: User) => {
+    if (target.is_service_account) return;
+    if (!confirm(`Reset the password for '${target.username}'? Their current sessions end and they must set a new password at next sign-in.`)) {
       return;
     }
 
     try {
-      await api.resetUserPassword(userId);
-      setSuccessMsg(`Password for '${username}' was reset to 'PhantomSOAR1@'. Operator must change it upon next login.`);
+      const res = await api.resetUserPassword(target.user_id);
+      const tempPassword = res?.temporary_password || res?.default_password;
+      setSuccessMsg(
+        tempPassword
+          ? `Password for '${target.username}' was reset. One-time password: ${tempPassword} (shown once; it must be changed at next sign-in).`
+          : res?.message || `Password for '${target.username}' was reset; it must be changed at next sign-in.`
+      );
       loadUsers();
     } catch (err: any) {
       setError(err.message || "Failed to reset operator password.");
@@ -175,8 +187,9 @@ export default function AccountsPage() {
   // Statistics
   const totalUsers = users.length;
   const activeCount = users.filter((u) => u.is_active !== false).length;
-  const pendingPasswordCount = users.filter((u) => u.must_change_password).length;
-  const adminCount = users.filter((u) => u.role.toLowerCase().includes("admin") || u.role.toLowerCase().includes("lead")).length;
+  const pendingPasswordCount = users.filter((u) => u.must_change_password && !u.is_service_account).length;
+  const adminCount = users.filter((u) => isAdmin(u)).length;
+  const serviceAccountCount = users.filter((u) => u.is_service_account).length;
 
   if (!isAuthorized) {
     return (
@@ -286,16 +299,16 @@ export default function AccountsPage() {
             <KeyRound className="h-4 w-4 text-amber-400" />
           </div>
           <div className="text-2xl font-black text-amber-400">{pendingPasswordCount}</div>
-          <span className="text-[11px] text-slate-500 font-medium">Must update default password</span>
+          <span className="text-[11px] text-slate-500 font-medium">Must change initial password</span>
         </div>
 
         <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
           <div className="flex items-center justify-between text-slate-400 text-xs mb-1">
-            <span>SOC Admins / Leads</span>
+            <span>Administrators</span>
             <Shield className="h-4 w-4 text-purple-400" />
           </div>
           <div className="text-2xl font-black text-purple-400">{adminCount}</div>
-          <span className="text-[11px] text-slate-500 font-medium">High privilege accounts</span>
+          <span className="text-[11px] text-slate-500 font-medium">High privilege accounts{serviceAccountCount > 0 ? ` · ${serviceAccountCount} service account${serviceAccountCount === 1 ? "" : "s"}` : ""}</span>
         </div>
       </div>
 
@@ -350,6 +363,8 @@ export default function AccountsPage() {
                 filteredUsers.map((user) => {
                   const isRootAdmin = user.username === "abunemah";
                   const isActive = user.is_active !== false;
+                  const isService = Boolean(user.is_service_account);
+                  const level = roleLevel(user);
 
                   return (
                     <tr key={user.user_id} className="hover:bg-slate-800/40 transition">
@@ -371,6 +386,15 @@ export default function AccountsPage() {
                                   Root Admin
                                 </span>
                               )}
+                              {isService && (
+                                <span
+                                  className="inline-flex items-center gap-1 text-[10px] bg-cyan-500/15 text-cyan-300 px-1.5 py-0.2 rounded border border-cyan-500/30 font-semibold"
+                                  title="Non-human account for the AI agent API. Authenticates with an API key, cannot sign in to the console."
+                                >
+                                  <Bot className="h-3 w-3" />
+                                  Service account
+                                </span>
+                              )}
                             </div>
                             <span className="text-[11px] text-slate-500 font-mono">ID #{user.user_id}</span>
                           </div>
@@ -380,14 +404,14 @@ export default function AccountsPage() {
                       {/* Assigned Role */}
                       <td className="py-3.5 px-4">
                         <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border ${
-                          user.role.toLowerCase().includes("admin")
+                          level === "admin"
                             ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
-                            : user.role.toLowerCase().includes("lead")
+                            : level === "security_engineer"
                             ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
-                            : user.role.toLowerCase().includes("tier 2")
+                            : level === "analyst"
                             ? "bg-blue-500/10 text-blue-400 border-blue-500/20"
-                            : user.role.toLowerCase().includes("tier 1")
-                            ? "bg-sky-500/10 text-sky-400 border-sky-500/20"
+                            : level === "service"
+                            ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20"
                             : "bg-slate-700/30 text-slate-300 border-slate-600/40"
                         }`}>
                           {user.role}
@@ -396,7 +420,12 @@ export default function AccountsPage() {
 
                       {/* Credential Status */}
                       <td className="py-3.5 px-4">
-                        {user.must_change_password ? (
+                        {isService ? (
+                          <span className="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
+                            <KeyRound className="h-3 w-3" />
+                            <span>API key{user.api_key_prefix ? ` (${user.api_key_prefix}…)` : ""}</span>
+                          </span>
+                        ) : user.must_change_password ? (
                           <span className="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
                             <Clock className="h-3 w-3" />
                             <span>Pending First Login Change</span>
@@ -432,23 +461,26 @@ export default function AccountsPage() {
                       {/* Actions */}
                       <td className="py-3.5 px-4 text-right">
                         <div className="flex items-center justify-end space-x-2">
-                          {/* Reset Password to Default */}
-                          <button
-                            onClick={() => handleResetPassword(user.user_id, user.username)}
-                            title="Reset password back to default (PhantomSOAR1@)"
-                            className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-400 transition"
-                          >
-                            <KeyRound className="h-3.5 w-3.5" />
-                          </button>
+                          {/* Password actions apply to human operators only; service accounts have no password. */}
+                          {!isService && (
+                            <>
+                              <button
+                                onClick={() => handleResetPassword(user)}
+                                title="Reset password (issues a one-time password that must be changed at next sign-in)"
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-400 transition"
+                              >
+                                <KeyRound className="h-3.5 w-3.5" />
+                              </button>
 
-                          {/* Flag Account as Suspected Compromised (NIST SP 800-63B) */}
-                          <button
-                            onClick={() => handleFlagCompromised(user.user_id, user.username)}
-                            title="Flag as Compromised (Forces reset per NIST SP 800-63B)"
-                            className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-500/20 text-rose-400 transition"
-                          >
-                            <Shield className="h-3.5 w-3.5" />
-                          </button>
+                              <button
+                                onClick={() => handleFlagCompromised(user.user_id, user.username)}
+                                title="Flag as Compromised (Forces reset per NIST SP 800-63B)"
+                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-500/20 text-rose-400 transition"
+                              >
+                                <Shield className="h-3.5 w-3.5" />
+                              </button>
+                            </>
+                          )}
 
                           {/* Toggle Active / Disabled */}
                           {!isRootAdmin && (
@@ -524,13 +556,13 @@ export default function AccountsPage() {
             <div className="mb-5 p-3.5 rounded-xl bg-blue-950/40 border border-blue-500/30 text-xs text-slate-300 space-y-1.5">
               <div className="flex items-center space-x-2 text-blue-400 font-bold">
                 <KeyRound className="h-4 w-4" />
-                <span>Default Password Policy:</span>
+                <span>Initial Password Policy:</span>
               </div>
               <p className="text-[11px] text-slate-400">
-                New accounts are initialized with temporary password: <code className="text-blue-300 font-mono font-bold bg-blue-900/40 px-1 py-0.5 rounded">PhantomSOAR1@</code>
+                The server issues the initial password. If it returns a one-time password it is shown once after creation; share it with the operator over a trusted channel.
               </p>
               <p className="text-[11px] text-amber-400 font-medium">
-                * The operator will be required to change this password immediately upon their first login.
+                * The operator must change it at first sign-in. AI agent service accounts are provisioned through the agent API, not here.
               </p>
             </div>
 
@@ -555,13 +587,13 @@ export default function AccountsPage() {
                   onChange={(e) => setNewRole(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none focus:border-blue-500 font-medium"
                 >
-                  <option value="Tier 1 Analyst (Triage & Monitoring)">Tier 1 Analyst (Triage & Monitoring)</option>
-                  <option value="Tier 2 Analyst (Senior Responder)">Tier 2 Analyst (Senior Responder)</option>
-                  <option value="SOC Lead / Incident Commander">SOC Lead / Incident Commander</option>
-                  <option value="Threat Hunter / Intel Specialist">Threat Hunter / Intel Specialist</option>
-                  <option value="SOC Auditor (Read-Only)">SOC Auditor (Read-Only)</option>
-                  <option value="Lead SOC Architect / Admin">Lead SOC Architect / Admin</option>
+                  {ASSIGNABLE_ROLES.map((r) => (
+                    <option key={r.role} value={r.role}>{r.role}</option>
+                  ))}
                 </select>
+                <p className="text-[11px] text-slate-500">
+                  {ASSIGNABLE_ROLES.find((r) => r.role === newRole)?.description}
+                </p>
               </div>
 
               <div className="pt-3 flex items-center justify-end space-x-3">

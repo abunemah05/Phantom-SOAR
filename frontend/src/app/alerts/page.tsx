@@ -152,7 +152,7 @@ function AlertsContent() {
               Alerts & Incident Investigation Workspace
             </h1>
             <span className="text-xs font-mono px-2 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/20 font-bold">
-              {filteredAlerts.length} Active Cases
+              {filteredAlerts.length} {filteredAlerts.length === 1 ? "Case" : "Cases"}
             </span>
           </div>
           <p className="text-sm text-slate-400 mt-1">
@@ -275,7 +275,7 @@ function AlertsContent() {
                       <p className="text-xs text-slate-500 max-w-sm">
                         {statusFilter !== "ALL" || severityFilter !== "ALL" || search
                           ? "Try clearing filters to view all telemetry events."
-                          : "The SOAR system is listening for live SIEM, EDR, and Suricata telemetry."}
+                          : "Alerts arrive through the authenticated SIEM / EDR / XDR webhooks."}
                       </p>
                       {(statusFilter !== "ALL" || severityFilter !== "ALL" || search) && (
                         <button
@@ -303,7 +303,7 @@ function AlertsContent() {
                         {alert.rule_id}
                       </div>
                       <div className="text-[11px] text-slate-400 truncate mt-0.5">
-                        {alert.raw_payload?.rule?.description || alert.raw_payload?.full_log || "Wazuh detection match"}
+                        {alert.raw_payload?.rule?.description || alert.raw_payload?.full_log || alert.source}
                       </div>
                     </td>
                     <td className="py-4 px-4">
@@ -323,7 +323,7 @@ function AlertsContent() {
                         </span>
                         {(alert.max_threat_score || 0) > 0 && (
                           <span className="text-[10px] px-1.5 py-0.2 rounded bg-rose-500/10 text-rose-400 font-mono font-bold">
-                            Score: {alert.max_threat_score}/100
+                            Max TIP score: {alert.max_threat_score}/100
                           </span>
                         )}
                       </div>

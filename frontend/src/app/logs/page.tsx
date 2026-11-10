@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { 
   Terminal, 
   RefreshCw, 
@@ -8,7 +8,6 @@ import {
   Filter, 
   Search, 
   Trash2, 
-  Zap, 
   CheckCircle2, 
   AlertCircle, 
   ShieldAlert, 
@@ -25,10 +24,13 @@ import {
   Bell, 
   ScrollText, 
   SlidersHorizontal,
+  Lock,
   X
 } from "lucide-react";
 import { api } from "@/lib/api";
+import { isAdmin } from "@/lib/roles";
 import { SystemLog } from "@/lib/types";
+import { useAuth } from "@/components/AuthGate";
 
 const SOURCES = [
   { id: "ALL", label: "All Sources" },
@@ -40,6 +42,7 @@ const SOURCES = [
   { id: "IAM", label: "IAM & Identity", icon: Key },
   { id: "ITSM", label: "ITSM & Webhooks", icon: Bell },
   { id: "AUTOMATION", label: "Automation Playbooks", icon: ScrollText },
+  { id: "AUTH", label: "Authentication", icon: Lock },
 ];
 
 const TIME_PRESETS = [
@@ -52,6 +55,8 @@ const TIME_PRESETS = [
 ];
 
 export default function LogsPage() {
+  const { user } = useAuth();
+  const canClearLogs = isAdmin(user);
   const [logs, setLogs] = useState<SystemLog[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -68,7 +73,7 @@ export default function LogsPage() {
   const [expandedLogIds, setExpandedLogIds] = useState<Record<number, boolean>>({});
   const [actionNotice, setActionNotice] = useState<string | null>(null);
 
-  const fetchLogs = async (showLoading: boolean = false) => {
+  const fetchLogs = useCallback(async (showLoading: boolean = false) => {
     if (showLoading) setLoading(true);
     try {
       const activeSeconds = customSecondsInput && parseInt(customSecondsInput) > 0 
@@ -89,11 +94,11 @@ export default function LogsPage() {
     } finally {
       if (showLoading) setLoading(false);
     }
-  };
+  }, [customSecondsInput, selectedSeconds, selectedSource, selectedLevel, searchQuery]);
 
   useEffect(() => {
     fetchLogs(true);
-  }, [selectedSource, selectedSeconds, selectedLevel, searchQuery]);
+  }, [fetchLogs]);
 
   // Live Stream Polling (every 3 seconds if active)
   useEffect(() => {
@@ -102,7 +107,7 @@ export default function LogsPage() {
       fetchLogs(false);
     }, 3000);
     return () => clearInterval(interval);
-  }, [isLiveStreaming, selectedSource, selectedSeconds, selectedLevel, searchQuery, customSecondsInput]);
+  }, [isLiveStreaming, fetchLogs]);
 
   const handleApplyCustomSeconds = (e: React.FormEvent) => {
     e.preventDefault();
@@ -110,17 +115,6 @@ export default function LogsPage() {
     if (!isNaN(parsed) && parsed > 0) {
       setSelectedSeconds(parsed);
       fetchLogs(true);
-    }
-  };
-
-  const handleSeedFreshLogs = async () => {
-    try {
-      await api.seedLogs();
-      setActionNotice("Injected fresh real-time security events into telemetry stream.");
-      fetchLogs(true);
-      setTimeout(() => setActionNotice(null), 3500);
-    } catch (err: any) {
-      setError("Failed to seed fresh logs.");
     }
   };
 
@@ -132,7 +126,7 @@ export default function LogsPage() {
       setActionNotice("All telemetry and audit logs cleared.");
       setTimeout(() => setActionNotice(null), 3500);
     } catch (err: any) {
-      setError("Failed to clear logs.");
+      setError(`Failed to clear logs: ${err.message || "request failed"}`);
     }
   };
 
@@ -207,11 +201,11 @@ export default function LogsPage() {
               <h1 className="text-xl font-bold text-white flex items-center gap-2.5">
                 Centralized Telemetry & Audit Logs
                 <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 font-bold border border-blue-500/30 font-mono">
-                  LIVE STREAM
+                  AUTO-REFRESH
                 </span>
               </h1>
               <p className="text-xs text-slate-400">
-                Unified security telemetry across EDR, XDR, Wazuh SIEM, Threat Intel, Firewall ACLs, and Autonomous Playbooks.
+                Events recorded by the platform: alert ingestion, threat-intel enrichment, response actions (live or simulated), playbooks and sign-ins.
               </p>
             </div>
           </div>
@@ -241,16 +235,6 @@ export default function LogsPage() {
             )}
           </button>
 
-          {/* Inject Test Telemetry Button */}
-          <button
-            onClick={handleSeedFreshLogs}
-            className="flex items-center space-x-1.5 px-3 py-1.5 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/30 rounded-xl text-xs font-semibold transition"
-            title="Inject fresh real-time events to see live updates"
-          >
-            <Zap className="h-3.5 w-3.5 text-indigo-400" />
-            <span>Inject Telemetry</span>
-          </button>
-
           {/* Refresh Manual Button */}
           <button
             onClick={() => fetchLogs(true)}
@@ -261,14 +245,16 @@ export default function LogsPage() {
             <span>Refresh</span>
           </button>
 
-          {/* Clear Logs */}
-          <button
-            onClick={handleClearLogs}
-            className="p-1.5 text-slate-400 hover:text-rose-400 bg-slate-900 hover:bg-rose-500/10 border border-slate-800 rounded-xl text-xs transition"
-            title="Clear all logs"
-          >
-            <Trash2 className="h-4 w-4" />
-          </button>
+          {/* Clear Logs (admin only) */}
+          {canClearLogs && (
+            <button
+              onClick={handleClearLogs}
+              className="p-1.5 text-slate-400 hover:text-rose-400 bg-slate-900 hover:bg-rose-500/10 border border-slate-800 rounded-xl text-xs transition"
+              title="Clear all logs (admin only)"
+            >
+              <Trash2 className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </div>
 

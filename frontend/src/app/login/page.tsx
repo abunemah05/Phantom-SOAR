@@ -17,7 +17,8 @@ import {
   Smartphone
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { getStoredUser, setStoredAuth, setStoredUser, clearAuth } from "@/lib/auth";
+import { getStoredUser, setStoredAuth, clearAuth } from "@/lib/auth";
+import { needsPasswordChange } from "@/lib/roles";
 import { User as UserType } from "@/lib/types";
 
 export default function LoginPage() {
@@ -42,12 +43,16 @@ export default function LoginPage() {
   const [confirmPassword, setConfirmPassword] = useState<string>("");
   const [changeLoading, setChangeLoading] = useState<boolean>(false);
   const [changeError, setChangeError] = useState<string | null>(null);
+  const [changeNotice, setChangeNotice] = useState<string | null>(null);
+  // True when we arrived here with a pending password change and do not know the current password.
+  const [askCurrentPassword, setAskCurrentPassword] = useState<boolean>(false);
 
   useEffect(() => {
     const user = getStoredUser();
     if (user) {
-      if (user.must_change_password || user.compromised_reset_required) {
+      if (needsPasswordChange(user)) {
         setChangeUsername(user.username);
+        setAskCurrentPassword(true);
         setRequiresPasswordChange(true);
       } else {
         setCurrentLoggedInUser(user);
@@ -55,10 +60,22 @@ export default function LoginPage() {
     }
   }, []);
 
+  const signOut = async () => {
+    await api.logout();
+    setCurrentLoggedInUser(null);
+    setRequiresPasswordChange(false);
+    setAskCurrentPassword(false);
+    setCurrentPassword("");
+    setNewPassword("");
+    setConfirmPassword("");
+    setPassword("");
+  };
+
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
+    setChangeNotice(null);
 
     try {
       const res = await api.login(username.trim(), password, mfaRequired ? mfaCode.trim() : undefined);
@@ -74,9 +91,10 @@ export default function LoginPage() {
         setStoredAuth(res.user, res.access_token);
         setCurrentLoggedInUser(res.user);
 
-        if (res.user.must_change_password || res.user.compromised_reset_required) {
+        if (needsPasswordChange(res.user)) {
           setChangeUsername(res.user.username);
           setCurrentPassword(password);
+          setAskCurrentPassword(false);
           setRequiresPasswordChange(true);
         } else {
           setSuccess(true);
@@ -111,25 +129,31 @@ export default function LoginPage() {
     }
 
     try {
-      await api.changePassword({
+      const res = await api.changePassword({
         username: changeUsername,
         current_password: currentPassword,
         new_password: newPassword,
       });
 
-      // Update cached user profile
-      const stored = getStoredUser();
-      if (stored) {
-        stored.must_change_password = false;
-        stored.compromised_reset_required = false;
-        setStoredUser(stored);
-      }
-
-      setSuccess(true);
       setRequiresPasswordChange(false);
-      setTimeout(() => {
-        router.push("/");
-      }, 500);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+
+      // The backend invalidates earlier sessions on a password change and returns a new one.
+      if (res?.access_token && res.user && !needsPasswordChange(res.user)) {
+        setStoredAuth(res.user, res.access_token);
+        setSuccess(true);
+        setTimeout(() => {
+          router.push("/");
+        }, 500);
+      } else {
+        clearAuth();
+        setCurrentLoggedInUser(null);
+        setUsername(changeUsername);
+        setPassword("");
+        setChangeNotice("Password updated. Sign in again with your new password.");
+      }
     } catch (err: any) {
       setChangeError(err.message || "Failed to update password. Please check security policy requirements.");
     } finally {
@@ -185,6 +209,25 @@ export default function LoginPage() {
               )}
 
               <form onSubmit={handlePasswordChangeSubmit} className="space-y-4">
+                <div className="text-[11px] text-slate-400">
+                  Account: <b className="text-slate-200">{changeUsername}</b>
+                </div>
+                {askCurrentPassword && (
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-300 mb-1">
+                      Current (Temporary) Password
+                    </label>
+                    <input
+                      type="password"
+                      required
+                      autoComplete="current-password"
+                      value={currentPassword}
+                      onChange={(e) => setCurrentPassword(e.target.value)}
+                      placeholder="Password you signed in with"
+                      className="w-full px-3.5 py-2.5 rounded-lg bg-slate-950 border border-slate-800 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                    />
+                  </div>
+                )}
                 <div>
                   <label className="block text-xs font-semibold text-slate-300 mb-1">
                     New Secure Passphrase (Min 15 Chars)
@@ -245,6 +288,14 @@ export default function LoginPage() {
                     </>
                   )}
                 </button>
+
+                <button
+                  type="button"
+                  onClick={signOut}
+                  className="w-full text-center text-xs text-slate-400 hover:text-slate-200 transition"
+                >
+                  Sign out instead
+                </button>
               </form>
             </div>
           ) : (
@@ -279,16 +330,20 @@ export default function LoginPage() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => {
-                        clearAuth();
-                        setCurrentLoggedInUser(null);
-                      }}
+                      onClick={signOut}
                       className="px-2 py-1 rounded bg-slate-800 hover:bg-rose-950/40 text-slate-400 hover:text-rose-400 font-semibold text-[11px] transition border border-slate-700/60"
                       title="Clear session"
                     >
                       Sign Out
                     </button>
                   </div>
+                </div>
+              )}
+
+              {changeNotice && !error && (
+                <div className="mb-4 p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center space-x-2 text-emerald-400 text-xs">
+                  <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
+                  <span>{changeNotice}</span>
                 </div>
               )}
 
