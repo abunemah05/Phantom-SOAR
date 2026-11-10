@@ -38,6 +38,7 @@ from backend.dependencies import (
     ROLE_ADMIN,
     get_current_user,
     get_current_user_allow_password_change,
+    get_current_service_account,
     security_bearer,
 )
 from backend.routers.logs import record_log
@@ -388,6 +389,12 @@ def disable_mfa(
 def get_current_user_profile(current_user: User = Depends(get_current_user_allow_password_change)):
     """Profile of the signed-in operator (also available while a password change is pending)."""
     return current_user.to_dict()
+
+
+@router.get("/service-account", response_model=UserResponse)
+def get_service_account_identity(account: User = Depends(get_current_service_account)):
+    """Lets an AI agent / integration confirm its API key (`X-Phantom-Agent-Key`) and see its account."""
+    return {**account.to_dict(), "api_key_prefix": account.api_key_prefix}
 
 
 @router.post("/logout")

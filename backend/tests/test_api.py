@@ -493,3 +493,40 @@ def test_hitl_approval(client, admin_headers):
 
     approve_res = client.post(f"/api/alerts/{triaged_id}/approve", headers=admin_headers)
     assert approve_res.status_code == 200, approve_res.text
+
+
+def test_service_account_api_keys(client, admin_headers):
+    for u in client.get("/api/users", headers=admin_headers).json():
+        if u["username"] == "triage-agent-probe":
+            client.delete(f"/api/users/{u['user_id']}", headers=admin_headers)
+    created = client.post("/api/users/service-accounts", json={"username": "triage-agent-probe"}, headers=admin_headers)
+    assert created.status_code == 201, created.text
+    account = created.json()
+    key = account["api_key"]
+    assert account["is_service_account"] is True
+    assert key.startswith(account["api_key_prefix"] + "_")
+
+    listed = next(u for u in client.get("/api/users", headers=admin_headers).json() if u["username"] == "triage-agent-probe")
+    assert listed["api_key_prefix"] == account["api_key_prefix"] and "api_key" not in listed
+
+    who = client.get("/api/auth/service-account", headers={"X-Phantom-Agent-Key": key})
+    assert who.status_code == 200 and who.json()["username"] == "triage-agent-probe"
+    assert client.get("/api/auth/service-account", headers={"Authorization": f"Bearer {key}"}).status_code == 200
+    assert client.get("/api/auth/service-account").status_code == 401
+    assert client.get("/api/auth/service-account", headers={"X-Phantom-Agent-Key": key + "x"}).status_code == 401
+    # Operator sessions are not agent credentials, and agent keys are not operator sessions.
+    assert client.get("/api/auth/service-account", headers=admin_headers).status_code == 401
+    assert client.get("/api/alerts", headers={"Authorization": f"Bearer {key}"}).status_code == 401
+    assert client.get("/api/alerts", headers={"X-Phantom-Agent-Key": key}).status_code == 401
+
+    rotated = client.post(f"/api/users/{account['user_id']}/rotate-api-key", headers=admin_headers)
+    assert rotated.status_code == 200
+    assert client.get("/api/auth/service-account", headers={"X-Phantom-Agent-Key": key}).status_code == 401
+    new_key = rotated.json()["api_key"]
+    assert client.get("/api/auth/service-account", headers={"X-Phantom-Agent-Key": new_key}).status_code == 200
+
+    assert client.put(f"/api/users/{account['user_id']}", json={"role": "Admin"}, headers=admin_headers).status_code == 400
+    assert client.post(f"/api/users/{account['user_id']}/reset-password", headers=admin_headers).status_code == 400
+    assert client.put(f"/api/users/{account['user_id']}", json={"is_active": False}, headers=admin_headers).status_code == 200
+    assert client.get("/api/auth/service-account", headers={"X-Phantom-Agent-Key": new_key}).status_code == 403
+    assert client.delete(f"/api/users/{account['user_id']}", headers=admin_headers).status_code == 200

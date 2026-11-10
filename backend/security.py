@@ -219,6 +219,39 @@ def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
     except jwt.PyJWTError:
         return None
 
+# --- Service-account API keys ---
+# Format: phk_<8 hex lookup id>_<43 url-safe chars>. Only the lookup id and a SHA-256 digest are
+# stored; the keys carry 256 bits of entropy, so a fast digest is appropriate (no password stretching).
+API_KEY_PREFIX = "phk_"
+
+
+def generate_api_key() -> Tuple[str, str, str]:
+    """Returns (plaintext key shown once, lookup prefix to store, digest to store)."""
+    lookup = f"{API_KEY_PREFIX}{secrets.token_hex(4)}"
+    key = f"{lookup}_{secrets.token_urlsafe(32)}"
+    return key, lookup, hash_api_key(key)
+
+
+def hash_api_key(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def api_key_lookup_prefix(key: str) -> Optional[str]:
+    """The stored lookup prefix of a well-formed key, else None."""
+    if not key or not key.startswith(API_KEY_PREFIX):
+        return None
+    lookup, sep, secret = key.partition("_")[2].partition("_")
+    if not sep or len(lookup) != 8 or not secret:
+        return None
+    return f"{API_KEY_PREFIX}{lookup}"
+
+
+def verify_api_key(key: str, stored_hash: Optional[str]) -> bool:
+    if not key or not stored_hash:
+        return False
+    return hmac.compare_digest(hash_api_key(key), stored_hash)
+
+
 # --- Logout revocation (in-process denylist of token ids until they expire) ---
 _revoked_jtis: Dict[str, float] = {}
 _revoked_lock = threading.Lock()

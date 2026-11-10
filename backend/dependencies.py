@@ -10,16 +10,23 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, FrozenSet, Iterable, Optional
 
 from fastapi import Depends, HTTPException, status, Header
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.models import User
-from backend.security import decode_access_token, is_token_revoked, PASSWORD_CHANGE_CLAIM
+from backend.security import (
+    PASSWORD_CHANGE_CLAIM,
+    api_key_lookup_prefix,
+    decode_access_token,
+    is_token_revoked,
+    verify_api_key,
+)
 
 logger = logging.getLogger(__name__)
 
 security_bearer = HTTPBearer(auto_error=False)
+agent_key_header = APIKeyHeader(name="X-Phantom-Agent-Key", auto_error=False)
 
 # --- Roles -------------------------------------------------------------------
 # Canonical role names, plus the legacy strings already stored in existing
@@ -185,6 +192,42 @@ def require_human_analyst(current_user: User = Depends(get_current_user)) -> Use
     """Authenticated, active, non-service account. Used where a person must make the decision
     (approving containment, deciding on alerts, approving AI agent proposals)."""
     return current_user
+
+
+def get_current_service_account(
+    agent_key: Optional[str] = Depends(agent_key_header),
+    auth: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer),
+    db: Session = Depends(get_db),
+) -> User:
+    """Authenticate an AI agent / integration by its API key.
+
+    The key is sent as `X-Phantom-Agent-Key: phk_...` (or `Authorization: Bearer phk_...`).
+    Operator JWTs are not accepted here, and service-account keys are not accepted by
+    get_current_user, so the two APIs cannot be mixed up.
+    """
+    key = (agent_key or "").strip()
+    if not key and auth is not None and (auth.credentials or "").startswith("phk_"):
+        key = auth.credentials.strip()
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Agent API key required: send 'X-Phantom-Agent-Key: <key>'.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+    lookup = api_key_lookup_prefix(key)
+    account = (
+        db.query(User).filter(User.api_key_prefix == lookup, User.is_service_account.is_(True)).first()
+        if lookup else None
+    )
+    if account is None or not verify_api_key(key, account.api_key_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid agent API key.",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+    if not account.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Service account is disabled.")
+    return account
 
 
 def require_roles(allowed: FrozenSet[str], detail: str) -> Callable[..., User]:

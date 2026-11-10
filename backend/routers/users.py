@@ -6,10 +6,18 @@ from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.models import User
-from backend.schemas import UserResponse, UserCreateRequest, UserCreateResponse, UserUpdateRequest
-from backend.security import hash_password, generate_temporary_password
+from backend.schemas import (
+    UserResponse,
+    UserCreateRequest,
+    UserCreateResponse,
+    UserUpdateRequest,
+    ServiceAccountCreateRequest,
+    ServiceAccountKeyResponse,
+)
+from backend.security import hash_password, generate_temporary_password, generate_api_key
 from backend.dependencies import (
     ADMIN_ROLES,
+    ROLE_AI_AGENT,
     ROLE_SOC_ANALYST,
     SERVICE_ROLES,
     is_known_role,
@@ -30,6 +38,21 @@ def _get_user_or_404(db: Session, user_id: int) -> User:
     if not user:
         raise HTTPException(status_code=404, detail="User account not found.")
     return user
+
+
+def _public(user: User) -> dict:
+    return {**user.to_dict(), "api_key_prefix": user.api_key_prefix}
+
+
+def _validated_username(username: str, db: Session) -> str:
+    username = (username or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username cannot be empty.")
+    if len(username) > 50:
+        raise HTTPException(status_code=400, detail="Username cannot exceed 50 characters.")
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(status_code=400, detail=f"Operator username '{username}' already exists in the system.")
+    return username
 
 
 def _validated_role(role: str) -> str:
@@ -65,7 +88,7 @@ def list_users(
 ):
     """[Admin Only] List operator and service accounts. Password hashes and MFA secrets are never returned."""
     users = db.query(User).order_by(User.user_id.asc()).all()
-    return [u.to_dict() for u in users]
+    return [_public(u) for u in users]
 
 
 @router.post("", response_model=UserCreateResponse, status_code=status.HTTP_201_CREATED)
@@ -78,18 +101,7 @@ def create_user(
     [Admin Only] Provision an operator account. A random one-time password is generated and
     returned once in `temporary_password`; the operator must change it at first sign-in.
     """
-    username = payload.username.strip()
-    if not username:
-        raise HTTPException(status_code=400, detail="Username cannot be empty.")
-    if len(username) > 50:
-        raise HTTPException(status_code=400, detail="Username cannot exceed 50 characters.")
-
-    if db.query(User).filter(User.username == username).first():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Operator username '{username}' already exists in the system."
-        )
-
+    username = _validated_username(payload.username, db)
     role = _validated_role(payload.role or ROLE_SOC_ANALYST)
     temporary_password = generate_temporary_password()
     now = datetime.now(timezone.utc)
@@ -110,7 +122,65 @@ def create_user(
     record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' provisioned account '{username}' with role '{role}'.",
                target=username, details={"role": role, "by": admin.username})
 
-    return {**new_user.to_dict(), "temporary_password": temporary_password}
+    return {**_public(new_user), "temporary_password": temporary_password}
+
+
+@router.post("/service-accounts", response_model=ServiceAccountKeyResponse, status_code=status.HTTP_201_CREATED)
+def create_service_account(
+    payload: ServiceAccountCreateRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin)
+):
+    """
+    [Admin Only] Create a service account for an AI agent or integration. The API key is returned
+    once in `api_key`; it authenticates with `X-Phantom-Agent-Key`. Service accounts cannot sign in
+    to the console and cannot call operator endpoints.
+    """
+    username = _validated_username(payload.username, db)
+    api_key, prefix, digest = generate_api_key()
+    now = datetime.now(timezone.utc)
+    account = User(
+        username=username,
+        password_hash=hash_password(generate_temporary_password()),  # never disclosed; password sign-in is refused
+        role=ROLE_AI_AGENT,
+        must_change_password=False,
+        is_active=True,
+        mfa_enabled=False,
+        is_service_account=True,
+        api_key_hash=digest,
+        api_key_prefix=prefix,
+        password_changed_at=now,
+        created_at=now,
+    )
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+
+    record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' created service account '{username}' (key {prefix}).",
+               target=username, details={"api_key_prefix": prefix, "by": admin.username})
+    return {**_public(account), "api_key": api_key}
+
+
+@router.post("/{user_id}/rotate-api-key", response_model=ServiceAccountKeyResponse)
+def rotate_service_account_key(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin)
+):
+    """[Admin Only] Issue a new API key for a service account; the previous key stops working immediately."""
+    account = _get_user_or_404(db, user_id)
+    if not account.is_service_account:
+        raise HTTPException(status_code=400, detail="Only service accounts have API keys.")
+    old_prefix = account.api_key_prefix
+    api_key, prefix, digest = generate_api_key()
+    account.api_key_hash = digest
+    account.api_key_prefix = prefix
+    db.commit()
+    db.refresh(account)
+
+    record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' rotated the API key of '{account.username}'.",
+               target=account.username, details={"old_prefix": old_prefix, "new_prefix": prefix, "by": admin.username})
+    return {**_public(account), "api_key": api_key}
 
 
 @router.put("/{user_id}", response_model=UserResponse)
@@ -124,6 +194,8 @@ def update_user(
     user = _get_user_or_404(db, user_id)
     changes = {}
 
+    if payload.role is not None and user.is_service_account:
+        raise HTTPException(status_code=400, detail="Service account roles are fixed; create a separate account instead.")
     new_role = _validated_role(payload.role) if payload.role is not None else None
     deactivating = payload.is_active is False and user.is_active
     demoting = (
@@ -160,7 +232,7 @@ def update_user(
     if changes:
         record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' updated account '{user.username}'.",
                    target=user.username, details={"changes": changes, "by": admin.username})
-    return user.to_dict()
+    return _public(user)
 
 
 @router.post("/{user_id}/reset-password")

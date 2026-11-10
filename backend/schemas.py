@@ -42,12 +42,19 @@ class UserResponse(BaseModel):
     mfa_enabled: bool = False
     compromised_reset_required: bool = False
     is_service_account: bool = False
+    api_key_prefix: Optional[str] = None  # non-secret lookup id of a service account's API key
     password_changed_at: Optional[str] = None
     created_at: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 class UserCreateResponse(UserResponse):
     temporary_password: str  # shown once; the operator must change it at first sign-in
+
+class ServiceAccountCreateRequest(BaseModel):
+    username: str  # e.g. "triage-agent"
+
+class ServiceAccountKeyResponse(UserResponse):
+    api_key: str  # shown once; only a digest is stored
 
 class UserCreateRequest(BaseModel):
     username: str
