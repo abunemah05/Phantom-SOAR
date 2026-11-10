@@ -23,13 +23,17 @@ venv/
 ENV/
 .venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+celerybeat-schedule*
 
-# Local Environment Variables
+# Local Environment Variables (secrets) - only the template is tracked
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env.*
+!.env.example
 
 # Logs
 *.log
