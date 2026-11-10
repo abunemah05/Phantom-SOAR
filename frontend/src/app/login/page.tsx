@@ -46,12 +46,15 @@ export default function LoginPage() {
   const [changeNotice, setChangeNotice] = useState<string | null>(null);
   // True when we arrived here with a pending password change and do not know the current password.
   const [askCurrentPassword, setAskCurrentPassword] = useState<boolean>(false);
+  const [changeMfaEnabled, setChangeMfaEnabled] = useState<boolean>(false);
+  const [changeMfaCode, setChangeMfaCode] = useState<string>("");
 
   useEffect(() => {
     const user = getStoredUser();
     if (user) {
       if (needsPasswordChange(user)) {
         setChangeUsername(user.username);
+        setChangeMfaEnabled(Boolean(user.mfa_enabled));
         setAskCurrentPassword(true);
         setRequiresPasswordChange(true);
       } else {
@@ -133,6 +136,7 @@ export default function LoginPage() {
         username: changeUsername,
         current_password: currentPassword,
         new_password: newPassword,
+        ...(changeMfaCode.trim() ? { mfa_code: changeMfaCode.trim() } : {}),
       });
 
       setRequiresPasswordChange(false);
@@ -225,6 +229,22 @@ export default function LoginPage() {
                       onChange={(e) => setCurrentPassword(e.target.value)}
                       placeholder="Password you signed in with"
                       className="w-full px-3.5 py-2.5 rounded-lg bg-slate-950 border border-slate-800 text-white text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
+                    />
+                  </div>
+                )}
+                {askCurrentPassword && changeMfaEnabled && (
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-300 mb-1">
+                      Authenticator Code (needed if your session has expired)
+                    </label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={6}
+                      value={changeMfaCode}
+                      onChange={(e) => setChangeMfaCode(e.target.value)}
+                      placeholder="123456"
+                      className="w-full px-3.5 py-2.5 rounded-lg bg-slate-950 border border-slate-800 text-white text-sm font-mono tracking-widest focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition"
                     />
                   </div>
                 )}

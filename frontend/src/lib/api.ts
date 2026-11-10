@@ -108,6 +108,9 @@ async function handleErrorResponse(res: Response, isAuthRequest: boolean): Promi
       clearAuth();
       redirectToLogin();
     } else if (res.status === 403 && message.toLowerCase().includes(PASSWORD_CHANGE_REQUIRED)) {
+      // Flag the cached profile so /login opens the change-password form.
+      const cached = getStoredUser();
+      if (cached) setStoredUser({ ...cached, must_change_password: true });
       redirectToLogin();
     }
   }
