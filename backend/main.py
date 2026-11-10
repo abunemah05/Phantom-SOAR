@@ -5,6 +5,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+# Configure logging before backend modules load, so their import-time warnings
+# (random JWT secret, ignored CORS wildcard, bootstrap password) are formatted.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+
 from backend.config import settings
 from backend.database import engine, Base, SessionLocal
 from backend.routers import (
@@ -25,10 +32,6 @@ from backend.models import Playbook
 from backend.crud import create_playbook
 from backend.engine.playbooks_catalog import PRECONFIGURED_PLAYBOOKS
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
 logger = logging.getLogger("phantom_soar")
 
 def ensure_sqlite_migrations():
