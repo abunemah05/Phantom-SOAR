@@ -23,17 +23,20 @@ import {
   ChevronDown,
   ChevronRight,
   AlertCircle,
-  ScrollText
+  ScrollText,
+  Bot
 } from "lucide-react";
 import {
+  AgentProposal,
   AlertDetail,
+  AlertEntities,
   ContainmentAction,
   IocArtifact,
   TipProviderResult,
   VulnerabilityIntel
 } from "@/lib/types";
 import { api } from "@/lib/api";
-import { formatDuration } from "@/lib/format";
+import { formatDateTime, formatDuration, parseApiDate } from "@/lib/format";
 
 interface InvestigateModalProps {
   alertId: number | null;
@@ -42,7 +45,7 @@ interface InvestigateModalProps {
   onAlertUpdated?: () => void;
 }
 
-type TabId = "context" | "intel" | "nvd" | "response" | "timeline";
+type TabId = "context" | "intel" | "nvd" | "response" | "agent" | "timeline";
 
 // --- Presentation helpers --------------------------------------------------
 
@@ -132,6 +135,45 @@ const EXECUTION_MODE: Record<string, { label: string; className: string; hint: s
   },
 };
 
+const ENTITY_LABELS: Array<[keyof AlertEntities, string]> = [
+  ["hosts", "Hosts"],
+  ["ips", "IPs"],
+  ["users", "Users"],
+  ["processes", "Processes"],
+  ["files", "Files"],
+  ["hashes", "Hashes"],
+  ["domains", "Domains"],
+  ["urls", "URLs"],
+];
+
+const NVD_LOOKUP_LABELS: Record<string, string> = {
+  live: "Live NVD lookup",
+  partial: "Partial: some NVD lookups failed",
+  not_configured: "NVD lookup not configured",
+  unavailable: "NVD unreachable",
+  no_cves: "No CVE identifiers in the alert text",
+};
+
+const PROPOSAL_STATUS: Record<string, { label: string; className: string }> = {
+  pending_approval: { label: "Awaiting analyst decision", className: "bg-amber-500/10 text-amber-400 border-amber-500/30" },
+  auto_executed: { label: "Auto-executed by policy", className: "bg-blue-500/10 text-blue-300 border-blue-500/30" },
+  partially_executed: { label: "Partially executed", className: "bg-blue-500/10 text-blue-300 border-blue-500/30" },
+  approved: { label: "Approved by analyst", className: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" },
+  rejected: { label: "Rejected by analyst", className: "bg-rose-500/10 text-rose-400 border-rose-500/30" },
+  blocked: { label: "Blocked by policy", className: "bg-rose-500/10 text-rose-400 border-rose-500/30" },
+  no_action: { label: "No action proposed", className: "bg-slate-800 text-slate-400 border-slate-700" },
+};
+
+function policyText(decision: Record<string, any> | undefined): { text: string; className: string } {
+  if (!decision) return { text: "—", className: "text-slate-500" };
+  const d = (decision.decision && typeof decision.decision === "object" ? decision.decision : decision) as Record<string, any>;
+  const reasons = Array.isArray(d.reasons) ? d.reasons.join("; ") : "";
+  if (d.allowed === false) return { text: `Denied${reasons ? `: ${reasons}` : ""}`, className: "text-rose-400" };
+  if (d.requires_approval) return { text: `Needs approval${reasons ? `: ${reasons}` : ""}`, className: "text-amber-400" };
+  if (d.allowed) return { text: `Allowed${reasons ? `: ${reasons}` : ""}`, className: "text-emerald-400" };
+  return { text: reasons || "—", className: "text-slate-400" };
+}
+
 function providerLabel(key: string, p?: TipProviderResult): string {
   return PROVIDER_LABELS[key] || PROVIDER_LABELS[p?.provider || ""] || p?.provider || key;
 }
@@ -196,8 +238,7 @@ function formatSummaryValue(value: unknown): string {
 
 function formatTime(iso?: string | null): string {
   if (!iso) return "—";
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  return formatDateTime(iso, iso);
 }
 
 function stepsOf(workflowLogic: unknown): Array<Record<string, unknown>> {
@@ -399,6 +440,13 @@ export default function InvestigateModal({
     return logic?.mitre_id || null;
   })();
 
+  const entities = detail?.entities ?? null;
+  const entityGroups = entities
+    ? ENTITY_LABELS.map(([key, label]) => [label, Array.isArray(entities[key]) ? entities[key] : []] as [string, string[]]).filter(([, v]) => v.length > 0)
+    : [];
+  const routing = detail?.routing ?? null;
+  const proposals: AgentProposal[] = detail?.agent_proposals ?? [];
+
   const isLowTicket = detail?.severity?.toLowerCase() === "low";
   const affectedAsset = detail?.raw_payload?.agent?.name || detail?.raw_payload?.agent?.ip || null;
 
@@ -423,12 +471,18 @@ export default function InvestigateModal({
           detail: `${(a.execution_mode || "unrecorded").toUpperCase()} · ${a.status} · by ${a.executed_by || "System"}`,
           kind: "action",
         })),
+        ...(detail.agent_proposals ?? []).map((p) => ({
+          at: p.created_at,
+          title: `AI agent ${p.agent_name}: verdict ${p.verdict}`,
+          detail: `${p.proposed_actions.length} proposed action(s) · ${p.status.replace(/_/g, " ")}`,
+          kind: "agent",
+        })),
         ...(detail.resolved_at
           ? [{ at: detail.resolved_at, title: `Resolved by ${detail.resolved_by || "unknown"}`, detail: detail.analyst_decision, kind: "resolve" }]
           : []),
       ]
         .filter((e) => e.at)
-        .sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime())
+        .sort((a, b) => (parseApiDate(a.at)?.getTime() ?? 0) - (parseApiDate(b.at)?.getTime() ?? 0))
     : [];
 
   const renderActionRow = (act: ContainmentAction) => {
@@ -512,7 +566,7 @@ export default function InvestigateModal({
                 )}
               </div>
               <p className="text-[11px] text-slate-400 font-mono truncate">
-                Ingested: {detail?.created_at ? new Date(detail.created_at).toUTCString() : "—"} | Source: {detail?.source || "—"}
+                Ingested: {parseApiDate(detail?.created_at)?.toUTCString() ?? "—"} | Source: {detail?.source || "—"}
               </p>
             </div>
           </div>
@@ -738,6 +792,7 @@ export default function InvestigateModal({
                 { id: "intel", label: "Threat Intel", icon: Layers, badge: iocs.length ? String(iocs.length) : undefined },
                 { id: "nvd", label: "NVD Vulnerabilities", icon: ShieldAlert, badge: vulnIntel?.cves_detected?.length ? String(vulnIntel.cves_detected.length) : undefined },
                 { id: "response", label: "Playbook & Response", icon: Cpu, badge: actions.length ? String(actions.length) : undefined },
+                { id: "agent", label: "AI Agent", icon: Bot, badge: proposals.length ? String(proposals.length) : undefined },
                 { id: "timeline", label: "Timeline", icon: Clock },
               ] as Array<{ id: TabId; label: string; icon: React.ElementType; badge?: string }>).map((tab) => {
                 const TabIcon = tab.icon;
@@ -791,6 +846,25 @@ export default function InvestigateModal({
                           Rule-based summary generated from the alert, its IOC verdicts and recorded actions.
                         </p>
                       </div>
+
+                      {entityGroups.length > 0 && (
+                        <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-4 space-y-2">
+                          <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block">
+                            Entities in this alert
+                          </span>
+                          <p className="text-[10px] text-slate-500">Automated actions (playbooks, AI agent) may only target these.</p>
+                          {entityGroups.map(([label, items]) => (
+                            <div key={label} className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                              <span className="text-slate-400 w-20 flex-shrink-0">{label}:</span>
+                              {items.map((item) => (
+                                <span key={item} className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 font-mono text-slate-200 break-all">
+                                  {item}
+                                </span>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      )}
 
                       <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-4 space-y-2">
                         <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-1">
@@ -957,9 +1031,12 @@ export default function InvestigateModal({
                               <div className="text-lg font-black text-white mt-0.5">
                                 {vulnIntel.cves_detected?.length ? vulnIntel.cves_detected.join(", ") : "None found"}
                               </div>
-                              {(vulnIntel.status || vulnIntel.message) && (
+                              {(vulnIntel.lookup_status || vulnIntel.status || vulnIntel.message) && (
                                 <div className="text-[11px] text-slate-400 mt-1">
-                                  {[vulnIntel.status, vulnIntel.message].filter(Boolean).join(" — ")}
+                                  {[
+                                    vulnIntel.lookup_status ? NVD_LOOKUP_LABELS[vulnIntel.lookup_status] || vulnIntel.lookup_status : vulnIntel.status,
+                                    vulnIntel.message,
+                                  ].filter(Boolean).join(" — ")}
                                 </div>
                               )}
                             </div>
@@ -1078,6 +1155,35 @@ export default function InvestigateModal({
                         )}
                       </div>
 
+                      {/* Routing decision */}
+                      {routing && (
+                        <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-white uppercase tracking-wider">Routing decision</span>
+                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                              String(routing.mode).toUpperCase() === "HOTL"
+                                ? "bg-blue-500/10 text-blue-400 border-blue-500/30"
+                                : "bg-amber-500/10 text-amber-400 border-amber-500/30"
+                            }`}>
+                              {routing.mode}
+                            </span>
+                          </div>
+                          {(routing.reasons ?? []).map((r, i) => (
+                            <p key={i} className="text-xs text-slate-300">{r}</p>
+                          ))}
+                          <div className="text-[11px] text-slate-400">
+                            <span className="font-semibold text-slate-300">Evidence:</span>{" "}
+                            {routing.evidence && routing.evidence.length > 0 ? (
+                              <ul className="list-disc list-inside mt-1 space-y-0.5">
+                                {routing.evidence.map((ev, i) => <li key={i}>{ev}</li>)}
+                              </ul>
+                            ) : (
+                              "none confirmed (no Malicious IOC from live or lab intelligence, telemetry not Critical)."
+                            )}
+                          </div>
+                        </div>
+                      )}
+
                       {/* Executions */}
                       <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
                         <div className="p-3 bg-slate-900 border-b border-slate-800">
@@ -1133,6 +1239,81 @@ export default function InvestigateModal({
                     </div>
                   )}
 
+                  {/* TAB: AI AGENT */}
+                  {activeTab === "agent" && (
+                    <div className="space-y-4">
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Triage verdicts and response proposals submitted by AI agents through the agent API. Every proposed action is
+                        checked by the policy engine; anything not allowed automatically waits for an analyst.
+                      </p>
+                      {proposals.length === 0 ? (
+                        <div className="p-6 text-center text-xs text-slate-500 italic bg-slate-950 border border-slate-800 rounded-xl">
+                          No AI agent has submitted a proposal for this alert.
+                        </div>
+                      ) : (
+                        proposals.map((p) => {
+                          const st = PROPOSAL_STATUS[p.status] || { label: p.status, className: "bg-slate-800 text-slate-400 border-slate-700" };
+                          return (
+                            <div key={p.proposal_id} className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
+                              <div className="p-3.5 bg-slate-900/60 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                                <div className="flex items-center gap-2">
+                                  <Bot className="h-4 w-4 text-cyan-300" />
+                                  <span className="text-xs font-bold text-white">{p.agent_name}</span>
+                                  <VerdictBadge verdict={p.verdict ? p.verdict.charAt(0).toUpperCase() + p.verdict.slice(1) : "Unknown"} />
+                                  <span className="text-[11px] font-mono text-slate-300">
+                                    confidence {Number.isFinite(p.confidence) ? `${Math.round(p.confidence * 100)}%` : "—"}
+                                  </span>
+                                </div>
+                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${st.className}`}>{st.label}</span>
+                              </div>
+                              <div className="p-3.5 space-y-2">
+                                {p.summary && <p className="text-xs text-slate-200">{p.summary}</p>}
+                                {p.reasoning && <p className="text-[11px] text-slate-400 whitespace-pre-line">{p.reasoning}</p>}
+                                {p.proposed_actions.length > 0 && (
+                                  <table className="w-full text-left text-[11px]">
+                                    <thead className="text-slate-500 uppercase tracking-wider">
+                                      <tr>
+                                        <th className="py-1.5 pr-3 font-bold">Action</th>
+                                        <th className="py-1.5 pr-3 font-bold">Target</th>
+                                        <th className="py-1.5 pr-3 font-bold">Policy</th>
+                                        <th className="py-1.5 font-bold">Result</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-800/70">
+                                      {p.proposed_actions.map((a, i) => {
+                                        const policy = policyText(p.policy_evaluation[i]);
+                                        const result = p.execution_results[i];
+                                        return (
+                                          <tr key={i} className="align-top">
+                                            <td className="py-1.5 pr-3 font-mono text-slate-200">{a.action}</td>
+                                            <td className="py-1.5 pr-3 font-mono text-slate-300 break-all">{a.target || "—"}</td>
+                                            <td className={`py-1.5 pr-3 ${policy.className}`}>{policy.text}</td>
+                                            <td className="py-1.5">
+                                              {result ? (
+                                                <ExecutionModeBadge mode={(result.execution_mode as string) || null} />
+                                              ) : (
+                                                <span className="text-slate-500">not executed</span>
+                                              )}
+                                            </td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                )}
+                                <div className="text-[10px] text-slate-500">
+                                  Submitted {formatTime(p.created_at)}
+                                  {p.decided_by && ` · decided by ${p.decided_by} ${p.decided_at ? `at ${formatTime(p.decided_at)}` : ""}`}
+                                  {p.decision_notes && ` · ${p.decision_notes}`}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  )}
+
                   {/* TAB: TIMELINE */}
                   {activeTab === "timeline" && (
                     <div className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
@@ -1149,7 +1330,7 @@ export default function InvestigateModal({
                           {timeline.map((ev, idx) => (
                             <li key={idx} className="flex gap-3">
                               <div className={`mt-1 h-2 w-2 rounded-full flex-shrink-0 ${
-                                ev.kind === "action" ? "bg-emerald-400" : ev.kind === "ioc" ? "bg-blue-400" : ev.kind === "playbook" ? "bg-indigo-400" : ev.kind === "resolve" ? "bg-purple-400" : "bg-slate-400"
+                                ev.kind === "action" ? "bg-emerald-400" : ev.kind === "ioc" ? "bg-blue-400" : ev.kind === "playbook" ? "bg-indigo-400" : ev.kind === "resolve" ? "bg-purple-400" : ev.kind === "agent" ? "bg-cyan-400" : "bg-slate-400"
                               }`} />
                               <div className="min-w-0">
                                 <div className="text-xs text-slate-200 font-semibold break-all">{ev.title}</div>

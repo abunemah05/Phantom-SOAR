@@ -21,7 +21,7 @@ import { api } from "@/lib/api";
 import { AdminReportData, User } from "@/lib/types";
 import { getStoredUser, subscribeToAuth } from "@/lib/auth";
 import { isAdmin } from "@/lib/roles";
-import { formatDuration } from "@/lib/format";
+import { formatDateTime, formatDuration } from "@/lib/format";
 
 export default function AdminReportsPage() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -407,13 +407,13 @@ export default function AdminReportsPage() {
                     </td>
                     <td className="py-2.5 px-4 text-slate-300">{c.status}</td>
                     <td className="py-2.5 px-4 font-semibold text-purple-400">
-                      {c.resolved_by || "Autonomous"}
+                      {c.resolved_by || "Not resolved"}
                     </td>
                     <td className="py-2.5 px-4 text-slate-300 max-w-xs truncate">
-                      {c.analyst_decision || "Autonomous Engine"}
+                      {c.analyst_decision || "—"}
                     </td>
                     <td className="py-2.5 px-4 font-mono text-[11px] text-slate-500">
-                      {c.created_at ? c.created_at.substring(0, 19).replace("T", " ") : "-"}
+                      {formatDateTime(c.created_at)}
                     </td>
                   </tr>
                 ))

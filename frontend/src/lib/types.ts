@@ -139,6 +139,8 @@ export interface VulnerabilityIntel {
     justification?: string;
     action_description?: string;
   };
+  /** "live" | "partial" | "not_configured" | "unavailable" | "no_cves" */
+  lookup_status?: string;
   status?: string;
   message?: string;
 }
@@ -163,6 +165,44 @@ export interface MitreAttack {
   id: string[];
   tactic: string[];
   technique: string[];
+  /** "telemetry" | "playbook" when present */
+  source?: string;
+}
+
+export interface AlertEntities {
+  hosts: string[];
+  ips: string[];
+  users: string[];
+  hashes: string[];
+  files: string[];
+  processes: string[];
+  domains: string[];
+  urls: string[];
+}
+
+export interface AlertRouting {
+  mode: ExecutionMode | string;
+  reasons: string[];
+  evidence: string[];
+}
+
+export interface AgentProposal {
+  proposal_id: number;
+  alert_id: number;
+  agent_name: string;
+  verdict: string;
+  confidence: number;
+  summary?: string | null;
+  reasoning?: string | null;
+  proposed_actions: Array<{ action: string; target?: string | null; params?: Record<string, unknown> }>;
+  policy_evaluation: Array<Record<string, any>>;
+  execution_results: Array<Record<string, any>>;
+  /** pending_approval | auto_executed | partially_executed | approved | rejected | blocked | no_action */
+  status: string;
+  decided_by?: string | null;
+  decided_at?: string | null;
+  decision_notes?: string | null;
+  created_at: string;
 }
 
 export interface AlertDetail extends Alert {
@@ -173,7 +213,11 @@ export interface AlertDetail extends Alert {
   mitre_attack?: MitreAttack;
   triage_summary?: string;
   simulation_mode?: boolean;
+  hotl_enabled?: boolean;
   playbook?: Playbook | null;
+  routing?: AlertRouting | null;
+  entities?: AlertEntities | null;
+  agent_proposals?: AgentProposal[];
   vulnerability_intel?: VulnerabilityIntel;
 }
 
@@ -215,10 +259,15 @@ export interface DashboardMetrics {
 // --- Configuration ---------------------------------------------------------
 
 export interface ConfigEntry {
+  /** Effective value; always "" for secrets. */
   value: string;
   is_secret: boolean;
   is_set: boolean;
+  /** "••••" + last 4 chars for a set secret, else null. */
   preview: string | null;
+  /** Where the effective value comes from. */
+  source?: 'database' | 'environment' | 'default' | null;
+  env_var?: string;
   updated_at: string | null;
 }
 

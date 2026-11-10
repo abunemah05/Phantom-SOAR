@@ -252,6 +252,17 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  /** Admin only. The API key is returned once; agents send it as X-Phantom-Agent-Key. */
+  createServiceAccount: (username: string): Promise<User & { api_key: string }> =>
+    fetchJson(`${API_BASE}/users/service-accounts`, {
+      method: 'POST',
+      body: JSON.stringify({ username }),
+    }),
+
+  /** Admin only. Issues a new key; the previous one stops working immediately. */
+  rotateServiceAccountKey: (userId: number): Promise<User & { api_key: string }> =>
+    fetchJson(`${API_BASE}/users/${userId}/rotate-api-key`, { method: 'POST' }),
+
   updateUser: (userId: number, data: { role?: string; is_active?: boolean; compromised_reset_required?: boolean }): Promise<User> =>
     fetchJson(`${API_BASE}/users/${userId}`, {
       method: 'PUT',

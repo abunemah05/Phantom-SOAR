@@ -383,6 +383,8 @@ export default function ConfigurationPage() {
 
     if (field.kind === "secret") {
       const isSet = Boolean(entry?.is_set);
+      const fromEnv = entry?.source === "environment";
+      const storedInDb = isSet && !fromEnv;
       const willClear = Boolean(clears[id]);
       const visible = Boolean(visibleSecrets[id]);
       return (
@@ -396,7 +398,11 @@ export default function ConfigurationPage() {
                 ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
                 : "bg-slate-800 text-slate-500 border-slate-700"
             }`}>
-              {willClear ? "Will be cleared" : isSet ? `Set (${entry?.preview || "••••"})` : "Not set"}
+              {willClear
+                ? "Will be cleared"
+                : isSet
+                ? `Set${fromEnv ? " via env" : ""} (${entry?.preview || "••••"})`
+                : "Not set"}
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -420,7 +426,7 @@ export default function ConfigurationPage() {
                 {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
               </button>
             </div>
-            {canEdit && (isSet || willClear) && (
+            {canEdit && (storedInDb || willClear) && (
               <button
                 type="button"
                 onClick={() => toggleClear(section.category, field.key)}
@@ -436,6 +442,11 @@ export default function ConfigurationPage() {
               </button>
             )}
           </div>
+          {fromEnv && !willClear && (
+            <p className="text-[10px] text-slate-500">
+              Comes from the {entry?.env_var || "server"} environment variable; a value saved here takes precedence.
+            </p>
+          )}
           {field.help && <p className="text-[10px] text-slate-500">{field.help}</p>}
         </div>
       );

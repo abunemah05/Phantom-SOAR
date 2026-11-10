@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { isAdmin } from "@/lib/roles";
+import { formatTimeOfDay, parseApiDate } from "@/lib/format";
 import { SystemLog } from "@/lib/types";
 import { useAuth } from "@/components/AuthGate";
 
@@ -179,7 +180,7 @@ export default function LogsPage() {
 
   // Format relative elapsed time (seconds ago)
   const formatTimeAgo = (isoDate: string) => {
-    const diffMs = Date.now() - new Date(isoDate).getTime();
+    const diffMs = Date.now() - (parseApiDate(isoDate)?.getTime() ?? Date.now());
     const diffSec = Math.max(0, Math.floor(diffMs / 1000));
     if (diffSec < 60) return `${diffSec}s ago`;
     const diffMin = Math.floor(diffSec / 60);
@@ -465,7 +466,7 @@ export default function LogsPage() {
                     <div className="flex flex-wrap items-center gap-2">
                       {/* Timestamp & Elapsed */}
                       <span className="text-slate-500 text-[11px] font-mono whitespace-nowrap">
-                        {new Date(log.created_at).toLocaleTimeString()} ({timeAgo})
+                        {formatTimeOfDay(log.created_at)} ({timeAgo})
                       </span>
 
                       {/* Source Badge */}

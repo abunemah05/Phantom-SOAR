@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { Alert } from "@/lib/types";
 import { api } from "@/lib/api";
+import { formatDateTime } from "@/lib/format";
 import InvestigateModal from "@/components/InvestigateModal";
 
 function AlertsContent() {
@@ -329,7 +330,7 @@ function AlertsContent() {
                       </div>
                     </td>
                     <td className="py-4 px-4 text-slate-400 font-mono text-[11px]">
-                      {alert.created_at ? new Date(alert.created_at).toLocaleString() : "Live Telemetry"}
+                      {formatDateTime(alert.created_at)}
                     </td>
                     <td className="py-4 px-4 text-right" onClick={(e) => e.stopPropagation()}>
                       <button

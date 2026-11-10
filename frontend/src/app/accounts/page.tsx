@@ -18,12 +18,16 @@ import {
   X,
   Search,
   BadgeCheck,
-  Bot
+  Bot,
+  Copy,
+  Check,
+  RotateCw
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { User } from "@/lib/types";
 import { getStoredUser, subscribeToAuth } from "@/lib/auth";
 import { ASSIGNABLE_ROLES, ROLE_SOC_ANALYST, isAdmin, roleLevel } from "@/lib/roles";
+import { formatDate } from "@/lib/format";
 
 export default function AccountsPage() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -40,6 +44,14 @@ export default function AccountsPage() {
   const [newRole, setNewRole] = useState<string>(ROLE_SOC_ANALYST);
   const [createLoading, setCreateLoading] = useState<boolean>(false);
   const [modalError, setModalError] = useState<string | null>(null);
+
+  // Service account (AI agent) state
+  const [showServiceModal, setShowServiceModal] = useState<boolean>(false);
+  const [serviceUsername, setServiceUsername] = useState<string>("");
+  const [serviceLoading, setServiceLoading] = useState<boolean>(false);
+  const [serviceError, setServiceError] = useState<string | null>(null);
+  const [issuedKey, setIssuedKey] = useState<{ username: string; apiKey: string } | null>(null);
+  const [keyCopied, setKeyCopied] = useState<boolean>(false);
 
   const evaluateAuth = (user: User | null) => {
     setCurrentUser(user);
@@ -131,6 +143,36 @@ export default function AccountsPage() {
       loadUsers();
     } catch (err: any) {
       setError(err.message || "Failed to reset operator password.");
+    }
+  };
+
+  const handleCreateServiceAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setServiceLoading(true);
+    setServiceError(null);
+    try {
+      const created = await api.createServiceAccount(serviceUsername.trim());
+      setShowServiceModal(false);
+      setServiceUsername("");
+      setKeyCopied(false);
+      setIssuedKey({ username: created.username, apiKey: created.api_key });
+      loadUsers();
+    } catch (err: any) {
+      setServiceError(err.message || "Failed to create the service account.");
+    } finally {
+      setServiceLoading(false);
+    }
+  };
+
+  const handleRotateKey = async (target: User) => {
+    if (!confirm(`Issue a new API key for '${target.username}'? The current key stops working immediately.`)) return;
+    try {
+      const res = await api.rotateServiceAccountKey(target.user_id);
+      setKeyCopied(false);
+      setIssuedKey({ username: res.username || target.username, apiKey: res.api_key });
+      loadUsers();
+    } catch (err: any) {
+      setError(err.message || "Failed to rotate the API key.");
     }
   };
 
@@ -236,6 +278,18 @@ export default function AccountsPage() {
           >
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
             <span>Refresh</span>
+          </button>
+
+          <button
+            onClick={() => {
+              setServiceError(null);
+              setShowServiceModal(true);
+            }}
+            className="flex items-center space-x-2 px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-cyan-500/30 text-cyan-300 rounded-xl text-xs font-bold transition"
+            title="Create a non-human account whose API key lets an AI triage agent use the agent API"
+          >
+            <Bot className="h-4 w-4" />
+            <span>Create AI Agent Account</span>
           </button>
 
           <button
@@ -455,12 +509,22 @@ export default function AccountsPage() {
 
                       {/* Provisioned Date */}
                       <td className="py-3.5 px-4 text-slate-400 font-mono text-[11px]">
-                        {user.created_at ? new Date(user.created_at).toLocaleDateString() : "System Init"}
+                        {formatDate(user.created_at, "System Init")}
                       </td>
 
                       {/* Actions */}
                       <td className="py-3.5 px-4 text-right">
                         <div className="flex items-center justify-end space-x-2">
+                          {isService && (
+                            <button
+                              onClick={() => handleRotateKey(user)}
+                              title="Rotate API key (the current key stops working immediately)"
+                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 transition"
+                            >
+                              <RotateCw className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+
                           {/* Password actions apply to human operators only; service accounts have no password. */}
                           {!isService && (
                             <>
@@ -562,7 +626,7 @@ export default function AccountsPage() {
                 The server issues the initial password. If it returns a one-time password it is shown once after creation; share it with the operator over a trusted channel.
               </p>
               <p className="text-[11px] text-amber-400 font-medium">
-                * The operator must change it at first sign-in. AI agent service accounts are provisioned through the agent API, not here.
+                * The operator must change it at first sign-in. For an AI agent, use &ldquo;Create AI Agent Account&rdquo; instead.
               </p>
             </div>
 
@@ -614,6 +678,117 @@ export default function AccountsPage() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* CREATE SERVICE ACCOUNT MODAL */}
+      {showServiceModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 relative">
+            <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-5">
+              <div className="flex items-center space-x-2.5">
+                <div className="p-2 rounded-xl bg-cyan-600/10 text-cyan-300 border border-cyan-500/20">
+                  <Bot className="h-5 w-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-100 text-sm">Create AI Agent Account</h3>
+                  <p className="text-[11px] text-slate-400">Service account for the guarded agent API</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowServiceModal(false)}
+                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {serviceError && (
+              <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs flex items-center space-x-2">
+                <AlertCircle className="h-4 w-4 flex-shrink-0" />
+                <span>{serviceError}</span>
+              </div>
+            )}
+
+            <div className="mb-5 p-3.5 rounded-xl bg-cyan-950/30 border border-cyan-500/20 text-[11px] text-slate-300 space-y-1.5">
+              <p>The account cannot sign in to this console. It authenticates to the agent API with an API key that is shown <b>once</b>.</p>
+              <p>Everything the agent proposes goes through the policy engine; with the default autonomy (recommend_only) every action waits for an analyst.</p>
+            </div>
+
+            <form onSubmit={handleCreateServiceAccount} className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-300">Account name</label>
+                <input
+                  type="text"
+                  required
+                  value={serviceUsername}
+                  onChange={(e) => setServiceUsername(e.target.value)}
+                  placeholder="e.g. triage-agent"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-cyan-500 font-medium"
+                />
+              </div>
+              <div className="pt-3 flex items-center justify-end space-x-3">
+                <button
+                  type="button"
+                  onClick={() => setShowServiceModal(false)}
+                  className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={serviceLoading}
+                  className="px-5 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition disabled:opacity-50 flex items-center space-x-2"
+                >
+                  {serviceLoading && <RefreshCw className="h-3.5 w-3.5 animate-spin" />}
+                  <span>{serviceLoading ? "Creating..." : "Create & Issue Key"}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ONE-TIME API KEY DISPLAY */}
+      {issuedKey && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-lg bg-slate-900 border border-cyan-500/30 rounded-2xl shadow-2xl p-6 space-y-4">
+            <div className="flex items-center space-x-2.5">
+              <KeyRound className="h-5 w-5 text-cyan-300" />
+              <h3 className="font-bold text-slate-100 text-sm">API key for {issuedKey.username}</h3>
+            </div>
+            <p className="text-[11px] text-amber-400 font-semibold">
+              Copy it now. Only a hash is stored, so it cannot be shown again; rotate the key if it is lost.
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 p-3 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono text-cyan-200 break-all select-all">
+                {issuedKey.apiKey}
+              </code>
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(issuedKey.apiKey);
+                  setKeyCopied(true);
+                }}
+                className="p-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
+                title="Copy API key"
+              >
+                {keyCopied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
+              </button>
+            </div>
+            <p className="text-[11px] text-slate-400">
+              The agent sends it as the <code className="font-mono text-slate-200">X-Phantom-Agent-Key</code> header on agent API requests.
+            </p>
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => setIssuedKey(null)}
+                className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition"
+              >
+                I have stored the key
+              </button>
+            </div>
           </div>
         </div>
       )}
