@@ -1,4 +1,4 @@
-from backend.integrations.edr import edr_client, EDRConnector
+from backend.integrations.edr import edr_client, EDRConnector, wazuh_ar, WazuhActiveResponse
 from backend.integrations.tip import tip_client, ThreatIntelligencePlatform
 from backend.integrations.nvd import nvd_client, NationalVulnerabilityDatabase
 from backend.integrations.firewall import firewall_client, FirewallConnector
@@ -8,6 +8,8 @@ from backend.integrations.itsm import itsm_client, ITSMConnector
 __all__ = [
     "edr_client",
     "EDRConnector",
+    "wazuh_ar",
+    "WazuhActiveResponse",
     "tip_client",
     "ThreatIntelligencePlatform",
     "nvd_client",

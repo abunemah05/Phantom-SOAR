@@ -1,57 +1,89 @@
+"""Firewall connector backed by Wazuh active response.
+
+block_ip sends Wazuh's standard "firewall-drop" command (override with
+WAZUH_AR_BLOCK_COMMAND). The command runs on the alert's Wazuh agent, or on the
+agents listed in WAZUH_FIREWALL_AGENT_IDS (comma separated, e.g. a gateway
+agent) when that is set. How long a block lasts is governed by the <timeout>
+of the active-response block in the manager's ossec.conf, not by this call.
+
+unblock_ip and apply_rate_limit have no built-in Wazuh equivalent: they use
+custom commands (WAZUH_AR_UNBLOCK_COMMAND, default "phantom-unblock-ip";
+WAZUH_AR_RATE_LIMIT_COMMAND, default "phantom-rate-limit") that must be defined
+on the manager with matching scripts on the agents.
+"""
 import logging
-import uuid
-from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from backend.integrations import connector_base as base
+from backend.integrations.edr import ar_command, wazuh_ar
 
 logger = logging.getLogger(__name__)
 
+
+def _firewall_agents(agent_id: Optional[str]) -> List[str]:
+    configured = base.read_settings("wazuh_firewall_agent_ids").get("wazuh_firewall_agent_ids", "")
+    agents = [a.strip() for a in configured.replace("\n", ",").split(",") if a.strip()]
+    if agents:
+        return agents
+    return [agent_id] if agent_id else []
+
+
 class FirewallConnector:
-    """Next-Gen Firewall Connector (Palo Alto Networks / Fortinet / pfSense / iptables)."""
+    """IP containment through Wazuh active response."""
 
-    def __init__(self, provider: str = "Palo Alto Panorama / Wazuh Drop Active Response"):
-        self.provider = provider
-        self.blocked_ips: set[str] = set()
+    provider = "Wazuh Active Response (firewall)"
 
-    def block_ip(self, ip_address: str, direction: str = "both", duration_hours: int = 24) -> dict:
-        """Block external or internal IP at perimeter firewall."""
-        rule_id = f"FW-RULE-{uuid.uuid4().hex[:8].upper()}"
-        self.blocked_ips.add(ip_address)
-        logger.info(f"[{self.provider}] Dynamic block added for {ip_address}. Rule: {rule_id}")
-        return {
-            "status": "Success",
-            "action": "block_ip",
-            "rule_id": rule_id,
-            "ip_address": ip_address,
-            "direction": direction,
-            "duration_hours": duration_hours,
-            "provider": self.provider,
-            "policy": "DENY_DROP_ANY_LOG",
-            "timestamp": datetime.utcnow().isoformat(),
-            "details": f"IP {ip_address} added to Edge Dynamic Block List (DBL). Active drops initiated."
-        }
+    def block_ip(
+        self,
+        ip_address: str,
+        agent_id: Optional[str] = None,
+        duration_hours: Optional[int] = None,
+        direction: Optional[str] = None,
+        alert_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        result = wazuh_ar.run(
+            "block_ip", ip_address, ar_command("wazuh_ar_block_command"),
+            _firewall_agents(agent_id),
+            arguments=[],
+            alert_data={"data": {"srcip": ip_address, **(alert_context or {})}},
+            provider=self.provider,
+        )
+        if duration_hours or direction:
+            result["details"]["requested"] = {"duration_hours": duration_hours, "direction": direction}
+            result["details"]["note"] = (
+                "Block duration and direction are set by the active-response configuration "
+                "on the Wazuh manager, not per request."
+            )
+        return result
 
-    def unblock_ip(self, ip_address: str) -> dict:
-        """Remove IP block rule."""
-        if ip_address in self.blocked_ips:
-            self.blocked_ips.remove(ip_address)
-        logger.info(f"[{self.provider}] Rule removed for IP {ip_address}")
-        return {
-            "status": "Success",
-            "action": "unblock_ip",
-            "ip_address": ip_address,
-            "provider": self.provider,
-            "timestamp": datetime.utcnow().isoformat()
-        }
+    def unblock_ip(
+        self,
+        ip_address: str,
+        agent_id: Optional[str] = None,
+        alert_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return wazuh_ar.run(
+            "unblock_ip", ip_address, ar_command("wazuh_ar_unblock_command"),
+            _firewall_agents(agent_id),
+            arguments=[ip_address],
+            alert_data={"data": {"srcip": ip_address, **(alert_context or {})}},
+            provider=self.provider,
+        )
 
-    def apply_rate_limit(self, ip_address: str, rate: str = "10/minute") -> dict:
-        """Apply strict QoS / rate limit policy."""
-        return {
-            "status": "Success",
-            "action": "apply_rate_limit",
-            "ip_address": ip_address,
-            "rate": rate,
-            "provider": self.provider,
-            "timestamp": datetime.utcnow().isoformat(),
-            "details": f"Strict packet rate limit applied: {rate}"
-        }
+    def apply_rate_limit(
+        self,
+        ip_address: str,
+        rate: str = "10/minute",
+        agent_id: Optional[str] = None,
+        alert_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return wazuh_ar.run(
+            "apply_rate_limit", ip_address, ar_command("wazuh_ar_rate_limit_command"),
+            _firewall_agents(agent_id),
+            arguments=[ip_address, rate],
+            alert_data={"data": {"srcip": ip_address, "rate": rate, **(alert_context or {})}},
+            provider=self.provider,
+        )
+
 
 firewall_client = FirewallConnector()
