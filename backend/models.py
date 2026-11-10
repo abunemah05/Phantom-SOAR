@@ -25,6 +25,11 @@ class User(Base):
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime, nullable=True)  # Temporary rate-limiting against brute force
 
+    # Service accounts (AI agents, integrations) authenticate with an API key instead of a password
+    is_service_account = Column(Boolean, default=False, nullable=False)
+    api_key_hash = Column(String(255), nullable=True)
+    api_key_prefix = Column(String(16), nullable=True, index=True)
+
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
     def to_dict(self):
@@ -36,6 +41,7 @@ class User(Base):
             "is_active": self.is_active,
             "mfa_enabled": self.mfa_enabled,
             "compromised_reset_required": self.compromised_reset_required,
+            "is_service_account": bool(self.is_service_account),
             "password_changed_at": self.password_changed_at.isoformat() if self.password_changed_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
@@ -86,6 +92,7 @@ class Alert(Base):
     containment_actions = relationship("ContainmentAction", back_populates="alert", cascade="all, delete-orphan")
     incident_reports = relationship("IncidentReport", back_populates="alert", cascade="all, delete-orphan")
     analyst_actions = relationship("AnalystActionLog", back_populates="alert", cascade="all, delete-orphan")
+    agent_proposals = relationship("AgentProposal", back_populates="alert", cascade="all, delete-orphan")
 
     def to_dict(self):
         return {
@@ -112,6 +119,9 @@ class IocArtifact(Base):
     artifact_type = Column(String(50), nullable=False)  # IP, Hash, URL, Domain
     value = Column(String(500), nullable=False, index=True)
     threat_score = Column(Integer, default=0, nullable=False)  # e.g., 0-100
+    verdict = Column(String(20), default="Unknown", nullable=False)  # Malicious, Suspicious, Clean, Unknown
+    enrichment_status = Column(String(30), default="pending", nullable=False)  # enriched, partial, unavailable, not_configured, pending
+    tip_results = Column(JSON, nullable=True)  # per-provider results, each with its own status
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
     # Relationship
@@ -124,6 +134,9 @@ class IocArtifact(Base):
             "artifact_type": self.artifact_type,
             "value": self.value,
             "threat_score": self.threat_score,
+            "verdict": self.verdict,
+            "enrichment_status": self.enrichment_status,
+            "tip_results": self.tip_results,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
 
@@ -192,6 +205,10 @@ class ContainmentAction(Base):
     action_type = Column(String(100), nullable=False)  # isolate_endpoint, block_ip, terminate_session, disable_account
     status = Column(String(50), default="Executed", nullable=False)
     executed_by = Column(String(50), default="System", nullable=False, index=True)  # System or Analyst username
+    target = Column(String(255), nullable=True)  # host, IP, user, or file the action was applied to
+    connector = Column(String(50), nullable=True)  # edr, firewall, iam, itsm, ...
+    execution_mode = Column(String(20), nullable=True)  # live, simulated, skipped, blocked
+    details = Column(JSON, nullable=True)  # raw connector response / error / policy reasons
     timestamp = Column(DateTime, default=utc_now, nullable=False)
 
     # Relationship
@@ -204,6 +221,10 @@ class ContainmentAction(Base):
             "action_type": self.action_type,
             "status": self.status,
             "executed_by": self.executed_by,
+            "target": self.target,
+            "connector": self.connector,
+            "execution_mode": self.execution_mode,
+            "details": self.details,
             "timestamp": self.timestamp.isoformat() if self.timestamp else None
         }
 
@@ -274,4 +295,51 @@ class SystemLog(Base):
             "target": self.target,
             "details": self.details,
             "created_at": self.created_at.isoformat() if self.created_at else None
+        }
+
+
+class AgentProposal(Base):
+    """A triage verdict and set of proposed response actions submitted by an AI agent.
+
+    Every proposed action is checked by the policy engine; actions are only executed
+    automatically when policy allows it, otherwise they wait for an analyst decision.
+    """
+    __tablename__ = "agent_proposals"
+
+    proposal_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    alert_id = Column(Integer, ForeignKey("alerts.alert_id", ondelete="CASCADE"), nullable=False, index=True)
+    agent_name = Column(String(100), nullable=False, index=True)
+    verdict = Column(String(20), nullable=False)  # malicious, suspicious, benign, unknown
+    confidence = Column(Float, default=0.0, nullable=False)  # 0.0 - 1.0
+    summary = Column(Text, nullable=True)
+    reasoning = Column(Text, nullable=True)
+    proposed_actions = Column(JSON, nullable=True)  # [{"action", "target", "params"}]
+    policy_evaluation = Column(JSON, nullable=True)  # per-action policy decision
+    execution_results = Column(JSON, nullable=True)
+    status = Column(String(30), default="pending_approval", nullable=False, index=True)
+    # pending_approval, auto_executed, partially_executed, approved, rejected, blocked, no_action
+    decided_by = Column(String(50), nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    decision_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+
+    alert = relationship("Alert", back_populates="agent_proposals")
+
+    def to_dict(self):
+        return {
+            "proposal_id": self.proposal_id,
+            "alert_id": self.alert_id,
+            "agent_name": self.agent_name,
+            "verdict": self.verdict,
+            "confidence": self.confidence,
+            "summary": self.summary,
+            "reasoning": self.reasoning,
+            "proposed_actions": self.proposed_actions or [],
+            "policy_evaluation": self.policy_evaluation or [],
+            "execution_results": self.execution_results or [],
+            "status": self.status,
+            "decided_by": self.decided_by,
+            "decided_at": self.decided_at.isoformat() if self.decided_at else None,
+            "decision_notes": self.decision_notes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }

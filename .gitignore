@@ -41,3 +41,10 @@ Thumbs.db
 .vscode/
 .idea/
 .probe.txt
+
+# Runtime data (never commit databases or generated reports)
+*.db
+*.sqlite3
+backend/reports/*
+!backend/reports/.gitkeep
+*.tsbuildinfo

@@ -24,13 +24,23 @@ def get_ioc_artifacts_by_alert(db: Session, alert_id: int) -> List[IocArtifact]:
     return db.query(IocArtifact).filter(IocArtifact.alert_id == alert_id).all()
 
 def create_ioc_artifact(
-    db: Session, alert_id: int, artifact_type: str, value: str, threat_score: int = 0
+    db: Session,
+    alert_id: int,
+    artifact_type: str,
+    value: str,
+    threat_score: int = 0,
+    verdict: str = "Unknown",
+    enrichment_status: str = "pending",
+    tip_results: Optional[Dict[str, Any]] = None,
 ) -> IocArtifact:
     db_artifact = IocArtifact(
         alert_id=alert_id,
         artifact_type=artifact_type,
         value=value,
         threat_score=threat_score,
+        verdict=verdict,
+        enrichment_status=enrichment_status,
+        tip_results=tip_results,
         created_at=utc_now()
     )
     db.add(db_artifact)
@@ -233,12 +243,22 @@ def create_containment_action(
     db: Session,
     alert_id: int,
     action_type: str,
-    status: str = "Executed"
+    status: str = "Executed",
+    executed_by: str = "System",
+    target: Optional[str] = None,
+    connector: Optional[str] = None,
+    execution_mode: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
 ) -> ContainmentAction:
     action = ContainmentAction(
         alert_id=alert_id,
         action_type=action_type,
         status=status,
+        executed_by=executed_by,
+        target=target,
+        connector=connector,
+        execution_mode=execution_mode,
+        details=details,
         timestamp=utc_now()
     )
     db.add(action)

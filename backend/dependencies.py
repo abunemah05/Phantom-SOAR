@@ -1,4 +1,6 @@
+import hmac
 import logging
+import os
 from typing import Optional
 from fastapi import Depends, HTTPException, status, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -154,3 +156,24 @@ def require_analyst_or_admin(
             detail="Account is currently inactive."
         )
     return current_user
+
+
+def require_ingest_token(
+    x_phantom_ingest_token: Optional[str] = Header(default=None, alias="X-Phantom-Ingest-Token")
+) -> None:
+    """Authenticate SIEM / EDR / XDR webhook senders with a shared ingestion token.
+
+    Ingestion is disabled until PHANTOM_INGEST_TOKEN is set, so a fresh install never
+    accepts unauthenticated alerts that can trigger containment.
+    """
+    expected = os.getenv("PHANTOM_INGEST_TOKEN", "")
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook ingestion is disabled: set PHANTOM_INGEST_TOKEN on the server.",
+        )
+    if not x_phantom_ingest_token or not hmac.compare_digest(x_phantom_ingest_token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid X-Phantom-Ingest-Token header.",
+        )

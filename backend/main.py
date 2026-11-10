@@ -68,6 +68,24 @@ def ensure_sqlite_migrations():
                         conn.execute(text("ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0"))
                     if "locked_until" not in user_cols:
                         conn.execute(text("ALTER TABLE users ADD COLUMN locked_until DATETIME"))
+                    if "is_service_account" not in user_cols:
+                        conn.execute(text("ALTER TABLE users ADD COLUMN is_service_account BOOLEAN DEFAULT 0"))
+                    if "api_key_hash" not in user_cols:
+                        conn.execute(text("ALTER TABLE users ADD COLUMN api_key_hash VARCHAR(255)"))
+                    if "api_key_prefix" not in user_cols:
+                        conn.execute(text("ALTER TABLE users ADD COLUMN api_key_prefix VARCHAR(16)"))
+                    conn.commit()
+
+                # IoC artifacts: per-provider TIP evidence
+                ioc_res = conn.execute(text("PRAGMA table_info(ioc_artifacts)")).fetchall()
+                ioc_cols = [r[1] for r in ioc_res]
+                if ioc_cols:
+                    if "verdict" not in ioc_cols:
+                        conn.execute(text("ALTER TABLE ioc_artifacts ADD COLUMN verdict VARCHAR(20) DEFAULT 'Unknown'"))
+                    if "enrichment_status" not in ioc_cols:
+                        conn.execute(text("ALTER TABLE ioc_artifacts ADD COLUMN enrichment_status VARCHAR(30) DEFAULT 'pending'"))
+                    if "tip_results" not in ioc_cols:
+                        conn.execute(text("ALTER TABLE ioc_artifacts ADD COLUMN tip_results JSON"))
                     conn.commit()
 
                 # 3. Containment actions migrations
@@ -76,7 +94,15 @@ def ensure_sqlite_migrations():
                 if ca_cols:
                     if "executed_by" not in ca_cols:
                         conn.execute(text("ALTER TABLE containment_actions ADD COLUMN executed_by VARCHAR(50) DEFAULT 'System'"))
-                        conn.commit()
+                    for col, ddl in (
+                        ("target", "VARCHAR(255)"),
+                        ("connector", "VARCHAR(50)"),
+                        ("execution_mode", "VARCHAR(20)"),
+                        ("details", "JSON"),
+                    ):
+                        if col not in ca_cols:
+                            conn.execute(text(f"ALTER TABLE containment_actions ADD COLUMN {col} {ddl}"))
+                    conn.commit()
     except Exception as e:
         logger.debug(f"SQLite migration check: {e}")
 
