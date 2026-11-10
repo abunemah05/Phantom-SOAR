@@ -1,7 +1,8 @@
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from backend.config import settings
@@ -19,6 +20,7 @@ from backend.routers import (
     ensure_default_user,
     ensure_default_configurations
 )
+from backend.dependencies import get_current_user, require_ingest_token
 from backend.models import Playbook
 from backend.crud import create_playbook
 from backend.engine.playbooks_catalog import PRECONFIGURED_PLAYBOOKS
@@ -114,10 +116,10 @@ def init_system_defaults():
     ensure_sqlite_migrations()
     db = SessionLocal()
     try:
-        # 1. Ensure default credentials (abunemah / Admin1)
+        # 1. Bootstrap administrator (password from PHANTOM_BOOTSTRAP_ADMIN_PASSWORD)
         ensure_default_user(db)
 
-        # 2. Ensure default API key configurations
+        # 2. Integration settings rows (exactly the keys in integration_config.INTEGRATION_KEYS)
         ensure_default_configurations(db)
 
         # 3. Ensure 12 pre-configured SANS / MITRE IR Playbooks
@@ -149,24 +151,39 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware configuration
+# CORS: explicit origins only (PHANTOM_CORS_ORIGINS). The console sends Bearer tokens, not cookies.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.BACKEND_CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=[o for o in settings.BACKEND_CORS_ORIGINS if "*" not in o],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Register API Routers
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith(settings.API_V1_STR):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+# Register API routers. Routers whose every route needs an operator session get the
+# dependency at router level as well, so a route added without one is still protected.
+# Auth, users, reports, configuration and logs declare their (stricter) dependencies per route.
+_user_session = [Depends(get_current_user)]
 app.include_router(auth_router, prefix=settings.API_V1_STR)
 app.include_router(users_router, prefix=settings.API_V1_STR)
 app.include_router(reports_router, prefix=settings.API_V1_STR)
 app.include_router(config_router, prefix=settings.API_V1_STR)
-app.include_router(webhooks_router, prefix=settings.API_V1_STR)
-app.include_router(alerts_router, prefix=settings.API_V1_STR)
-app.include_router(playbooks_router, prefix=settings.API_V1_STR)
-app.include_router(demo_router, prefix=settings.API_V1_STR)
+app.include_router(webhooks_router, prefix=settings.API_V1_STR, dependencies=[Depends(require_ingest_token)])
+app.include_router(alerts_router, prefix=settings.API_V1_STR, dependencies=_user_session)
+app.include_router(playbooks_router, prefix=settings.API_V1_STR, dependencies=_user_session)
+app.include_router(demo_router, prefix=settings.API_V1_STR, dependencies=_user_session)
 app.include_router(logs_router, prefix=settings.API_V1_STR)
 
 @app.get("/")
@@ -180,10 +197,18 @@ def root():
 
 @app.get("/api/health")
 def health_check():
-    return {
-        "status": "healthy",
-        "database": "connected",
-        "default_user": "abunemah",
+    """Unauthenticated liveness/readiness probe. Reveals no account or configuration details."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        database = "connected"
+    except Exception as e:
+        logger.warning(f"Health check: database unavailable ({e.__class__.__name__}).")
+        database = "unavailable"
+    body = {
+        "status": "healthy" if database == "connected" else "degraded",
+        "database": database,
         "architecture": "SANS PICERL / SOAPA",
         "version": settings.PROJECT_VERSION
     }
+    return JSONResponse(body, status_code=200 if database == "connected" else 503)

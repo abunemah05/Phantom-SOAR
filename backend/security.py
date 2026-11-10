@@ -1,13 +1,18 @@
 import os
-import re
 import hmac
 import hashlib
+import logging
+import secrets
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, Tuple
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
 import pyotp
 import jwt
+
+logger = logging.getLogger(__name__)
 
 # --- Argon2 Hasher Configuration (NIST SP 800-63B Recommendation) ---
 # Parameters: Memory = 64MB (65536 KB), Time iterations = 2, Parallelism = 2
@@ -19,23 +24,52 @@ argon2_hasher = PasswordHasher(
     salt_len=16
 )
 
-# JWT Secret & Configuration
-JWT_SECRET_KEY = os.getenv("PHANTOM_JWT_SECRET", "phantom-soar-enterprise-jwt-secret-key-nist-2026")
-JWT_ALGORITHM = "HS256"
-JWT_EXPIRATION_MINUTES = 60 * 24 * 90  # 90-day persistent session (NIST SP 800-63B)
 
-# Legacy salt for smooth fallback
+def _load_jwt_secret() -> str:
+    secret = os.getenv("PHANTOM_JWT_SECRET", "").strip()
+    if secret:
+        return secret
+    if os.getenv("PHANTOM_ENV", "").strip().lower() != "test":
+        logger.warning(
+            "PHANTOM_JWT_SECRET is not set: using a random per-process signing key. "
+            "Sessions will not survive a restart and will not be shared between workers."
+        )
+    return secrets.token_urlsafe(64)
+
+
+def _load_expiry_minutes() -> int:
+    raw = os.getenv("PHANTOM_JWT_EXPIRE_MINUTES", "").strip()
+    try:
+        minutes = int(raw) if raw else 720
+    except ValueError:
+        logger.warning(f"Invalid PHANTOM_JWT_EXPIRE_MINUTES={raw!r}; using 720.")
+        minutes = 720
+    return max(1, minutes)
+
+
+JWT_SECRET_KEY = _load_jwt_secret()
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_MINUTES = _load_expiry_minutes()
+
+# Claim set on tokens issued to users who must change their password first.
+PASSWORD_CHANGE_CLAIM = "pwd_change_required"
+
+# Legacy salt, only used to verify (and then upgrade) pre-Argon2 hashes.
 LEGACY_SALT = "phantom_soar_salt_2026"
+
+# Verified against when a username does not exist, so response time does not reveal valid usernames.
+_DUMMY_HASH = argon2_hasher.hash(secrets.token_urlsafe(16))
 
 # --- NIST SP 800-63B Compromised Credential Blocklist ---
 # Common dictionary words, known breached passwords, and trivial keyboard patterns
 COMPROMISED_PASSWORD_BLOCKLIST = {
     "password", "password123", "password1234", "12345678", "123456789", "1234567890",
     "qwertyuiop", "asdfghjkl", "zxcvbnm", "administrator", "admin123", "admin1234",
-    "welcome123", "welcome2026", "PhantomSOAR", "PhantomSOAR1", "PhantomSOAR123",
-    "iloveyou123", "sunshine1", "princess1", "football1", "monkey123", "shadow123",
-    "master123", "dragon123", "trustno1", "letmein123", "changeme123", "default123",
-    "soc_analyst", "analyst123", "phantom123", "cybersecurity", "infosec123"
+    "welcome123", "welcome2026", "phantomsoar", "phantomsoar1", "phantomsoar123",
+    "phantomsoar1@", "admin1", "iloveyou123", "sunshine1", "princess1", "football1",
+    "monkey123", "shadow123", "master123", "dragon123", "trustno1", "letmein123",
+    "changeme123", "default123", "soc_analyst", "analyst123", "phantom123",
+    "cybersecurity", "infosec123"
 }
 
 def hash_password(password: str) -> str:
@@ -45,21 +79,36 @@ def hash_password(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """
     Verify password against Argon2id hash.
-    Falls back gracefully to legacy SHA-256 for existing database credentials.
+    Falls back to the legacy salted SHA-256 format for credentials created before Argon2.
     """
     if not hashed_password or not plain_password:
         return False
 
-    # Check if hash is Argon2 ($argon2id$ or $argon2i$)
     if hashed_password.startswith("$argon2"):
         try:
             return argon2_hasher.verify(hashed_password, plain_password)
         except (VerifyMismatchError, VerificationError, InvalidHashError):
             return False
 
-    # Fallback to legacy SHA-256 with salt
     legacy_hash = hashlib.sha256(f"{LEGACY_SALT}{plain_password}".encode("utf-8")).hexdigest()
     return hmac.compare_digest(legacy_hash, hashed_password)
+
+def password_needs_rehash(hashed_password: str) -> bool:
+    """True for legacy SHA-256 hashes or Argon2 hashes with outdated parameters."""
+    if not hashed_password or not hashed_password.startswith("$argon2"):
+        return True
+    try:
+        return argon2_hasher.check_needs_rehash(hashed_password)
+    except InvalidHashError:
+        return True
+
+def burn_password_check(plain_password: str) -> None:
+    """Spend the same work as a real verification (used for unknown usernames)."""
+    verify_password(plain_password or "x", _DUMMY_HASH)
+
+def generate_temporary_password() -> str:
+    """Random one-time password for new or reset accounts (must be changed at first sign-in)."""
+    return secrets.token_urlsafe(15)
 
 def is_compromised_password(password: str) -> bool:
     """
@@ -72,7 +121,7 @@ def is_compromised_password(password: str) -> bool:
 
     # Check for trivial dictionary prefixes common in breaches (e.g., password1234, admin2026)
     common_roots = [
-        "password", "qwerty", "admin", "welcome", "letmein", "default", 
+        "password", "qwerty", "admin", "welcome", "letmein", "default",
         "phantomsoar", "changeme", "iloveyou", "dragon", "master"
     ]
     for root in common_roots:
@@ -95,8 +144,8 @@ def is_compromised_password(password: str) -> bool:
     return False
 
 def check_nist_password_policy(
-    password: str, 
-    mfa_enabled: bool = False, 
+    password: str,
+    mfa_enabled: bool = False,
     username: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
@@ -150,17 +199,44 @@ def verify_totp_code(secret: str, code: str) -> bool:
 
 # --- JWT Session Tokens ---
 def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta] = None) -> str:
-    """Create signed JWT access token."""
+    """Create a signed JWT. Every token gets a unique jti so it can be revoked at logout."""
     to_encode = data.copy()
     now = datetime.now(timezone.utc)
     expire = now + (expires_delta if expires_delta else timedelta(minutes=JWT_EXPIRATION_MINUTES))
     to_encode.update({"iat": now, "exp": expire})
+    to_encode.setdefault("jti", secrets.token_urlsafe(16))
     return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 def decode_access_token(token: str) -> Optional[Dict[str, Any]]:
-    """Decode and validate signed JWT access token."""
+    """Decode and validate a signed JWT (signature, expiry, required claims). None when invalid."""
     try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-        return payload
-    except Exception:
+        return jwt.decode(
+            token,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            options={"require": ["exp", "iat", "sub"]},
+        )
+    except jwt.PyJWTError:
         return None
+
+# --- Logout revocation (in-process denylist of token ids until they expire) ---
+_revoked_jtis: Dict[str, float] = {}
+_revoked_lock = threading.Lock()
+
+def revoke_token(payload: Dict[str, Any]) -> None:
+    jti = payload.get("jti")
+    if not jti:
+        return
+    exp = float(payload.get("exp") or (time.time() + JWT_EXPIRATION_MINUTES * 60))
+    with _revoked_lock:
+        now = time.time()
+        for stale in [k for k, v in _revoked_jtis.items() if v < now]:
+            _revoked_jtis.pop(stale, None)
+        _revoked_jtis[jti] = exp
+
+def is_token_revoked(payload: Dict[str, Any]) -> bool:
+    jti = payload.get("jti")
+    if not jti:
+        return False
+    with _revoked_lock:
+        return jti in _revoked_jtis

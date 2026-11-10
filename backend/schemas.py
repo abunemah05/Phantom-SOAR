@@ -12,6 +12,7 @@ class ChangePasswordRequest(BaseModel):
     username: str
     current_password: str
     new_password: str
+    mfa_code: Optional[str] = None  # required for MFA accounts unless the caller sends its own Bearer session
 
 class MFASetupResponse(BaseModel):
     secret: str
@@ -23,6 +24,9 @@ class MFASetupResponse(BaseModel):
 class MFAVerifyRequest(BaseModel):
     username: Optional[str] = None
     code: str
+
+class MFADisableRequest(BaseModel):
+    code: Optional[str] = None  # current TOTP code, required while MFA is enabled
 
 class MFAStatusResponse(BaseModel):
     mfa_enabled: bool
@@ -37,9 +41,13 @@ class UserResponse(BaseModel):
     is_active: bool = True
     mfa_enabled: bool = False
     compromised_reset_required: bool = False
+    is_service_account: bool = False
     password_changed_at: Optional[str] = None
     created_at: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
+
+class UserCreateResponse(UserResponse):
+    temporary_password: str  # shown once; the operator must change it at first sign-in
 
 class UserCreateRequest(BaseModel):
     username: str
@@ -83,7 +91,9 @@ class AdminReportResponse(BaseModel):
     filtered_analyst: Optional[str] = None
     total_cases_reviewed: int
     total_containment_actions: int
+    containment_by_mode: Dict[str, int] = Field(default_factory=dict)  # live / simulated / skipped / blocked / failed
     average_mttr_seconds: float
+    mttr_sample_size: int = 0  # completed playbook executions the average is computed from
     analyst_breakdown: List[AnalystMetrics]
     cases: List[Dict[str, Any]]
     action_logs: List[Dict[str, Any]]
@@ -91,19 +101,22 @@ class AdminReportResponse(BaseModel):
 
 # --- System Configuration Schemas ---
 class ConfigItem(BaseModel):
-    category: str  # AI, EDR, XDR, SIEM, TIP, FIREWALL, ITSM
+    category: str  # TIP, SIEM, IAM, ITSM, ORCHESTRATION, AGENT
     key_name: str
-    key_value: str
-    is_secret: bool = True
+    key_value: str = ""
+    is_secret: Optional[bool] = None  # ignored: secrecy is decided by the server per key
+    clear: bool = False  # for secrets, an empty key_value keeps the stored value unless clear is true
 
 class ConfigUpdateRequest(BaseModel):
     configs: List[ConfigItem]
 
 class TestConnectionRequest(BaseModel):
-    category: str
-    service_name: str
+    service_name: str  # virustotal, abuseipdb, otx, threatfox, nvd, wazuh, okta, jira, slack
+    category: Optional[str] = None
+    # Optional overrides to test credentials before saving them; stored settings are used otherwise.
     api_key: Optional[str] = None
     endpoint_url: Optional[str] = None
+    username: Optional[str] = None
 
 
 # --- Alert Action Decision Schema ---
@@ -118,6 +131,9 @@ class IocArtifactBase(BaseModel):
     artifact_type: str  # IP, Hash, URL, Domain
     value: str
     threat_score: int = 0
+    verdict: str = "Unknown"  # Malicious, Suspicious, Clean, Unknown
+    enrichment_status: str = "pending"  # enriched, partial, unavailable, not_configured, pending
+    tip_results: Optional[Dict[str, Any]] = None
 
 class IocArtifactCreate(IocArtifactBase):
     alert_id: Optional[int] = None
@@ -134,6 +150,10 @@ class ContainmentActionBase(BaseModel):
     action_type: str
     status: str = "Executed"
     executed_by: str = "System"
+    target: Optional[str] = None
+    connector: Optional[str] = None
+    execution_mode: Optional[str] = None  # live, simulated, skipped, blocked, failed
+    details: Optional[Dict[str, Any]] = None
 
 class ContainmentActionCreate(ContainmentActionBase):
     alert_id: int
@@ -229,7 +249,9 @@ class AlertDetailResponse(AlertResponse):
     containment_actions: List[ContainmentActionResponse] = []
     incident_reports: List[IncidentReportResponse] = []
     mitre_attack: Optional[Dict[str, Any]] = None
-    ai_summary: Optional[str] = None
+    triage_summary: Optional[str] = None
+    simulation_mode: bool = False
+    playbook: Optional[Dict[str, Any]] = None
     vulnerability_intel: Optional[Dict[str, Any]] = None
     model_config = ConfigDict(from_attributes=True)
 
