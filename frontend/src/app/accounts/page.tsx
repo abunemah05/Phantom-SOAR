@@ -343,7 +343,7 @@ export default function AccountsPage() {
               ) : filteredUsers.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="py-8 text-center text-slate-500">
-                    No operator accounts found matching "{searchQuery}".
+                    No operator accounts found matching &ldquo;{searchQuery}&rdquo;.
                   </td>
                 </tr>
               ) : (

@@ -459,7 +459,7 @@ export default function LogsPage() {
                 No logs match the selected filter criteria.
               </p>
               <p className="text-[11px] text-slate-600">
-                Try widening your time window (seconds) or click "Inject Telemetry" to simulate live events.
+                Try widening the time window or clearing the source, level and search filters.
               </p>
             </div>
           ) : (
