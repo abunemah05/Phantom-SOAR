@@ -1,0 +1,14 @@
+# Keep the backend image limited to runtime code.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+tests/
+requirements-dev.txt
+reports/*
+*.db
+*.sqlite3
+*.log
+.env
+.env.*
+Dockerfile
+.dockerignore

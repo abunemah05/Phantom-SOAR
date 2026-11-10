@@ -1,52 +1,115 @@
-version: '3.8'
+# Phantom SOAR — full stack (Postgres, Redis, FastAPI API, Celery worker, Next.js UI).
+#
+#   cp .env.example .env    # then fill in the REQUIRED secrets
+#   docker compose up --build
+#
+# Secrets have no defaults: compose refuses to start until they are set in .env.
+# Postgres and Redis are only reachable on the internal compose network.
+
+name: phantom-soar
+
+x-backend-env: &backend-env
+  PHANTOM_ENV: ${PHANTOM_ENV:-production}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-phantom}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-phantom_soar}
+  PHANTOM_ALLOW_SQLITE_FALLBACK: "false"
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
+  CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
+  CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
+  REPORTS_DIR: /app/backend/reports
+  # Auth and ingestion
+  PHANTOM_JWT_SECRET: ${PHANTOM_JWT_SECRET:?set PHANTOM_JWT_SECRET in .env}
+  PHANTOM_JWT_EXPIRE_MINUTES: ${PHANTOM_JWT_EXPIRE_MINUTES:-720}
+  PHANTOM_BOOTSTRAP_ADMIN_PASSWORD: ${PHANTOM_BOOTSTRAP_ADMIN_PASSWORD:?set PHANTOM_BOOTSTRAP_ADMIN_PASSWORD in .env}
+  PHANTOM_INGEST_TOKEN: ${PHANTOM_INGEST_TOKEN:?set PHANTOM_INGEST_TOKEN in .env}
+  PHANTOM_CORS_ORIGINS: ${PHANTOM_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+  # Orchestration / agent guardrails (empty = application default; values saved
+  # in the Configuration page take precedence over these)
+  PHANTOM_SIMULATION_MODE: ${PHANTOM_SIMULATION_MODE:-}
+  PHANTOM_HOTL_ENABLED: ${PHANTOM_HOTL_ENABLED:-}
+  PHANTOM_PROTECTED_HOSTS: ${PHANTOM_PROTECTED_HOSTS:-}
+  PHANTOM_PROTECTED_USERS: ${PHANTOM_PROTECTED_USERS:-}
+  PHANTOM_PROTECTED_IPS: ${PHANTOM_PROTECTED_IPS:-}
+  PHANTOM_AGENT_MIN_CONFIDENCE: ${PHANTOM_AGENT_MIN_CONFIDENCE:-}
+  PHANTOM_AGENT_AUTONOMY: ${PHANTOM_AGENT_AUTONOMY:-}
+  # Threat intelligence
+  VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
+  ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
+  ALIENVAULT_OTX_API_KEY: ${ALIENVAULT_OTX_API_KEY:-}
+  THREATFOX_API_KEY: ${THREATFOX_API_KEY:-}
+  NVD_API_KEY: ${NVD_API_KEY:-}
+  # Wazuh manager API
+  WAZUH_API_URL: ${WAZUH_API_URL:-}
+  WAZUH_API_USER: ${WAZUH_API_USER:-}
+  WAZUH_API_PASSWORD: ${WAZUH_API_PASSWORD:-}
+  WAZUH_VERIFY_TLS: ${WAZUH_VERIFY_TLS:-}
+  # Identity provider
+  OKTA_DOMAIN: ${OKTA_DOMAIN:-}
+  OKTA_API_TOKEN: ${OKTA_API_TOKEN:-}
+  # ITSM / notifications
+  JIRA_BASE_URL: ${JIRA_BASE_URL:-}
+  JIRA_EMAIL: ${JIRA_EMAIL:-}
+  JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
+  JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
+  JIRA_WEBHOOK_URL: ${JIRA_WEBHOOK_URL:-}
+  SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
 
 services:
   db:
     image: postgres:16-alpine
     container_name: phantom_soar_db
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgrespassword
-      POSTGRES_DB: phantom_soar
-    ports:
-      - "5432:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-phantom}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-phantom_soar}
+    # No published port. To reach it from the host for debugging, add:
+    # ports: ["127.0.0.1:5432:5432"]
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d phantom_soar"]
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   redis:
     image: redis:7-alpine
     container_name: phantom_soar_redis
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}", "--appendonly", "yes"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    # No published port (see the db service for a loopback-only example).
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: phantom-soar-backend:local
     container_name: phantom_soar_backend
-    restart: always
-    environment:
-      DATABASE_URL: postgresql://postgres:postgrespassword@db:5432/phantom_soar
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/0
-      REPORTS_DIR: /app/backend/reports
+    restart: unless-stopped
+    environment: *backend-env
     ports:
-      - "8000:8000"
+      # Loopback by default. Set PHANTOM_PUBLISH_HOST=0.0.0.0 when Wazuh or other
+      # browsers must reach the API from another machine.
+      - "${PHANTOM_PUBLISH_HOST:-127.0.0.1}:8000:8000"
     volumes:
-      - ./backend/reports:/app/backend/reports
+      - reports_data:/app/backend/reports
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     depends_on:
       db:
         condition: service_healthy
@@ -57,36 +120,50 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: phantom-soar-backend:local
     container_name: phantom_soar_celery
-    restart: always
+    restart: unless-stopped
     command: ["celery", "-A", "backend.celery_app.celery_app", "worker", "--loglevel=info"]
-    environment:
-      DATABASE_URL: postgresql://postgres:postgrespassword@db:5432/phantom_soar
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/0
-      REPORTS_DIR: /app/backend/reports
+    environment: *backend-env
     volumes:
-      - ./backend/reports:/app/backend/reports
+      - reports_data:/app/backend/reports
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A backend.celery_app.celery_app inspect ping --timeout 5 -d \"celery@$$HOSTNAME\" > /dev/null"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
+      backend:
         condition: service_healthy
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # Baked into the browser bundle at build time: must be reachable from the
+        # user's browser. Rebuild (docker compose build frontend) after changing it.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     container_name: phantom_soar_frontend
-    restart: always
-    environment:
-      NEXT_PUBLIC_API_URL: http://backend:8000
+    restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "${PHANTOM_PUBLISH_HOST:-127.0.0.1}:3000:3000"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.status < 500 ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
 volumes:
   postgres_data:
   redis_data:
+  reports_data:

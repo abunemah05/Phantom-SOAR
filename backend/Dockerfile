@@ -1,20 +1,33 @@
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1
+# Phantom SOAR backend image (FastAPI API and Celery worker share it).
+# Build context is ./backend; the package is installed at /app/backend so
+# "backend.main:app" resolves with PYTHONPATH=/app.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app \
+    REPORTS_DIR=/app/backend/reports \
+    DATABASE_URL=sqlite:////app/data/phantom_soar.db
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libpq-dev \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN groupadd --system --gid 10001 phantom \
+    && useradd --system --uid 10001 --gid phantom --home-dir /app --no-create-home \
+       --shell /usr/sbin/nologin phantom
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Runtime dependencies only (psycopg2-binary / argon2 ship wheels, no compiler needed).
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
+# Application code stays root-owned; only the data and reports directories are writable.
 COPY . /app/backend
+RUN mkdir -p /app/backend/reports /app/data \
+    && chown phantom:phantom /app/backend/reports /app/data
 
-ENV PYTHONPATH=/app
-ENV PYTHONUNBUFFERED=1
+USER phantom
 
 EXPOSE 8000
 
