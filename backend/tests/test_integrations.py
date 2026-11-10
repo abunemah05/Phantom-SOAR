@@ -15,13 +15,20 @@ def test_edr_isolate_and_terminate():
     assert "evil.exe" == term_res["process_name"]
 
 def test_tip_enrichment():
+    # Tests run in simulation mode with no API keys: only explicit lab fixtures carry a score.
     res = tip_client.enrich_ioc("IP", "198.51.100.45")
     assert res["artifact_type"] == "IP"
     assert res["threat_score"] > 50
     assert res["verdict"] == "Malicious"
+    assert res["simulated"] is True
+    assert res["providers"]["abuseipdb"]["status"] == "lab_fixture"
 
-    hash_res = tip_client.enrich_ioc("Hash", "44d88612fea8a8f36de82e1278abb02f")
+    hash_res = tip_client.enrich_ioc("Hash", "44d88612fea8a8f36de82e1278abb02f")  # EICAR test file
     assert hash_res["threat_score"] >= 80
+
+    unknown = tip_client.enrich_ioc("Domain", "google.com")
+    assert unknown["verdict"] == "Unknown"
+    assert unknown["threat_score"] == 0
 
 def test_firewall_block():
     fw_res = firewall_client.block_ip("198.51.100.45")

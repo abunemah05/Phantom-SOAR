@@ -82,6 +82,10 @@ _TYPE_ALIASES = {
 
 _HASH_RE = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$")
 _DOMAIN_RE = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$")
+_DOCUMENTATION_NETS = tuple(
+    ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")
+)
+_SHARED_NET = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _lab(score: int, label: str, *tags: str) -> Dict[str, Any]:
@@ -142,10 +146,9 @@ def non_public_ip_reason(ip: ipaddress._BaseAddress) -> Optional[str]:
         return "link-local address"
     if ip.is_multicast:
         return "multicast address"
-    doc_nets = ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")
-    if any(ip in ipaddress.ip_network(n) for n in doc_nets if ipaddress.ip_network(n).version == ip.version):
+    if any(ip.version == net.version and ip in net for net in _DOCUMENTATION_NETS):
         return "documentation range (RFC 5737 / RFC 3849), not routable"
-    if ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10"):
+    if ip.version == 4 and ip in _SHARED_NET:
         return "shared address space (RFC 6598, carrier-grade NAT)"
     if ip.is_private:
         return "private / internal address"

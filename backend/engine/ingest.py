@@ -242,8 +242,8 @@ def extract_iocs(payload: Dict[str, Any], limit: int = MAX_IOCS_PER_ALERT) -> Tu
     }
 
     ordered: List[Tuple[str, str]] = []
-    if isinstance(payload.get("data"), dict):
-        ordered.extend(_iter_strings(payload["data"], depth=1))
+    if "data" in payload:
+        ordered.extend(_iter_strings(payload["data"], key="data", depth=1))
     ordered.extend((k, v) for k, v in _iter_strings({k: v for k, v in payload.items() if k != "data"}))
     if isinstance(payload.get("full_log"), str):
         ordered.append(("full_log", payload["full_log"][:65536]))
