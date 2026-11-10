@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Phantom SOAR — Enterprise Architecture & AI Engine Specification</title>
+  <style>
+    :root {
+      --navy-dark: #0B132B;
+      --navy-primary: #1C2541;
+      --blue-accent: #2563EB;
+      --blue-soft: #EFF6FF;
+      --cyan-tech: #0EA5E9;
+      --green-safe: #059669;
+      --green-soft: #ECFDF5;
+      --amber-hitl: #D97706;
+      --amber-soft: #FFFBEB;
+      --red-hotl: #DC2626;
+      --red-soft: #FEF2F2;
+      --slate-dark: #1E293B;
+      --slate-text: #334155;
+      --slate-muted: #64748B;
+      --bg-card: #F8FAFC;
+      --border-card: #E2E8F0;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      color: var(--slate-text);
+      background-color: #F1F5F9;
+      line-height: 1.6;
+      padding: 40px 20px;
+    }
+
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      background: #FFFFFF;
+      padding: 60px 50px;
+      border-radius: 12px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.06);
+      border: 1px solid var(--border-card);
+    }
+
+    /* Cover / Academic Header */
+    .academic-header {
+      text-align: center;
+      margin-bottom: 25px;
+      padding-bottom: 20px;
+      border-bottom: 2px solid var(--border-card);
+    }
+    .inst-name {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 1.2px;
+      color: var(--slate-muted);
+      text-transform: uppercase;
+      margin-bottom: 4px;
+    }
+    .doc-type {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      color: var(--blue-accent);
+      text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+    h1.main-title {
+      font-size: 36px;
+      font-weight: 800;
+      color: var(--navy-dark);
+      letter-spacing: -0.5px;
+      margin-bottom: 8px;
+    }
+    .subtitle {
+      font-size: 16px;
+      color: var(--blue-accent);
+      font-weight: 500;
+      margin-bottom: 24px;
+    }
+
+    /* Abstract Card */
+    .abstract-card {
+      background: var(--blue-soft);
+      border-left: 4px solid var(--blue-accent);
+      padding: 16px 20px;
+      border-radius: 0 8px 8px 0;
+      font-size: 14px;
+      color: var(--slate-dark);
+      margin-bottom: 30px;
+    }
+
+    /* Metadata Grid */
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 12px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-card);
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin-bottom: 40px;
+      font-size: 13px;
+    }
+    .meta-item {
+      display: flex;
+      flex-direction: column;
+    }
+    .meta-item .label {
+      font-weight: 700;
+      color: var(--slate-muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .meta-item .val {
+      font-weight: 600;
+      color: var(--navy-dark);
+      margin-top: 2px;
+    }
+
+    /* Headings */
+    h2.chapter-header {
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--navy-dark);
+      margin-top: 40px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      border-bottom: 2px solid var(--blue-accent);
+      padding-bottom: 6px;
+    }
+    h3.section-header {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--blue-accent);
+      margin-top: 24px;
+      margin-bottom: 8px;
+    }
+
+    p { margin-bottom: 12px; font-size: 14.5px; }
+    ul { margin: 8px 0 16px 24px; }
+    li { margin-bottom: 6px; font-size: 14px; }
+
+    /* ASCII Diagrams */
+    .code-box {
+      background: var(--navy-dark);
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 18px 20px;
+      overflow-x: auto;
+      margin: 18px 0 24px 0;
+      box-shadow: inset 0 2px 6px rgba(0,0,0,0.4);
+    }
+    .code-box pre {
+      font-family: "Courier New", Courier, monospace;
+      font-size: 11.5px;
+      line-height: 1.25;
+      color: var(--cyan-tech);
+    }
+
+    /* Tables */
+    table.data-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 18px 0 24px 0;
+      font-size: 13px;
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid var(--border-card);
+    }
+    table.data-table th {
+      background: var(--navy-dark);
+      color: #FFFFFF;
+      font-weight: 700;
+      text-align: left;
+      padding: 10px 14px;
+      font-size: 12.5px;
+    }
+    table.data-table td {
+      padding: 9px 14px;
+      border-bottom: 1px solid var(--border-card);
+      vertical-align: top;
+    }
+    table.data-table tr:nth-child(even) td {
+      background: var(--bg-card);
+    }
+    table.data-table tr:hover td {
+      background: #F1F5F9;
+    }
+
+    /* Callout Badges */
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .badge-critical { background: var(--red-soft); color: var(--red-hotl); border: 1px solid var(--red-hotl); }
+    .badge-medium { background: var(--amber-soft); color: var(--amber-hitl); border: 1px solid var(--amber-hitl); }
+    .badge-safe { background: var(--green-soft); color: var(--green-safe); border: 1px solid var(--green-safe); }
+
+    .callout {
+      padding: 14px 18px;
+      border-radius: 6px;
+      margin: 16px 0;
+      font-size: 13.5px;
+    }
+    .callout-amber { background: var(--amber-soft); border-left: 4px solid var(--amber-hitl); color: #78350F; }
+    .callout-green { background: var(--green-soft); border-left: 4px solid var(--green-safe); color: #064E3B; }
+
+    @media print {
+      body { background: white; padding: 0; }
+      .container { box-shadow: none; border: none; padding: 0; max-width: 100%; }
+      .code-box pre { font-size: 8.5px; }
+      h2.chapter-header { page-break-before: always; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Academic Header -->
+    <div class="academic-header">
+      <div class="inst-name">Balqa Applied University — Faculty of Artificial Intelligence & Cybersecurity</div>
+      <div class="doc-type">Graduation Project Thesis & Technical Defense Manual</div>
+      <h1 class="main-title">PHANTOM SOAR</h1>
+      <div class="subtitle">Enterprise Security Orchestration, Automation, and Response Platform</div>
+    </div>
+
+    <!-- Abstract Box -->
+    <div class="abstract-card">
+      <strong>Educational Thesis Abstract:</strong><br/>
+      Phantom SOAR is an enterprise-grade automated incident response platform architected around the 
+      <strong>SANS PICERL</strong> framework (Preparation, Identification, Containment, Eradication, Recovery, Lessons Learned), 
+      the <strong>SOAPA</strong> standard, and <strong>MITRE ATT&CK v14.1</strong>. This document provides a complete technical deep-dive 
+      into the core orchestration engine, the AI-driven Threat Intelligence Platform (TIP), heuristic behavioral scoring, 
+      HOTL/HITL autonomous response pipelines, and the multi-service Docker container topology.
+    </div>
+
+    <!-- Metadata Grid -->
+    <div class="meta-grid">
+      <div class="meta-item">
+        <span class="label">Candidate / Author</span>
+        <span class="val">Omar Abunemah</span>
+      </div>
+      <div class="meta-item">
+        <span class="label">Target Domain</span>
+        <span class="val">SOC Automation & Autonomous Defense</span>
+      </div>
+      <div class="meta-item">
+        <span class="label">Academic Institution</span>
+        <span class="val">Balqa Applied University</span>
+      </div>
+      <div class="meta-item">
+        <span class="label">Standard & Frameworks</span>
+        <span class="val">SANS PICERL / SOAPA / MITRE ATT&CK</span>
+      </div>
+      <div class="meta-item">
+        <span class="label">Backend Architecture</span>
+        <span class="val">FastAPI / Celery / Redis / PostgreSQL / SQLite</span>
+      </div>
+      <div class="meta-item">
+        <span class="label">Frontend Framework</span>
+        <span class="val">Next.js 14 (App Router) / Tailwind CSS / TypeScript</span>
+      </div>
+      <div class="meta-item">
+        <span class="label">Intelligence Layer</span>
+        <span class="val">AI Heuristic Engine + Multi-Source TIP Hub</span>
+      </div>
+      <div class="meta-item">
+        <span class="label">Deployment Mode</span>
+        <span class="val">Docker Compose Microservices (5 Containers)</span>
+      </div>
+    </div>
+
+    <!-- CHAPTER 1 -->
+    <h2 class="chapter-header">Chapter 1: Architectural Philosophy & The SANS PICERL Lifecycle</h2>
+    <p>
+      Modern Security Operations Centers (SOCs) face an existential volume problem: analysts are inundated with thousands 
+      of raw SIEM and EDR telemetry logs daily. Over 70% of alerts represent repetitive, low-complexity false positives or 
+      standard reconnaissance scans. Human analysts experiencing cognitive alert fatigue take an average of 45 minutes to 4 hours 
+      to manually triage and contain a critical threat.
+    </p>
+    <p>
+      <strong>Phantom SOAR</strong> solves this challenge by implementing algorithmic, programmatic orchestration aligned with the 
+      six phases of the gold-standard <strong>SANS PICERL</strong> incident response framework:
+    </p>
+
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th style="width: 20%;">SANS Phase</th>
+          <th style="width: 30%;">SOC Operational Role</th>
+          <th style="width: 50%;">Phantom SOAR Automated Implementation</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Preparation</strong></td>
+          <td>Pre-incident readiness & rule baselines</td>
+          <td>12 pre-configured SANS playbooks, API vault diagnostic probes, and containerized ingestion readiness.</td>
+        </tr>
+        <tr>
+          <td><strong>2. Identification</strong></td>
+          <td>Telemetry ingestion & threat detection</td>
+          <td>Multi-vector webhooks (/wazuh, /edr, /xdr), IoC extraction (IP, Hash, URL), and AI-driven TIP enrichment.</td>
+        </tr>
+        <tr>
+          <td><strong>3. Containment</strong></td>
+          <td>Threat isolation & blast radius control</td>
+          <td>Dual-tier routing: HOTL autonomous host network isolation & process killing (&lt; 2s) vs HITL analyst approval.</td>
+        </tr>
+        <tr>
+          <td><strong>4. Eradication</strong></td>
+          <td>Malware neutralization & root-cause purge</td>
+          <td>Force-terminating process trees via EDR kernel drivers, quarantining binary payloads, and firewall IP null-routes.</td>
+        </tr>
+        <tr>
+          <td><strong>5. Recovery</strong></td>
+          <td>Restoring production services safely</td>
+          <td>Re-enabling network connectivity (unisolate_endpoint), resetting credentials, and verifying host stability.</td>
+        </tr>
+        <tr>
+          <td><strong>6. Lessons Learned</strong></td>
+          <td>Post-incident audit & governance</td>
+          <td>Automated ReportLab Platypus PDF Incident Dossier generation, recording exact MTTR and containment logs.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3 class="section-header">System Architecture & Inter-Component Data Flow Diagram</h3>
+    <div class="code-box">
+      <pre>
++-------------------------------------------------------------------------------------------------+
+|                                MULTI-VECTOR TELEMETRY INGESTION                                 |
+|      Wazuh SIEM (Logs)          |     Sysmon / OpenEDR (Host)     |    Suricata / Zeek (XDR)    |
++---------------+---------------------------------+-------------------------------+---------------+
+                | POST /api/webhooks/wazuh        | POST /api/webhooks/edr        | POST /api/webhooks/xdr
+                v                                 v                               v
++-------------------------------------------------------------------------------------------------+
+|                                 FASTAPI REST API CORE (:8000)                                   |
+|    - Schema Validation (Pydantic)  - IoC Normalization   - SystemLog Real-Time Stream           |
++-------------------------------+-----------------------------------------+-----------------------+
+                                |                                         |
+                        SQLAlchemy ORM                            Redis Asynchronous Broker
+                                v                                         v
+                +-------------------------------+         +-------------------------------+
+                |    PostgreSQL / SQLite DB     |         |     Celery Background Worker  |
+                | Alerts, IoCs, Executions,     |         | Executes engine/runner.py     |
+                | Audit Logs, Accounts, Configs |         +---------------+---------------+
+                +-------------------------------+                         |
+                                                                          v
+                                                 +------------------------------------------------+
+                                                 |          SANS PICERL DECISION MATRIX           |
+                                                 +------------------------+-----------------------+
+                                                                          |
+                              +-------------------------------------------+-------------------------------------------+
+                              | Severity >= High OR Threat Score > 50                                                 | Severity <= Medium
+                              v                                                                                       v
+                  +-----------------------+                                                               +-----------------------+
+                  |  HOTL Autonomous Mode |                                                               |  HITL Analyst Gate    |
+                  |  Instant Containment  |                                                               |  Status: Triaged      |
+                  +-----------+-----------+                                                               +-----------+-----------+
+                              |                                                                                       |
+              +---------------+---------------+                                                                       | Analyst Clicks
+              |                               |                                                                       | "Approve"
+              v                               v                                                                       v
++---------------------------+   +---------------------------+                                                         |
+|  EDR: Host Isolation      |   |  ReportLab Platypus Engine| &lt;-------------------------------------------------------+
+|  EDR: Process Kill (PID)  |   |  Dynamic PDF Dossiers     |
+|  Firewall: IP Block List  |   |  MITRE ATT&CK Matrix      |
+|  IAM: Revoke User Session |   |  Forensic Timelines       |
+|  ITSM: Jira / Slack Alert |   +---------------------------+
++---------------------------+
+      </pre>
+    </div>
+
+    <!-- CHAPTER 2 -->
+    <h2 class="chapter-header">Chapter 2: The AI Engine in TIP & Automated Triage</h2>
+    <p>
+      A foundational innovation of Phantom SOAR is its <strong>dual-tier AI and Threat Intelligence Platform (TIP)</strong>. 
+      Rather than relying strictly on static IP or hash blocklists (which fail against zero-day malware and polymorphic droppers), 
+      Phantom SOAR combines live intelligence APIs with an autonomous <strong>machine learning heuristic behavioral engine</strong> and 
+      generative AI incident summarization.
+    </p>
+
+    <div class="callout callout-amber">
+      <strong>Educational Takeaway — Why Heuristic AI is Required in SOAR:</strong><br/>
+      1. Commercial threat intelligence APIs (VirusTotal, AbuseIPDB) enforce strict request quotas (e.g., 4 requests/min on free community tiers).<br/>
+      2. Adversaries alter binary compile-time hashes every 60 seconds (polymorphism), rendering exact MD5 matches obsolete.<br/>
+      3. Phantom SOAR's AI Heuristic Engine computes byte-distribution entropy and evaluates semantic keyword vectors to assign accurate threat scores even when completely offline.
+    </div>
+
+    <h3 class="section-header">A. AI Heuristic Behavioral Classifier (backend/integrations/tip.py)</h3>
+    <ul>
+      <li><strong>Lexical & Semantic Signature Classification:</strong> Scans indicator strings, file paths, and process arguments for adversary tradecraft terminology ('malware', 'c2', 'ransom', 'evil', 'beacon', 'lockbit', 'mimikatz', 'payload'). Elevated directly into the critical 85–99 range.</li>
+      <li><strong>Byte Dispersion & Entropy Calculation:</strong> Computes hexadecimal byte dispersion on hashes using truncated MD5/SHA256 seeds. High-entropy samples characteristic of packed and encrypted payloads receive automated severity boosts.</li>
+      <li><strong>RFC 1918 Private Subnet Suppression:</strong> Prevents catastrophic false-positive host isolation by recognizing internal private subnets (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) and assigning a threat score of 0.</li>
+      <li><strong>Mathematical Normalization:</strong> Normalizes VirusTotal v3 detection ratios into a standard 0–100 scale: <code>Threat Score = min(100, int((malicious / total) * 100))</code>, classifying scores &gt;= 50 as 'Malicious', &gt;= 20 as 'Suspicious', and &lt; 20 as 'Clean'.</li>
+    </ul>
+
+    <h3 class="section-header">B. Natural Language AI Executive Triage & MITRE Mapping (backend/routers/alerts.py)</h3>
+    <ul>
+      <li><strong>Automated Narrative Generation:</strong> Formulates concise, plain-English incident statements specifying rule origin, host name, detected severity, and maximum indicator threat score.</li>
+      <li><strong>Dynamic Containment Recommendations:</strong> If severity is High/Critical, the AI verifies that HOTL autonomous containment fired. If Medium/Low, it provides actionable context advising whether to contain or maintain passive monitoring.</li>
+      <li><strong>Automated MITRE ATT&CK Correlation:</strong> Dynamically correlates alert rules to MITRE Tactics and Techniques (T1486 Data Encrypted for Impact -> Impact; T1059 Command and Scripting Interpreter -> Execution; T1566 Phishing -> Initial Access).</li>
+    </ul>
+
+    <h3 class="section-header">AI & Threat Intelligence (TIP) Pipeline Architecture</h3>
+    <div class="code-box">
+      <pre>
++-------------------------------------------------------------------------------------------------+
+|                       AI & THREAT INTELLIGENCE (TIP) ENRICHMENT PIPELINE                        |
++-------------------------------------------------------------------------------------------------+
+       | Raw Ingested Alert (IP: 185.220.101.5, Hash: e3b0c442..., Rule: T1486)
+       v
++-------------------------------------------------------------------------------------------------+
+| 1. EXTRACTOR & TOKENIZER (regex IPv4, SHA256/MD5, FQDNs, URLs from full_log & data)            |
++-----------------------------------------------+-------------------------------------------------+
+                                                | Extracted IoCs
+                                                v
++-------------------------------------------------------------------------------------------------+
+| 2. TIP CLIENT ORCHESTRATOR (backend/integrations/tip.py)                                        |
+|    +----------------------------------+  +----------------------------------+                   |
+|    | Live VirusTotal v3 REST API      |  | Live AbuseIPDB API v2            |                   |
+|    | Detection stats & analysis score |  | IP confidence & country code     |                   |
+|    +-----------------+----------------+  +-----------------+----------------+                   |
+|                      |                                     |                                    |
+|                      +------------------+------------------+                                    |
+|                                         | Fallback / Offline                                    |
+|                                         v                                                       |
+|    +------------------------------------------------------------------------+                   |
+|    | AI Heuristic Behavioral Classifier (Hash Entropy & Semantic Mapping)   |                   |
+|    | - Detects keywords ('lockbit', 'mimikatz', 'c2', 'beacon', etc.)       |                   |
+|    | - Suppresses RFC 1918 private subnets & assigns 0 threat score         |                   |
+|    | - Generates Normalized Threat Score (0 - 100) and Verdict Label        |                   |
+|    +------------------------------------+-----------------------------------+                   |
++-----------------------------------------+-------------------------------------------------------+
+                                          | Enriched Artifacts
+                                          v
++-------------------------------------------------------------------------------------------------+
+| 3. AI EXECUTIVE SUMMARY & MITRE MAPPING (backend/routers/alerts.py)                             |
+|    - Maps raw event to MITRE ATT&CK Tactic (Impact, Initial Access, Lateral Movement)           |
+|    - Synthesizes incident narrative: "Automated analysis of WAZUH-RANSOM-100201..."             |
+|    - Issues action advice: "Immediate HOTL autonomous containment engaged."                    |
++-----------------------------------------+-------------------------------------------------------+
+                                          | Delivered To
+                                          v
++-------------------------------------------------------------------------------------------------+
+| 4. SOC ANALYST USER INTERFACE (frontend/src/app/alerts/page.tsx)                                |
+|    - "Executive Summary & AI Analysis" Card in Forensics Drawer                                 |
+|    - Interactive IoC Scorecards with VirusTotal breakdown badges                                |
++-------------------------------------------------------------------------------------------------+
+      </pre>
+    </div>
+
+    <!-- CHAPTER 3 -->
+    <h2 class="chapter-header">Chapter 3: HOTL vs HITL Autonomous Execution Matrix</h2>
+    <p>
+      A critical design challenge in security automation is balancing rapid response against accidental business disruption. 
+      Isolating a domain controller or database server on a low-fidelity scan causes severe operational outages. 
+      Phantom SOAR solves this with strict <strong>severity and threat-score bifurcation</strong> in <code>backend/engine/runner.py</code>:
+    </p>
+
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th style="width: 20%;">Dimension</th>
+          <th style="width: 40%;">HOTL (Human-On-The-Loop)</th>
+          <th style="width: 40%;">HITL (Human-In-The-Loop)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Trigger Threshold</strong></td>
+          <td>Alert Severity: <span class="badge badge-critical">Critical or High</span><br/>OR Max Threat Score <strong>&gt; 50</strong></td>
+          <td>Alert Severity: <span class="badge badge-medium">Medium or Low</span><br/>AND Max Threat Score <strong>&lt;= 50</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Execution Speed</strong></td>
+          <td><strong>Autonomous & Instantaneous</strong> (MTTR: 1.2s – 1.8s)</td>
+          <td><strong>Paused</strong> at analyst approval gate (Status: Triaged)</td>
+        </tr>
+        <tr>
+          <td><strong>Actions Executed</strong></td>
+          <td>
+            • EDR: Network host isolation<br/>
+            • EDR: Kill process tree by PID<br/>
+            • Firewall: Block attacking IP<br/>
+            • IAM: Revoke active user sessions<br/>
+            • ReportLab: Compile PDF Incident Dossier
+          </td>
+          <td>
+            • Telemetry parsed & enriched<br/>
+            • Awaits analyst review in UI<br/>
+            • Action buttons enabled: 'Approve Containment' vs 'Dismiss / Monitor'
+          </td>
+        </tr>
+        <tr>
+          <td><strong>Human Oversight</strong></td>
+          <td>Analyst is notified via ITSM (Jira / Slack) and monitors execution post-facto with complete auditability.</td>
+          <td>Analyst reviews AI triage brief, examines IoC threat scores, and retains full discretion to execute or suppress.</td>
+        </tr>
+        <tr>
+          <td><strong>Example Threat</strong></td>
+          <td>LockBit 3.0 Ransomware (vssadmin delete shadows, bulk file encryption)</td>
+          <td>Spearphishing email click or external port reconnaissance scan</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- CHAPTER 4 -->
+    <h2 class="chapter-header">Chapter 4: Comprehensive File-by-File Architectural Breakdown</h2>
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th style="width: 25%;">File Path</th>
+          <th style="width: 15%;">Subsystem</th>
+          <th style="width: 60%;">Architectural Purpose & Responsibility</th>
+        </tr>
+      </thead>
+      <tbody>
+        <!-- Root -->
+        <tr>
+          <td><code>docker-compose.yml</code></td>
+          <td>Deployment</td>
+          <td>Defines 5 container microservices (db, redis, backend, worker, frontend) with bridge networking and persistent volumes.</td>
+        </tr>
+        <tr>
+          <td><code>Dockerfile.backend</code></td>
+          <td>Deployment</td>
+          <td>Multi-stage container recipe for FastAPI and Celery workers, installing OS packages and ReportLab Cairo libraries.</td>
+        </tr>
+        <tr>
+          <td><code>Dockerfile.frontend</code></td>
+          <td>Deployment</td>
+          <td>Multi-stage production container for Next.js App Router, compiling TypeScript and minifying Tailwind CSS.</td>
+        </tr>
+        <tr>
+          <td><code>start_all.bat</code></td>
+          <td>Deployment</td>
+          <td>Windows local bootstrap script spawning the Uvicorn backend (:8000) and Next.js frontend (:3000) concurrently.</td>
+        </tr>
+
+        <!-- Backend Core -->
+        <tr>
+          <td><code>backend/main.py</code></td>
+          <td>Backend Core</td>
+          <td>FastAPI app entrypoint; configures CORS, initializes database schema, provisions admin accounts, and mounts PDF reports.</td>
+        </tr>
+        <tr>
+          <td><code>backend/config.py</code></td>
+          <td>Backend Core</td>
+          <td>Pydantic BaseSettings loading environment variables: database URLs, Redis brokers, API keys, and file paths.</td>
+        </tr>
+        <tr>
+          <td><code>backend/database.py</code></td>
+          <td>Backend Core</td>
+          <td>SQLAlchemy engine and scoped session maker; features automated fallback from PostgreSQL to local SQLite.</td>
+        </tr>
+        <tr>
+          <td><code>backend/models.py</code></td>
+          <td>Backend Core</td>
+          <td>Declarative ORM models: Alert, IocArtifact, Playbook, PlaybookExecution, ContainmentAction, IncidentReport, SystemLog, UserAccount, SystemConfig.</td>
+        </tr>
+        <tr>
+          <td><code>backend/schemas.py</code></td>
+          <td>Backend Core</td>
+          <td>Pydantic validation contracts ensuring strict typing across all inbound and outbound API JSON payloads.</td>
+        </tr>
+        <tr>
+          <td><code>backend/crud.py</code></td>
+          <td>Backend Core</td>
+          <td>Data access layer encapsulating database queries, alert filtering, user provisioning, and the get_ioc_artifacts_by_alert handler.</td>
+        </tr>
+        <tr>
+          <td><code>backend/celery_app.py</code></td>
+          <td>Backend Core</td>
+          <td>Configures the Celery distributed task queue over Redis for non-blocking asynchronous alert processing.</td>
+        </tr>
+
+        <!-- Engine -->
+        <tr>
+          <td><code>backend/engine/runner.py</code></td>
+          <td>IR Engine</td>
+          <td>Core decision engine. Evaluates severity and threat scores to execute HOTL autonomous containment or pause at HITL.</td>
+        </tr>
+        <tr>
+          <td><code>backend/engine/reporter.py</code></td>
+          <td>IR Engine</td>
+          <td>ReportLab Platypus PDF generator compiling SANS Incident Dossiers with MTTR benchmarks and forensic audit trails.</td>
+        </tr>
+        <tr>
+          <td><code>backend/engine/playbooks_catalog.py</code></td>
+          <td>IR Engine</td>
+          <td>Catalog of 12 standard MITRE ATT&CK / SANS playbooks (Ransomware, Brute Force, WebShell, Exfiltration, etc.).</td>
+        </tr>
+
+        <!-- Integrations -->
+        <tr>
+          <td><code>backend/integrations/edr.py</code></td>
+          <td>Connector Hub</td>
+          <td>EDR connector executing host network isolation, process termination (PID), and file quarantine.</td>
+        </tr>
+        <tr>
+          <td><code>backend/integrations/tip.py</code></td>
+          <td>Connector Hub</td>
+          <td>Threat Intelligence Platform combining VirusTotal v3, AbuseIPDB, and the AI heuristic behavioral classification engine.</td>
+        </tr>
+        <tr>
+          <td><code>backend/integrations/firewall.py</code></td>
+          <td>Connector Hub</td>
+          <td>Perimeter firewall connector dynamically blocking malicious external IPs and enforcing strict rate limits.</td>
+        </tr>
+        <tr>
+          <td><code>backend/integrations/iam.py</code></td>
+          <td>Connector Hub</td>
+          <td>Identity & Access connector handling emergency account locking and session revocation during credential compromise.</td>
+        </tr>
+        <tr>
+          <td><code>backend/integrations/itsm.py</code></td>
+          <td>Connector Hub</td>
+          <td>IT Service Management connector dispatching Jira incident tickets and real-time Slack/Discord alert webhooks.</td>
+        </tr>
+
+        <!-- Routers -->
+        <tr>
+          <td><code>backend/routers/webhooks.py</code></td>
+          <td>API Routers</td>
+          <td>Inbound telemetry endpoints: /wazuh (SIEM logs), /edr (Host process trees), and /xdr (Multi-layer correlated attacks).</td>
+        </tr>
+        <tr>
+          <td><code>backend/routers/alerts.py</code></td>
+          <td>API Routers</td>
+          <td>Alert endpoints: list/filter, detail view with AI summary, HITL manual sign-off, and executive PDF streaming.</td>
+        </tr>
+        <tr>
+          <td><code>backend/routers/playbooks.py</code></td>
+          <td>API Routers</td>
+          <td>Playbook management: CRUD operations, YAML code editing, and active state power switches (PATCH /toggle).</td>
+        </tr>
+        <tr>
+          <td><code>backend/routers/logs.py</code></td>
+          <td>API Routers</td>
+          <td>Unified security event stream API supporting connector-based (EDR, XDR, SIEM) and temporal second filtering.</td>
+        </tr>
+        <tr>
+          <td><code>backend/routers/auth.py</code></td>
+          <td>API Routers</td>
+          <td>JWT authentication router verifying credentials and enforcing mandatory first-login password rotation.</td>
+        </tr>
+        <tr>
+          <td><code>backend/routers/users.py</code></td>
+          <td>API Routers</td>
+          <td>RBAC user administration router for provisioning SOC analyst accounts, assigning roles, and managing credentials.</td>
+        </tr>
+        <tr>
+          <td><code>backend/routers/config.py</code></td>
+          <td>API Routers</td>
+          <td>Integration vault storing credentials for AI models, EDR, SIEM, and TIP, with live diagnostic reachability probes.</td>
+        </tr>
+        <tr>
+          <td><code>backend/routers/demo.py</code></td>
+          <td>API Routers</td>
+          <td>Presentation seeder injecting pre-configured test scenarios (Critical Ransomware, Phishing, etc.) for live demos.</td>
+        </tr>
+
+        <!-- Tests -->
+        <tr>
+          <td><code>backend/tests/test_api.py</code></td>
+          <td>Verification</td>
+          <td>FastAPI TestClient suite validating webhooks, authentication, approval routes, and telemetry log filtering.</td>
+        </tr>
+        <tr>
+          <td><code>backend/tests/test_integrations.py</code></td>
+          <td>Verification</td>
+          <td>Unit test suite verifying EDR isolation, TIP threat scoring, firewall IP blocking, and IAM calls.</td>
+        </tr>
+        <tr>
+          <td><code>backend/tests/test_runner.py</code></td>
+          <td>Verification</td>
+          <td>Validates orchestration runner routing: confirms HOTL fires on Critical alerts and HITL pauses on Medium/Low.</td>
+        </tr>
+
+        <!-- Frontend -->
+        <tr>
+          <td><code>frontend/src/app/page.tsx</code></td>
+          <td>Frontend UI</td>
+          <td>Primary SOC executive dashboard displaying real-time metrics, MITRE breakdown, and demo seeder.</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/app/alerts/page.tsx</code></td>
+          <td>Frontend UI</td>
+          <td>Alerts workspace featuring the Investigate Forensics Drawer, AI Analysis Card, and HITL action bar.</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/app/playbooks/page.tsx</code></td>
+          <td>Frontend UI</td>
+          <td>Playbook catalog and dual-mode Visual/YAML rule designer with active power switches.</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/app/logs/page.tsx</code></td>
+          <td>Frontend UI</td>
+          <td>Centralized telemetry stream with source pills (EDR, XDR, SIEM) and sliding second-based time filters.</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/app/configuration/page.tsx</code></td>
+          <td>Frontend UI</td>
+          <td>Integration vault interface with diagnostic 'Test Connection' buttons testing live API reachability.</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/app/accounts/page.tsx</code></td>
+          <td>Frontend UI</td>
+          <td>User management interface for creating Tier 1/2 analysts and managing credentials.</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/app/login/page.tsx</code></td>
+          <td>Frontend UI</td>
+          <td>Analyst authentication portal handling JWT tokens and forced password rotation flows.</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/components/Sidebar.tsx</code></td>
+          <td>Frontend UI</td>
+          <td>Dynamic client navigation component tracking active URL routes via usePathname() hook.</td>
+        </tr>
+        <tr>
+          <td><code>frontend/src/components/Navbar.tsx</code></td>
+          <td>Frontend UI</td>
+          <td>Global header bar showing user identity, active role badge, and session logout controls.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- CHAPTER 5 -->
+    <h2 class="chapter-header">Chapter 5: Docker Containerization & Service Orchestration</h2>
+    <div class="code-box">
+      <pre>
++-------------------------------------------------------------------------------------------------+
+|                                DOCKER COMPOSE TOPOLOGY & NETWORKS                               |
++-------------------------------------------------------------------------------------------------+
+|                                                                                                 |
+|   +--------------------------+                               +------------------------------+   |
+|   |   PostgreSQL Service     |                               |   Redis 7 Service            |   |
+|   |   Container: 'db'        |                               |   Container: 'redis'         |   |
+|   |   Port: 5432 (Internal)  |                               |   Port: 6379 (Internal)      |   |
+|   |   Vol: postgres_data     |                               |   Broker & Cache             |   |
+|   +-------------^------------+                               +--------------^---------------+   |
+|                 |                                                           |                   |
+|                 | DATABASE_URL                                              | CELERY_BROKER     |
+|                 |                                                           |                   |
+|   +-------------+----------------------------+               +--------------+---------------+   |
+|   |   FastAPI Backend Core                   |               |   Celery Background Worker   |   |
+|   |   Container: 'backend'                   |               |   Container: 'worker'        |   |
+|   |   Port: 8000:8000 (Host Access)          |               |   Async Tasks & Runner       |   |
+|   |   Depends On: db, redis                  |               |   Depends On: redis          |   |
+|   +-------------^----------------------------+               +------------------------------+   |
+|                 |                                                                               |
+|                 | REST API / CORS (http://localhost:8000)                                       |
+|                 |                                                                               |
+|   +-------------+----------------------------+                                                  |
+|   |   Next.js 14 Frontend                    |                                                  |
+|   |   Container: 'frontend'                  |                                                  |
+|   |   Port: 3000:3000 (Analyst Access)       |                                                  |
+|   |   Depends On: backend                    |                                                  |
+|   +------------------------------------------+                                                  |
+|                                                                                                 |
+|   SHARED VOLUMES: reports_data -> /app/backend/reports (persists PDF incident dossiers)         |
++-------------------------------------------------------------------------------------------------+
+      </pre>
+    </div>
+
+    <h3 class="section-header">Key Deployment & Architectural Safeguards:</h3>
+    <ul>
+      <li><strong>Zero State Loss:</strong> The <code>postgres_data</code> persistent volume guarantees that all ingested alerts, containment logs, custom playbooks, and user credentials survive container rebuilds.</li>
+      <li><strong>Report Document Persistence:</strong> The shared <code>reports_data</code> volume enables background Celery workers to generate PDF incident dossiers that the FastAPI backend can immediately stream to the analyst's browser.</li>
+      <li><strong>Dual Environment Flexibility:</strong> Phantom SOAR runs natively on bare-metal Windows using <code>start_all.bat</code> (with SQLite fallback) or in enterprise Linux clouds using <code>docker-compose up --build</code>.</li>
+    </ul>
+
+    <div style="text-align: center; margin-top: 50px; padding-top: 20px; border-top: 1px solid var(--border-card); font-size: 12px; color: var(--slate-muted);">
+      Balqa Applied University — Faculty of AI & Cybersecurity • Phantom SOAR Graduation Project Thesis
+    </div>
+  </div>
+</body>
+</html>
