@@ -18,6 +18,10 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     task_time_limit=300,
+    # process_alert is safe to re-run (already-processed alerts are skipped and finished
+    # steps are never repeated), so acknowledge only after the task completes.
+    task_acks_late=True,
+    worker_prefetch_multiplier=1,
     broker_connection_timeout=1.0,
     broker_connection_retry_on_startup=False,
     redis_socket_connect_timeout=1.0,
@@ -26,7 +30,7 @@ celery_app.conf.update(
 
 @celery_app.task(name="tasks.process_alert", bind=True, max_retries=2)
 def process_alert_task(self, alert_id: int):
-    """Celery background task for automated alert triage and playbook execution."""
+    """Route an ingested alert: autonomous (HOTL) playbook run or hand-off for analyst approval."""
     logger.info(f"[Celery] Processing Alert #{alert_id} in background worker.")
     from backend.engine.runner import process_alert
     try:

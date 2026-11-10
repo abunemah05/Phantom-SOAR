@@ -12,7 +12,7 @@ from backend.models import (
     ContainmentAction,
     IncidentReport,
 )
-from backend.schemas import AlertCreate, PlaybookCreate, PlaybookUpdate
+from backend.schemas import AlertCreate, PlaybookCreate
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
