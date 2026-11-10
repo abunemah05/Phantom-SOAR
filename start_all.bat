@@ -3,6 +3,7 @@ title Phantom SOAR - Platform Launcher
 cd /d "%~dp0"
 echo ========================================================
 echo   Launching Phantom SOAR Enterprise Platform
+echo   Settings: .env (optional, see .env.example)
 echo ========================================================
 echo [1/2] Launching Backend on http://localhost:8000 ...
 start "Phantom SOAR - Backend" cmd /k "run_backend.bat"
@@ -15,5 +16,7 @@ echo ========================================================
 echo   All systems launching in separate terminal windows!
 echo   Frontend Dashboard: http://localhost:3000
 echo   API Swagger Docs:   http://localhost:8000/docs
+echo   The backend window shows the webhook ingest token and,
+echo   on a fresh database, the generated admin password.
 echo ========================================================
 timeout /t 5
