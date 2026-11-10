@@ -365,6 +365,9 @@ def submit_analyst_decision(
     alert.resolved_by = analyst
     alert.resolved_at = now
     db.commit()
+    declined = runner.close_pending_actions(db, alert, by=analyst)
+    if declined:
+        message += f" {declined} action(s) awaiting approval were declined."
     db.refresh(alert)
     _log_analyst_action(db, alert, analyst, req.decision, alert.analyst_decision, req.notes or message)
 
@@ -422,11 +425,13 @@ def dismiss_alert(
     alert.resolved_by = current_user.username
     alert.resolved_at = datetime.now(timezone.utc)
     db.commit()
+    declined = runner.close_pending_actions(db, alert, by=current_user.username)
     db.refresh(alert)
     _log_analyst_action(db, alert, current_user.username, "dismiss", alert.analyst_decision, "Dismissed as False Positive")
     return {
         "status": "Success",
-        "message": f"Alert #{alert_id} dismissed and closed by analyst.",
+        "message": f"Alert #{alert_id} dismissed and closed by analyst."
+                   + (f" {declined} action(s) awaiting approval were declined." if declined else ""),
         "alert_id": alert_id,
         "current_status": alert.status,
         "resolved_by": current_user.username,

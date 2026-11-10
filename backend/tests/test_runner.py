@@ -14,6 +14,7 @@ from backend.engine.runner import (
     NoPlaybookError,
     approve_and_contain_alert,
     build_triage_summary,
+    close_pending_actions,
     evaluate_execution_mode,
     extract_mitre,
     match_playbook,
@@ -225,6 +226,24 @@ def test_private_ip_block_is_held_for_approval(db, settings):
     new_actions = approved["actions"]
     assert [(a["action_type"], a["target"]) for a in new_actions] == [("block_ip", "10.9.9.9")]
     assert {d["action"] for d in approved["already_done"]} == {"isolate_endpoint", "terminate_process", "revoke_user_sessions"}
+
+    db.expire_all()
+    resolved = db.get(ContainmentAction, held[0].action_id)
+    assert resolved.status == "Approved"
+    assert resolved.details["resolution"]["by"] == "lead"
+    assert resolved.details["resolution"]["executed_action_id"] == new_actions[0]["action_id"]
+
+
+def test_dismissing_declines_held_actions(db, settings):
+    alert = make_alert(db, ransomware_payload(srcip="10.9.9.9"), severity="Critical")
+    process_alert(alert.alert_id)
+    db.expire_all()
+    alert = db.get(type(alert), alert.alert_id)
+
+    assert close_pending_actions(db, alert, by="lead") == 1
+    statuses = {r.action_type: r.status for r in actions_for(db, alert.alert_id)}
+    assert statuses["block_ip"] == "Declined"
+    assert close_pending_actions(db, alert, by="lead") == 0
 
 
 def test_protected_host_is_blocked_for_the_playbook(db, settings):

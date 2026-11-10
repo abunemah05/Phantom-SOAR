@@ -239,7 +239,7 @@ def _never_block_reason(ip: IPAddress) -> Optional[str]:
 
 
 def _alert_host(alert: Any) -> Optional[str]:
-    raw = getattr(alert, "raw_payload", None) or {}
+    raw = (alert.get("raw_payload") if isinstance(alert, dict) else getattr(alert, "raw_payload", None)) or {}
     agent = _dict(raw.get("agent"))
     return agent.get("name") or agent.get("hostname")
 

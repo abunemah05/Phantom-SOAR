@@ -289,11 +289,12 @@ def run_playbook_steps(
 ) -> Dict[str, Any]:
     """Execute a playbook's steps for an alert. Steps already executed for the alert are not repeated."""
     entities = get_alert_entities(alert, iocs)
-    done = {
-        _record_key(ca.action_type, ca.target, alert)
-        for ca in (alert.containment_actions or [])
-        if ca.status in EXECUTED_STATUSES
-    }
+    existing = list(alert.containment_actions or [])
+    done = {_record_key(ca.action_type, ca.target, alert) for ca in existing if ca.status in EXECUTED_STATUSES}
+    held = {}
+    for ca in existing:
+        if ca.status == "Awaiting Approval":
+            held.setdefault(_record_key(ca.action_type, ca.target, alert), []).append(ca)
     records, notes, reused = [], [], []
     paused_at_gate = None
 
@@ -341,10 +342,34 @@ def run_playbook_steps(
             if not decision.allowed or (decision.requires_approval and not approved):
                 records.append(record_policy_block(db, alert, canonical or str(name), target, decision, executed_by, params))
                 continue
-            records.append(execute_action(db, alert, canonical, target, params, executed_by=executed_by))
-            done.add(_record_key(canonical, target, alert))
+            record = execute_action(db, alert, canonical, target, params, executed_by=executed_by)
+            records.append(record)
+            key = _record_key(canonical, target, alert)
+            done.add(key)
+            approved_holds = held.pop(key, [])
+            for pending in approved_holds:
+                _resolve_held(pending, "Approved", executed_by, record.action_id)
+            if approved_holds:
+                db.commit()
 
     return {"records": records, "notes": notes, "already_done": reused, "paused_at_gate": paused_at_gate}
+
+
+def _resolve_held(record: Any, status: str, by: str, action_id: Optional[int] = None) -> None:
+    details = dict(record.details or {})
+    details["resolution"] = {"status": status, "by": by, "at": utc_now().isoformat(), "executed_action_id": action_id}
+    record.status = status
+    record.details = details
+
+
+def close_pending_actions(db: Session, alert: Alert, by: str, status: str = "Declined") -> int:
+    """Mark actions still awaiting approval as declined (alert dismissed or kept under monitoring)."""
+    pending = [ca for ca in (alert.containment_actions or []) if ca.status == "Awaiting Approval"]
+    for record in pending:
+        _resolve_held(record, status, by)
+    if pending:
+        db.commit()
+    return len(pending)
 
 
 def _classify_run(run: Dict[str, Any], mode: str) -> Dict[str, Any]:
