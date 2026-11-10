@@ -1,0 +1,4 @@
+# Development and CI dependencies: runtime deps plus the test toolchain.
+-r requirements.txt
+pytest>=8.1.1,<10
+pytest-asyncio>=0.23.6,<2
