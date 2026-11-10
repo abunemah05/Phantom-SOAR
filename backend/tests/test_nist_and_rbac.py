@@ -162,6 +162,56 @@ def test_unrecognised_role_has_no_privileges(client, admin_headers):
     assert client.get("/api/alerts", headers=headers).status_code == 200
 
 
+def test_report_metrics_come_from_stored_rows(client, admin_headers):
+    """Isolated date range: every number in the report must be derivable from these rows."""
+    from datetime import datetime
+    from backend.database import SessionLocal
+    from backend.models import Alert, AnalystActionLog, ContainmentAction, PlaybookExecution
+
+    when = datetime(2020, 1, 1, 12, 0, 0)
+    db = SessionLocal()
+    try:
+        alert = Alert(rule_id="REPORT-FIXTURE", source="Wazuh", severity="High", status="Contained",
+                      assigned_analyst="report_fixture_analyst", resolved_by="report_fixture_analyst",
+                      resolved_at=when, created_at=when, raw_payload={})
+        db.add(alert)
+        db.flush()
+        db.add_all([
+            PlaybookExecution(alert_id=alert.alert_id, status="Completed", mttr_seconds=4.0, executed_at=when),
+            PlaybookExecution(alert_id=alert.alert_id, status="Pending Analyst Approval", mttr_seconds=0.0, executed_at=when),
+            ContainmentAction(alert_id=alert.alert_id, action_type="block_ip", status="Simulated", execution_mode="simulated",
+                              executed_by="report_fixture_analyst", timestamp=when),
+            ContainmentAction(alert_id=alert.alert_id, action_type="create_ticket", status="Skipped", execution_mode="skipped",
+                              executed_by="System", timestamp=when),
+            AnalystActionLog(alert_id=alert.alert_id, analyst_username="report_fixture_analyst", action_type="take_action",
+                             decision="Escalated & Contained", timestamp=when),
+        ])
+        db.commit()
+        alert_id = alert.alert_id
+    finally:
+        db.close()
+
+    query = "period=custom&start_date=2020-01-01&end_date=2020-01-01"
+    report = client.get(f"/api/reports/analyst-activity?{query}", headers=admin_headers).json()
+    assert report["total_cases_reviewed"] == 1
+    assert report["total_containment_actions"] == 2
+    assert report["containment_by_mode"] == {"simulated": 1, "skipped": 1}
+    assert report["average_mttr_seconds"] == 4.0  # the pending execution has no MTTR and is not averaged in
+    assert report["mttr_sample_size"] == 1
+    row = next(a for a in report["analyst_breakdown"] if a["analyst_username"] == "report_fixture_analyst")
+    assert (row["cases_assigned"], row["cases_resolved"], row["escalated_count"], row["containment_actions_taken"]) == (1, 1, 1, 1)
+
+    pdf = client.get(f"/api/reports/analyst-activity/pdf?{query}", headers=admin_headers)
+    assert pdf.status_code == 200 and pdf.content.startswith(b"%PDF")
+
+    db = SessionLocal()
+    try:
+        db.delete(db.get(Alert, alert_id))
+        db.commit()
+    finally:
+        db.close()
+
+
 def test_multi_tip_aggregation_and_sources(client, admin_headers):
     from backend.integrations.tip import tip_client
 

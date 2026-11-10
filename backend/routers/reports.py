@@ -131,7 +131,14 @@ def get_analyst_activity_report(
         by_mode[mode] = by_mode.get(mode, 0) + 1
 
     user_roles = {u.username: u.role for u in db.query(User).all() if not u.is_service_account}
-    target_analysts = [analyst_filter] if analyst_filter else sorted(user_roles.keys())
+    if analyst_filter:
+        target_analysts = [analyst_filter]
+    else:
+        # Include people who acted in the period even if their account was deleted since.
+        seen = set(user_roles)
+        seen.update(name for a in matched_alerts for name in (a.assigned_analyst, a.resolved_by) if name)
+        seen.update(entry.analyst_username for entry in action_logs if entry.analyst_username)
+        target_analysts = sorted(seen)
 
     analyst_summaries = []
     for uname in target_analysts:
