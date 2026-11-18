@@ -166,6 +166,9 @@ def seed_demo_data(db: Session = Depends(get_db), current_user: User = Depends(r
             "severity": alert.severity,
             "status": alert.status,
             "processing": result.processing,
+            # True when a Celery worker is enriching/processing the alert in the background; the
+            # verdicts and status below then show the state at ingestion and update shortly after.
+            "enrichment_pending": result.enrichment_pending,
             "ioc_verdicts": {a["value"]: a["verdict"] for a in result.artifacts},
             "max_threat_score": max((a["threat_score"] for a in result.artifacts), default=0),
         })
@@ -176,6 +179,8 @@ def seed_demo_data(db: Session = Depends(get_db), current_user: User = Depends(r
             f"Playbook catalogue ready ({playbook_count} playbooks); ran {len(seeded)} lab alerts through the "
             "real ingestion pipeline. Threat-intel results are simulation-mode lab fixtures; connector "
             "actions are simulated unless the connector is configured."
+            + (" Enrichment and playbook runs continue in the background worker; refresh the alert list shortly."
+               if any(s["enrichment_pending"] for s in seeded) else "")
         ),
         "simulation_mode": True,
         "seeded_playbooks_count": playbook_count,
