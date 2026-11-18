@@ -102,7 +102,7 @@ def elapsed_seconds_since(created_at: Optional[datetime]) -> float:
 
 def is_hotl_globally_enabled(db: Optional[Session] = None) -> bool:
     """Global HOTL kill switch (ORCHESTRATION.hotl_enabled; default OFF)."""
-    return integration_config.get_bool("hotl_enabled", db=db)
+    return integration_config.hotl_effective(db)
 
 
 # --- Playbook matching --------------------------------------------------------
@@ -315,7 +315,8 @@ def playbook_steps(playbook: Optional[Playbook]) -> List[Dict[str, Any]]:
     return sorted((s for s in steps if isinstance(s, dict)), key=order)
 
 
-def _step_targets(action: Optional[str], alert: Alert, iocs: List[Any], entities: Dict[str, List[str]]) -> List[Optional[str]]:
+def _step_targets(action: Optional[str], alert: Alert, iocs: List[Any], entities: Dict[str, List[str]],
+                  approved: bool = False) -> List[Optional[str]]:
     if action is None:
         return [None]
     target_type = ACTION_CATALOG[action]["target_type"]
@@ -325,8 +326,12 @@ def _step_targets(action: Optional[str], alert: Alert, iocs: List[Any], entities
     if target_type == "ip":
         # Never aim IP containment at the monitored host itself or at IPs threat intel calls clean.
         own_ip = alert_agent(alert).get("ip")
+        # An automated block must rest on evidence: only IPs that threat intel calls Malicious are targeted. Other
+        # IPs in the payload (attacker-influenced log text can contain anyone's address) are never blocked here.
+        # An analyst-approved run has been reviewed by a human, so it keeps every non-clean IP.
         clean = {str(i.value) for i in iocs if (i.artifact_type or "").upper() == "IP" and i.verdict == "Clean"}
-        values = [v for v in values if v != own_ip and v not in clean]
+        malicious = {str(i.value) for i in iocs if (i.artifact_type or "").upper() == "IP" and i.verdict == "Malicious"}
+        values = [v for v in values if v != own_ip and v not in clean and (approved or v in malicious)]
     return values[:MAX_TARGETS_PER_STEP]
 
 
@@ -383,7 +388,7 @@ def run_playbook_steps(
                 notes.append(f"Step {index}: ignored unsupported params {ignored} for {canonical}.")
             params = {k: v for k, v in params.items() if k in allowed_params}
 
-        targets = _step_targets(canonical, alert, iocs, entities)
+        targets = _step_targets(canonical, alert, iocs, entities, approved=approved)
         if not targets:
             target_type = ACTION_CATALOG[canonical]["target_type"]
             records.append(create_containment_action(

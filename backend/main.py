@@ -42,23 +42,35 @@ logger = logging.getLogger("phantom_soar")
 _TRUE = {"1", "true", "yes", "on"}
 
 def init_system_defaults():
+    """Seed the administrator, the settings rows and the playbooks. Steps are independent: one failing never
+    skips the others, and failing to create the administrator is fatal (nobody could sign in)."""
     db = SessionLocal()
     try:
-        # 1. Bootstrap administrator (password from PHANTOM_BOOTSTRAP_ADMIN_PASSWORD)
-        ensure_default_user(db)
+        # 1. Bootstrap administrator (password from PHANTOM_BOOTSTRAP_ADMIN_PASSWORD, else a generated one-time file)
+        try:
+            ensure_default_user(db)
+        except Exception:
+            db.rollback()
+            logger.exception("Could not create the bootstrap administrator")
+            raise
 
         # 2. Integration settings rows (exactly the keys in integration_config.INTEGRATION_KEYS)
-        ensure_default_configurations(db)
+        try:
+            ensure_default_configurations(db)
+        except Exception:
+            db.rollback()
+            logger.exception("Could not seed the integration settings")
 
-        # 3. Ensure 12 pre-configured SANS / MITRE IR Playbooks
-        count = db.query(Playbook).count()
-        if count == 0:
-            logger.info("Initializing 12 pre-configured SANS / MITRE IR Playbooks...")
-            for pb in PRECONFIGURED_PLAYBOOKS:
-                create_playbook(db, pb)
-            logger.info("Playbooks initialized.")
-    except Exception as e:
-        logger.warning(f"Error during system bootstrap: {e}")
+        # 3. Pre-configured SANS / MITRE IR playbooks
+        try:
+            if db.query(Playbook).count() == 0:
+                logger.info(f"Initializing {len(PRECONFIGURED_PLAYBOOKS)} pre-configured SANS / MITRE IR playbooks...")
+                for pb in PRECONFIGURED_PLAYBOOKS:
+                    create_playbook(db, pb)
+                logger.info("Playbooks initialized.")
+        except Exception:
+            db.rollback()
+            logger.exception("Could not seed the playbooks")
     finally:
         db.close()
 

@@ -118,11 +118,14 @@ def _now() -> datetime:
 
 
 def _seed_value(key: str) -> str:
-    """Initial stored value: an explicit environment value for non-secret keys, else the default."""
-    if key not in DEFAULTS:
-        return ""
-    env_value = os.getenv(INTEGRATION_KEYS[key][1], "").strip()
-    return env_value or DEFAULTS[key]
+    """Initial stored value: always empty.
+
+    The database holds only what an administrator saved in the console. Environment variables and the built-in
+    defaults are resolved at read time (integration_config.get_setting: database, then environment, then default),
+    so changing an environment variable and restarting always takes effect. Freezing them into the database on
+    first boot made later environment changes silently ignored.
+    """
+    return ""
 
 
 def ensure_default_configurations(db: Session) -> None:

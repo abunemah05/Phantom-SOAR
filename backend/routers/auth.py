@@ -104,7 +104,8 @@ def _write_bootstrap_password(username: str, password: str) -> Path:
     path = _bootstrap_password_path()
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, "fchmod"):  # not available on Windows before Python 3.13; the 0600 open mode is best effort there
+            os.fchmod(fd, 0o600)
         os.write(fd, f"username: {username}\npassword: {password}\n".encode("utf-8"))
     finally:
         os.close(fd)

@@ -476,7 +476,7 @@ def ai_status(db: Session) -> Dict[str, Any]:
         "autonomy": integration_config.get_setting("agent_autonomy", db=db),
         "min_confidence": min_confidence,
         "simulation_mode": integration_config.is_simulation_mode(db),
-        "hotl_enabled": integration_config.get_bool("hotl_enabled", db=db),
+        "hotl_enabled": integration_config.hotl_effective(db),
         "send_raw_payload": integration_config.get_bool("ai_send_raw_payload", db=db),
         "max_alerts_per_minute": max_calls_per_minute(db),
         "pending_proposals": db.query(AgentProposal).filter(AgentProposal.status == "pending_approval").count(),

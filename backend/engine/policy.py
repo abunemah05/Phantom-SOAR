@@ -226,10 +226,26 @@ def _name_variants(value: str) -> List[str]:
     return [v for v in variants if v]
 
 
+_GLOB_CHARS = ("*", "?", "[")
+
+
 def _matches_pattern(value: str, patterns: List[str]) -> bool:
-    """Case-insensitive glob match of a host or user name (also by short name) against the entries."""
-    cleaned = [p.strip().lower() for p in patterns if p and p.strip()]
-    return any(fnmatch.fnmatchcase(v, p) for v in _name_variants(value) for p in cleaned)
+    """Case-insensitive match of a host or user name against the protected entries, by short name in BOTH directions.
+
+    An entry 'dc01.corp.local' protects 'dc01' (what Wazuh reports as agent.name) and 'CORP\\svc-backup' protects
+    'svc-backup'; a target 'dc01.corp.local' is protected by an entry 'dc01'. Entries that contain wildcards are
+    used exactly as written (splitting '*.corp.local' would produce a bare '*'). Over-matching is the safe error
+    here: it can only protect more, never less.
+    """
+    variants = _name_variants(value)
+    for pattern in patterns:
+        cleaned = (pattern or "").strip().lower()
+        if not cleaned:
+            continue
+        forms = [cleaned] if any(ch in cleaned for ch in _GLOB_CHARS) else _name_variants(cleaned)
+        if any(fnmatch.fnmatchcase(v, f) for v in variants for f in forms):
+            return True
+    return False
 
 
 def _ip_in_list(ip: IPAddress, entries: List[str]) -> bool:
@@ -305,6 +321,16 @@ def evaluate_action(
     param_errors = validate_params(canonical, params)
     if param_errors:
         return PolicyDecision(False, False, param_errors)
+
+    # Automated actors may only act through the Wazuh agent the alert came from. An `agent_id` naming any other
+    # agent would aim the action (and bypass the protected-host check, which looks at the alert's own host) at a
+    # machine nobody reviewed. Analysts can still name another agent on purpose.
+    if automated:
+        supplied_agent = str((params or {}).get("agent_id") or "").strip()
+        if supplied_agent and supplied_agent != (alert_agent_id(alert) or ""):
+            return PolicyDecision(False, False, [
+                f"Denied: agent_id '{supplied_agent}' is not the agent that raised alert "
+                f"#{getattr(alert, 'alert_id', '?')}; automation may only act through the alert's own agent."])
 
     target = str(target).strip() if target is not None else None
     if target_type != "none" and not target:
@@ -385,7 +411,7 @@ def evaluate_action(
             else:
                 reasons.append(f"Note: {target} is an internal (private-range) address.")
 
-    if automated and not integration_config.get_bool("hotl_enabled", db=db):
+    if automated and not integration_config.hotl_effective(db):
         requires_approval = True
         reasons.append("Autonomous response (HOTL) is disabled; automated actions need analyst approval.")
 

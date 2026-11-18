@@ -87,7 +87,8 @@ def ai_cfg(monkeypatch):
     overrides: Dict[str, str] = {
         "ai_enabled": "true", "openrouter_api_key": FAKE_KEY, "openrouter_model": llm.DEFAULT_MODEL,
         "ai_max_alerts_per_minute": "600", "ai_send_raw_payload": "false", "ai_auto_triage": "false",
-        "hotl_enabled": "false", "simulation_mode": "true", "protected_hosts": "", "protected_users": "",
+        "hotl_enabled": "false", "simulation_mode": "true", "protected_hosts": "unrelated-protected-host.example",
+        "protected_users": "unrelated-breakglass-user",
         "protected_ips": "", "agent_autonomy": "recommend_only", "agent_min_confidence": "0.85",
     }
     original = integration_config.get_setting

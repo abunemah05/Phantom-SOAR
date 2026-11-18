@@ -54,8 +54,8 @@ def ransomware_payload(srcip="198.51.100.45"):
 
 @pytest.fixture
 def settings(monkeypatch):
-    overrides = {"hotl_enabled": "true", "simulation_mode": "true", "protected_hosts": "",
-                 "protected_users": "", "protected_ips": ""}
+    overrides = {"hotl_enabled": "true", "simulation_mode": "true", "protected_hosts": "unrelated-protected-host.example",
+                 "protected_users": "unrelated-breakglass-user", "protected_ips": ""}
     original = integration_config.get_setting
 
     def fake_get_setting(key_name, db=None, default=None):

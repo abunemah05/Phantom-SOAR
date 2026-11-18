@@ -46,7 +46,11 @@ def cfg(monkeypatch):
     def fake(key_name, db=None, default=None):
         if key_name in values:
             return values[key_name]
-        if key_name in ("protected_hosts", "protected_users", "protected_ips", "siem_manager_url"):
+        if key_name == "protected_hosts":
+            return "unrelated-protected-host.example"  # HOTL may only run with protected assets listed
+        if key_name == "protected_users":
+            return "unrelated-breakglass-user"
+        if key_name in ("protected_ips", "siem_manager_url"):
             return ""
         return original(key_name, db=db, default=default)
 

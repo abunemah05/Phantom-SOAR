@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from backend import integration_config
 from backend.crud import create_containment_action
 from backend.integrations import connector_base
 from backend.integrations.edr import edr_client
@@ -341,7 +342,23 @@ def _default_ticket_text(alert: Alert) -> Dict[str, str]:
     return {"summary": f"[Phantom SOAR #{alert.alert_id}] {title}", "description": "\n".join(lines)}
 
 
+_SIMULATION_PROVIDER = {"edr": "Wazuh EDR", "firewall": "Wazuh firewall", "iam": "Okta", "itsm": "Jira / Slack"}
+
+
 def _dispatch(alert: Alert, action: str, target: Optional[str], params: Dict[str, Any]) -> Dict[str, Any]:
+    # Simulation mode is a hard stop for every response action: nothing is sent to any real system, even when
+    # credentials are saved. (Read-only threat-intel lookups are unaffected.) Turn simulation_mode OFF to act for real.
+    if integration_config.is_simulation_mode():
+        connector = (ACTION_CATALOG.get(action) or {}).get("connector", "")
+        provider = _SIMULATION_PROVIDER.get(connector, connector or "connector")
+        return connector_base.make_result(
+            action, target, provider, "simulated",
+            {
+                "simulated": True,
+                "message": f"SIMULATED: simulation mode is ON, so {provider} was not contacted and nothing was changed. "
+                           "Turn simulation_mode off in Configuration to run actions for real.",
+            },
+        )
     context = _alert_context(alert)
     agent_id = _agent_id_for(alert, action, target, params)
 

@@ -232,9 +232,10 @@ def configured_real_connectors(db: Optional[Session] = None) -> List[str]:
 def production_safety_errors(db: Optional[Session] = None) -> List[str]:
     """Reasons this deployment must not start as configured. Empty list means no problem found.
 
-    In production, simulation mode on while any real connector is configured is a
-    contradictory setup: runs would be labelled simulated (or accept lab-fixture
-    threat intel) next to live credentials. It is refused unless the operator sets
+    In production, simulation mode on while any real connector or threat-intel key is configured is a
+    contradictory setup: response actions are only rehearsed and lab-fixture threat intel is accepted next to
+    live credentials. Fix it with PHANTOM_SIMULATION_MODE=false (or the console), or confirm it is intended with
+    PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION=true; environment changes take effect on the next start. It is refused unless the operator sets
     simulation_confirmed_in_production=true to say it is intended.
     """
     if not is_production():
@@ -423,3 +424,19 @@ def hotl_enable_blockers(db: Optional[Session] = None) -> List[str]:
     for key in ("protected_hosts", "protected_users", "protected_ips"):
         blockers.extend(f"{key}: {e}" for e in validate_protected_list(key, get_setting(key, db=db)))
     return blockers
+
+
+def hotl_effective(db: Optional[Session] = None) -> bool:
+    """Autonomous response (HOTL) as it is actually applied: switched on AND allowed to be on.
+
+    The switch can be set from the environment (PHANTOM_HOTL_ENABLED) without going through the console's
+    checks, so the protected-asset requirements are enforced here, at run time, for every reader: HOTL with
+    no protected hosts/IPs/users listed never runs, whatever the switch says.
+    """
+    if not get_bool("hotl_enabled", db=db):
+        return False
+    blockers = hotl_enable_blockers(db)
+    if blockers:
+        logger.warning("HOTL is switched on but ignored until these are fixed: %s", "; ".join(blockers))
+        return False
+    return True
