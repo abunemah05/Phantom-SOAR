@@ -21,8 +21,11 @@ Settings are read at call time through integration_config so values saved on
 the Configuration page take effect immediately.
 """
 import logging
+import random
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import httpx
 
@@ -47,8 +50,11 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def http_client(verify: bool = True) -> httpx.Client:
-    """Factory for outbound HTTP clients (tests replace it with a MockTransport client)."""
+def http_client(verify: Union[bool, str] = True) -> httpx.Client:
+    """Factory for outbound HTTP clients (tests replace it with a MockTransport client).
+
+    ``verify`` is True, False, or the path of a CA bundle file (httpx accepts a path string).
+    """
     return httpx.Client(timeout=HTTP_TIMEOUT, verify=verify)
 
 
@@ -163,3 +169,122 @@ def _host_of(exc: httpx.HTTPError) -> str:
         return exc.request.url.host
     except Exception:
         return "the remote service"
+
+
+# --- Retries -----------------------------------------------------------------------
+
+# Module-level so tests can patch them: ``monkeypatch.setattr(connector_base, "sleep", ...)``.
+sleep = time.sleep
+jitter = random.random  # returns a float in [0, 1)
+
+RETRY_BASE_DELAY = 0.5
+RETRY_MAX_DELAY = 8.0
+RETRY_AFTER_CAP = 30.0  # never honour a Retry-After longer than this (seconds)
+RETRY_STATUSES = frozenset({429, 502, 503, 504})
+RETRY_AFTER_STATUSES = frozenset({429, 503})  # the only ones a non-idempotent request may retry
+
+# Failures that happen before the server can have processed the request.
+_PRE_REQUEST_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
+def parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Seconds to wait from a Retry-After header (delta-seconds or HTTP-date), capped; None if absent/invalid."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            seconds = (when - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            return None
+    return min(max(seconds, 0.0), RETRY_AFTER_CAP)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with jitter: base * 2^(attempt-1), plus up to 100% jitter, capped."""
+    base = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+    return min(base + jitter() * base, RETRY_MAX_DELAY)
+
+
+def attempts_of(obj: Any) -> int:
+    """How many attempts request_with_retry made for a response or for the exception it raised."""
+    if isinstance(obj, httpx.Response):
+        return int(obj.extensions.get("phantom_attempts", 1))
+    return int(getattr(obj, "phantom_attempts", 1))
+
+
+def request_with_retry(
+    client: httpx.Client,
+    method: str,
+    url: str,
+    *,
+    idempotent: bool = True,
+    max_attempts: int = 3,
+    **kwargs: Any,
+) -> httpx.Response:
+    """client.request() with bounded retries and exponential backoff plus jitter.
+
+    Retried: connect errors, timeouts and HTTP 502/503/504/429 (Retry-After is honoured, capped at
+    RETRY_AFTER_CAP seconds). For ``idempotent=False`` requests (which could act twice if the
+    first attempt was in fact processed) only failures that happen before the server can have
+    processed the request are retried: connect errors and 429/503 that carry Retry-After. A read
+    timeout is never retried for them.
+
+    Returns the last response (callers still call raise_for_status()); if every attempt raised, the
+    last exception is re-raised. The number of attempts is available from ``attempts_of()``:
+    ``response.extensions["phantom_attempts"]`` or ``exc.phantom_attempts``.
+    """
+    max_attempts = max(1, int(max_attempts))
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            response = client.request(method, url, **kwargs)
+        except httpx.HTTPError as exc:
+            exc.phantom_attempts = attempt  # type: ignore[attr-defined]
+            if attempt >= max_attempts or not _error_is_retryable(exc, idempotent):
+                raise
+            delay = _backoff_delay(attempt)
+            logger.info(f"[retry] {method} {_safe_host(url)} failed ({exc.__class__.__name__}); "
+                        f"attempt {attempt}/{max_attempts}, retrying in {delay:.2f}s")
+            sleep(delay)
+            continue
+
+        response.extensions["phantom_attempts"] = attempt
+        retry_after = parse_retry_after(response.headers.get("Retry-After"))
+        if attempt >= max_attempts or not _status_is_retryable(response.status_code, retry_after, idempotent):
+            return response
+        delay = retry_after if retry_after is not None else _backoff_delay(attempt)
+        logger.info(f"[retry] {method} {_safe_host(url)} got HTTP {response.status_code}; "
+                    f"attempt {attempt}/{max_attempts}, retrying in {delay:.2f}s")
+        response.close()
+        sleep(delay)
+
+
+def _error_is_retryable(exc: Exception, idempotent: bool) -> bool:
+    if isinstance(exc, _PRE_REQUEST_ERRORS):
+        return True
+    if not idempotent:
+        return False
+    # Idempotent requests may also retry after a read timeout or a dropped connection.
+    return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+
+
+def _status_is_retryable(status: int, retry_after: Optional[float], idempotent: bool) -> bool:
+    if status not in RETRY_STATUSES:
+        return False
+    if idempotent:
+        return True
+    return status in RETRY_AFTER_STATUSES and retry_after is not None
+
+
+def _safe_host(url: str) -> str:
+    try:
+        return httpx.URL(url).host
+    except Exception:
+        return "remote"

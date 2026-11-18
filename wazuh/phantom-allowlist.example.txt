@@ -1,0 +1,8 @@
+# Phantom SOAR allow-list. Copy to:
+#   Linux:   /var/ossec/etc/phantom-allowlist.txt
+#   Windows: C:\Program Files (x86)\ossec-agent\phantom-allowlist.txt
+# One IP or CIDR per line. The scripts will NEVER block or rate-limit these, and isolation keeps them reachable.
+# The Wazuh manager (from ossec.conf), loopback, link-local, multicast and the host's own addresses are always protected.
+# Add: your admin jump host / VPN range, DNS servers, domain controllers, gateways, monitoring, this SOAR server.
+# 192.0.2.10        admin jump host
+# 198.51.100.0/28   VPN range

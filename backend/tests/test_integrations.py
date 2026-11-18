@@ -129,7 +129,7 @@ def test_wazuh_isolate_authenticates_then_sends_active_response(settings, http):
     assert auth_call.url.path == "/security/user/authenticate"
     assert ar_call.url.params["agents_list"] == "004"
     body = json.loads(ar_call.content)
-    assert body["command"] == "phantom-isolate-host"
+    assert body["command"] == "!phantom-isolate-host"
     assert body["arguments"] == []
     assert body["alert"]["data"]["hostname"] == "srv-prod-db01"
     assert body["alert"]["data"]["phantom_alert_id"] == 7
@@ -143,7 +143,8 @@ def test_wazuh_block_ip_uses_firewall_drop(settings, http):
 
     assert result["status"] == "Success"
     body = json.loads(calls[1].content)
-    assert body["command"] == "firewall-drop"
+    assert body["command"] == "!phantom-block-ip"
+    assert body["arguments"] == ["198.51.100.45", "48", "inbound"]
     assert body["alert"]["data"]["srcip"] == "198.51.100.45"
     assert calls[1].url.params["agents_list"] == "010"
     assert result["details"]["requested"]["duration_hours"] == 48
@@ -155,7 +156,7 @@ def test_wazuh_terminate_process_passes_process_arguments(settings, http):
     result = edr_client.terminate_process("lockbit3_encryptor.exe", agent_id="004", pid=4242)
     assert result["status"] == "Success"
     body = json.loads(calls[1].content)
-    assert body["command"] == "phantom-kill-process"
+    assert body["command"] == "!phantom-kill-process"
     assert body["arguments"] == ["lockbit3_encryptor.exe", "4242"]
 
 
@@ -250,6 +251,8 @@ def test_jira_ticket_uses_the_key_jira_returns(settings, http):
     settings.update(JIRA)
 
     def handler(request):
+        if request.method == "GET":  # existing-issue (idempotency) check finds nothing
+            return httpx.Response(200, json={"issues": []})
         assert request.url.path == "/rest/api/2/issue"
         assert request.headers["authorization"] == _basic("soar@corp.test", "jira-token")
         fields = json.loads(request.content)["fields"]
@@ -270,6 +273,8 @@ def test_jira_retries_without_rejected_priority(settings, http):
     bodies = []
 
     def handler(request):
+        if request.method == "GET":  # existing-issue (idempotency) check finds nothing
+            return httpx.Response(200, json={"issues": []})
         fields = json.loads(request.content)["fields"]
         bodies.append(fields)
         if "priority" in fields:
