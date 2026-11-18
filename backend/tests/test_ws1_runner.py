@@ -1,5 +1,6 @@
 """WS1: simulation never counts as containment, idempotent claiming, evidence and playbook matching."""
 import threading
+import traceback
 from datetime import timedelta
 
 import pytest
@@ -206,7 +207,7 @@ def test_concurrent_process_alert_threads_execute_each_action_once(db, cfg, live
         try:
             results.append(process_alert(alert.alert_id))
         except Exception as exc:  # pragma: no cover - reported below
-            errors.append(exc)
+            errors.append(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
 
     threads = [threading.Thread(target=worker) for _ in range(6)]
     for t in threads:
