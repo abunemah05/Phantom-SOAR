@@ -70,7 +70,7 @@ ACTION_CATALOG: Dict[str, Dict[str, Any]] = {
         "target_type": "ip",
         "impact": "medium",
         "reversible": True,
-        "description": "Drop traffic from an IP with the Wazuh firewall-drop active response.",
+        "description": "Block an IP on the endpoint(s) with the Wazuh phantom-block-ip active response (temporary, default duration set by wazuh_default_block_hours).",
         "params": {
             "agent_id": _AGENT_ID_PARAM,
             "duration_hours": {"type": "integer", "minimum": 1, "maximum": 720},
@@ -94,6 +94,7 @@ ACTION_CATALOG: Dict[str, Dict[str, Any]] = {
         "params": {
             "agent_id": _AGENT_ID_PARAM,
             "rate": {"type": "string", "description": "e.g. '10/minute' or '5/second'"},
+            "duration_hours": {"type": "integer", "minimum": 1, "maximum": 720},
         },
     },
     "disable_account": {
@@ -361,7 +362,8 @@ def _dispatch(alert: Alert, action: str, target: Optional[str], params: Dict[str
         return firewall_client.unblock_ip(target, agent_id=agent_id, alert_context=context)
     if action == "apply_rate_limit":
         return firewall_client.apply_rate_limit(
-            target, rate=params.get("rate") or "10/minute", agent_id=agent_id, alert_context=context
+            target, rate=params.get("rate") or "10/minute", agent_id=agent_id, alert_context=context,
+            duration_hours=params.get("duration_hours"),
         )
     if action == "disable_account":
         return iam_client.disable_account(target, reason=params.get("reason"))

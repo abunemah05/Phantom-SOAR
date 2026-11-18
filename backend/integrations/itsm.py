@@ -71,12 +71,14 @@ class ITSMConnector:
     slack_provider = "Slack"
 
     def _request(self, client: httpx.Client, method: str, url: str, *, idempotent: bool = True, **kwargs) -> httpx.Response:
-        """The single place every Jira/Slack HTTP call goes through (swap point for request_with_retry).
+        """The single place every Jira/Slack HTTP call goes through with bounded retries (connector_base.request_with_retry).
 
         ``idempotent=False`` marks calls that must never be auto-retried on timeouts or 5xx
         (Jira issue creation); the label check in create_ticket is the second line of defence.
         """
-        return client.request(method, url, **kwargs)
+        return base.request_with_retry(
+            client, method, url, idempotent=idempotent, retry_statuses=base.RETRY_STATUSES - {429}, **kwargs
+        )
 
     def _call(self, client: httpx.Client, method: str, url: str, **kwargs) -> httpx.Response:
         return throttle.send_honouring_429(lambda: self._request(client, method, url, **kwargs))

@@ -33,6 +33,7 @@ from backend.integration_config import (
     INTEGRATION_KEYS,
     get_bool,
     get_setting,
+    hotl_enable_blockers,
     is_configured,
     is_simulation_mode,
 )
@@ -80,6 +81,24 @@ KNOWN_DUMMY_VALUES = {
 
 BOOL_KEYS = {"hotl_enabled", "simulation_mode", "siem_verify_tls", "require_mfa_for_admin"}
 URL_KEYS = {"siem_manager_url", "jira_base_url", "jira_webhook_url", "slack_webhook_url"}
+# key -> (minimum, maximum, integer?). Out-of-range values are rejected instead of silently ignored.
+NUMERIC_KEYS: Dict[str, Tuple[float, float, bool]] = {
+    "vt_requests_per_minute": (0, 100000, True),
+    "vt_requests_per_day": (0, 10_000_000, True),
+    "abuseipdb_daily_limit": (0, 10_000_000, True),
+    "nvd_requests_per_30s": (1, 100000, True),
+    "tip_max_wait_seconds": (0, 600, False),
+    "vt_malicious_weight": (0, 10, False),
+    "vt_suspicious_weight": (0, 10, False),
+    "vt_malicious_threshold": (0.001, 1, False),
+    "vt_min_detections": (0, 1000, False),
+    "tip_malicious_threshold": (1, 100, True),
+    "tip_suspicious_threshold": (1, 100, True),
+    "tip_critical_threshold": (1, 100, True),
+    "wazuh_default_block_hours": (0, 720, True),
+    "wazuh_default_rate_limit_hours": (0, 720, True),
+}
+JIRA_API_VERSIONS = ("2", "3")
 AGENT_AUTONOMY_LEVELS = ("recommend_only", "low_impact", "policy")
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -208,6 +227,20 @@ def _validate_value(key: str, value: str) -> Tuple[str, Optional[str]]:
         if lowered in _FALSE:
             return "false", None
         return value, f"{key}: expected true or false."
+    if key in NUMERIC_KEYS:
+        low, high, integer = NUMERIC_KEYS[key]
+        try:
+            number = float(value)
+        except ValueError:
+            return value, f"{key}: expected a number between {low:g} and {high:g}."
+        if number != number or not low <= number <= high or (integer and number != int(number)):
+            kind = "whole number" if integer else "number"
+            return value, f"{key}: expected a {kind} between {low:g} and {high:g}."
+        return str(int(number)) if integer else str(number), None
+    if key == "jira_api_version":
+        if value not in JIRA_API_VERSIONS:
+            return value, f"{key}: expected 2 or 3."
+        return value, None
     if key == "agent_min_confidence":
         try:
             number = float(value)
@@ -239,6 +272,18 @@ def _validate_value(key: str, value: str) -> Tuple[str, Optional[str]]:
                 return value, f"{key}: '{item}' is not an IP address or CIDR range."
         return ", ".join(items), None
     return value, None
+
+
+def _invalidate_integration_caches(updated_keys: List[str]) -> None:
+    """Threat-intel verdict caches must not outlive a changed key, threshold or simulation switch."""
+    if not updated_keys:
+        return
+    try:
+        from backend.integrations import nvd, tip
+        tip.clear_cache()
+        nvd.clear_cache()
+    except Exception as exc:  # never fail a save because a cache could not be cleared
+        logger.warning(f"Could not clear threat-intel caches: {exc}")
 
 
 @router.post("")
@@ -297,7 +342,16 @@ def update_configurations(
             audit[key] = "cleared" if value == "" else "updated"
         else:
             audit[key] = value
+    # Autonomous response can only be switched on while protected assets are listed (same rule as /hotl-toggle).
+    # Evaluated with this request's own changes applied, so protected lists and the switch can be saved together.
+    if "hotl_enabled" in updated and get_bool("hotl_enabled", db=db):
+        blockers = hotl_enable_blockers(db)
+        if blockers:
+            db.rollback()
+            raise HTTPException(status_code=409, detail={"message": "Autonomous response (HOTL) cannot be enabled yet. "
+                                                         "Nothing was saved.", "blockers": blockers})
     db.commit()
+    _invalidate_integration_caches(updated)
 
     if updated:
         record_log(db, "CONFIG", "ACTION", f"Admin '{admin.username}' updated settings: {', '.join(updated)}.",
@@ -665,6 +719,11 @@ def toggle_hotl_status(
     if row is None:
         row = SystemConfig(category="ORCHESTRATION", key_name="hotl_enabled", is_secret=False)
         db.add(row)
+    if new_value and not current:
+        blockers = hotl_enable_blockers(db)
+        if blockers:
+            raise HTTPException(status_code=409, detail={
+                "message": "Autonomous response (HOTL) cannot be enabled yet.", "blockers": blockers})
     row.key_value = "true" if new_value else "false"
     row.updated_at = _now()
     db.commit()

@@ -33,6 +33,7 @@ from backend.engine import runner
 from backend.engine.actions import (
     ACTION_CATALOG,
     EXECUTED_STATUSES,
+    RAN_STATUSES,
     TARGET_ENTITY_KEYS,
     execute_action,
     record_policy_block,
@@ -96,6 +97,8 @@ def _run_status(result: Dict[str, Any]) -> str:
 def _approve(db: Session, alert_id: int, username: str, playbook_id: Optional[int]) -> Dict[str, Any]:
     try:
         return runner.approve_and_contain_alert(db, alert_id, approved_by=username, playbook_id=playbook_id)
+    except runner.AlertBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except runner.NoPlaybookError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except ValueError as exc:
@@ -231,7 +234,12 @@ def list_alerts(
 
 
 @router.get("/{alert_id}")
-def get_alert_detail(alert_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_alert_detail(
+    alert_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Alert detail: IOCs with evidence, matched playbook, routing, actions, reports and an honest triage summary."""
     alert = _get_alert_or_404(db, alert_id)
 
@@ -241,11 +249,14 @@ def get_alert_detail(alert_id: int, db: Session = Depends(get_db), current_user:
     report = get_incident_report_by_alert(db, alert_id)
     playbook = runner.playbook_for_alert(db, alert)
 
+    # Opening an alert must stay fast: use cached CVE data only and fetch missing CVEs from NVD in the background.
     try:
-        vulnerability_intel = nvd_client.analyze_alert_vulnerabilities(alert.to_dict())
+        vulnerability_intel = nvd_client.analyze_alert_vulnerabilities(alert.to_dict(), db, allow_live=False)
+        if vulnerability_intel.get("status") in ("pending", "partial"):
+            background_tasks.add_task(nvd_client.refresh_alert_vulnerabilities, alert_id)
     except Exception as exc:
-        logger.warning(f"NVD analysis failed for Alert #{alert_id}: {exc}")
-        vulnerability_intel = {"status": "unavailable", "error": str(exc)}
+        logger.warning(f"NVD analysis failed for Alert #{alert_id}: {type(exc).__name__}")
+        vulnerability_intel = {"status": "unavailable", "error": "Vulnerability lookup failed."}
 
     return {
         "alert_id": alert.alert_id,
@@ -278,10 +289,19 @@ def get_alert_detail(alert_id: int, db: Session = Depends(get_db), current_user:
 
 
 @router.get("/{alert_id}/vulnerabilities")
-def get_alert_vulnerabilities(alert_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """CVE context for the alert from the National Vulnerability Database."""
+def get_alert_vulnerabilities(
+    alert_id: int,
+    background_tasks: BackgroundTasks,
+    refresh: bool = Query(False, description="Fetch missing or stale CVEs from NVD now (background) instead of using the cache only"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CVE context for the alert from the National Vulnerability Database (cached; missing CVEs load in the background)."""
     alert = _get_alert_or_404(db, alert_id)
-    return nvd_client.analyze_alert_vulnerabilities(alert.to_dict())
+    analysis = nvd_client.analyze_alert_vulnerabilities(alert.to_dict(), db, allow_live=False)
+    if refresh or analysis.get("status") in ("pending", "partial"):
+        background_tasks.add_task(nvd_client.refresh_alert_vulnerabilities, alert_id)
+    return analysis
 
 
 @router.post("/{alert_id}/vulnerabilities/execute-hotl")
@@ -325,12 +345,13 @@ def execute_cve_hotl_action(
         records.append(record)
         results.append({"policy": decision.to_dict(), "action": record.to_dict()})
 
-    executed = [r for r in records if r.status in EXECUTED_STATUSES]
-    simulated = any(r.status == "Simulated" for r in executed)
+    live = [r for r in records if r.status in EXECUTED_STATUSES]
+    executed = [r for r in records if r.status in RAN_STATUSES]
+    simulated = bool(executed) and not live  # rehearsal only: nothing real changed, so it is never "Contained"
     cves = analysis.get("cves_detected") or []
     now = datetime.now(timezone.utc)
     if executed and alert.status in ("New", "Triaged", "Monitoring"):
-        alert.status = "Contained"
+        alert.status = "Simulated" if simulated else "Contained"
         alert.analyst_decision = f"NVD-recommended {action}" + (f" ({cves[0]})" if cves else "")
         alert.resolved_by = current_user.username
         alert.resolved_at = now

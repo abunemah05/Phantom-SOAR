@@ -304,6 +304,7 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
     new_alerts = db.query(Alert).filter(Alert.status == "New").count()
     triaged_alerts = db.query(Alert).filter(Alert.status == "Triaged").count()
     contained_alerts = db.query(Alert).filter(Alert.status == "Contained").count()
+    simulated_alerts = db.query(Alert).filter(Alert.status == "Simulated").count()
     resolved_alerts = db.query(Alert).filter(Alert.status.in_(["Resolved", "Closed"])).count()
     unresolved_alerts = db.query(Alert).filter(~Alert.status.in_(["Resolved", "Closed"])).count()
     review_gates_count = db.query(Alert).filter(Alert.status.in_(["Triaged", "New"])).count()
@@ -332,6 +333,7 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
         "new_alerts": new_alerts,
         "triaged_alerts": triaged_alerts,
         "contained_alerts": contained_alerts,
+        "simulated_alerts": simulated_alerts,  # rehearsed only: not contained, not resolved
         "resolved_alerts": resolved_alerts,
         "unresolved_alerts": unresolved_alerts,
         "review_gates_count": review_gates_count,

@@ -250,15 +250,31 @@ def test_runtime_status_shape(client, admin_headers):
     assert not any(data["integrations"].values())  # tests run with no third-party credentials
 
 
+def _save_config(client, headers, **values):
+    categories = {"protected_hosts": "ORCHESTRATION", "protected_users": "ORCHESTRATION", "protected_ips": "ORCHESTRATION"}
+    return client.post("/api/configuration", headers=headers, json={"configs": [
+        {"category": categories[k], "key_name": k, "key_value": v, "clear": v == ""} for k, v in values.items()]})
+
+
 def test_hotl_status_and_toggle(client, admin_headers):
     initial = client.get("/api/configuration/hotl-status", headers=admin_headers).json()["hotl_enabled"]
     try:
-        res = client.post("/api/configuration/hotl-toggle", json={"enabled": not initial}, headers=admin_headers)
+        # Autonomous response cannot be switched on while no protected hosts / users are listed.
+        client.post("/api/configuration/hotl-toggle", json={"enabled": False}, headers=admin_headers)
+        _save_config(client, admin_headers, protected_hosts="", protected_users="", protected_ips="")
+        refused = client.post("/api/configuration/hotl-toggle", json={"enabled": True}, headers=admin_headers)
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["blockers"]
+        assert client.get("/api/configuration/hotl-status", headers=admin_headers).json()["hotl_enabled"] is False
+
+        assert _save_config(client, admin_headers, protected_hosts="dc01.corp.example", protected_users="breakglass").status_code == 200
+        res = client.post("/api/configuration/hotl-toggle", json={"enabled": True}, headers=admin_headers)
         assert res.status_code == 200
-        assert res.json()["hotl_enabled"] is (not initial)
-        assert client.get("/api/configuration/hotl-status", headers=admin_headers).json()["hotl_enabled"] is (not initial)
+        assert res.json()["hotl_enabled"] is True
+        assert client.get("/api/configuration/hotl-status", headers=admin_headers).json()["hotl_enabled"] is True
     finally:
         client.post("/api/configuration/hotl-toggle", json={"enabled": initial}, headers=admin_headers)
+        _save_config(client, admin_headers, protected_hosts="", protected_users="", protected_ips="")
 
 
 def test_test_connection_is_honest(client, admin_headers, monkeypatch):

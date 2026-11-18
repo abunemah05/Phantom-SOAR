@@ -34,8 +34,36 @@ INTEGRATION_KEYS: Dict[str, Tuple[str, str]] = {
     "siem_user": ("SIEM", "WAZUH_API_USER"),
     "siem_password": ("SIEM", "WAZUH_API_PASSWORD"),
     "siem_verify_tls": ("SIEM", "WAZUH_VERIFY_TLS"),
+    # Threat-intel tuning (empty = built-in default; see backend/integrations/tip.py and nvd.py)
+    "vt_requests_per_minute": ("TIP", "VT_REQUESTS_PER_MINUTE"),
+    "vt_requests_per_day": ("TIP", "VT_REQUESTS_PER_DAY"),
+    "abuseipdb_daily_limit": ("TIP", "ABUSEIPDB_DAILY_LIMIT"),
+    "nvd_requests_per_30s": ("TIP", "NVD_REQUESTS_PER_30S"),
+    "tip_max_wait_seconds": ("TIP", "TIP_MAX_WAIT_SECONDS"),
+    "vt_malicious_weight": ("TIP", "VT_MALICIOUS_WEIGHT"),
+    "vt_suspicious_weight": ("TIP", "VT_SUSPICIOUS_WEIGHT"),
+    "vt_malicious_threshold": ("TIP", "VT_MALICIOUS_THRESHOLD"),
+    "vt_min_detections": ("TIP", "VT_MIN_DETECTIONS"),
+    "tip_malicious_threshold": ("TIP", "TIP_MALICIOUS_THRESHOLD"),
+    "tip_suspicious_threshold": ("TIP", "TIP_SUSPICIOUS_THRESHOLD"),
+    "tip_critical_threshold": ("TIP", "TIP_CRITICAL_THRESHOLD"),
+    # Wazuh active response (see wazuh/README.md)
+    "wazuh_ca_bundle": ("SIEM", "WAZUH_CA_BUNDLE"),
+    "wazuh_ar_script_prefix": ("SIEM", "WAZUH_AR_SCRIPT_PREFIX"),
+    "wazuh_windows_agent_ids": ("SIEM", "WAZUH_WINDOWS_AGENT_IDS"),
+    "wazuh_firewall_agent_ids": ("SIEM", "WAZUH_FIREWALL_AGENT_IDS"),
+    "wazuh_default_block_hours": ("SIEM", "WAZUH_DEFAULT_BLOCK_HOURS"),
+    "wazuh_default_rate_limit_hours": ("SIEM", "WAZUH_DEFAULT_RATE_LIMIT_HOURS"),
+    "wazuh_ar_block_command": ("SIEM", "WAZUH_AR_BLOCK_COMMAND"),
+    "wazuh_ar_unblock_command": ("SIEM", "WAZUH_AR_UNBLOCK_COMMAND"),
+    "wazuh_ar_isolate_command": ("SIEM", "WAZUH_AR_ISOLATE_COMMAND"),
+    "wazuh_ar_unisolate_command": ("SIEM", "WAZUH_AR_UNISOLATE_COMMAND"),
+    "wazuh_ar_kill_command": ("SIEM", "WAZUH_AR_KILL_COMMAND"),
+    "wazuh_ar_quarantine_command": ("SIEM", "WAZUH_AR_QUARANTINE_COMMAND"),
+    "wazuh_ar_rate_limit_command": ("SIEM", "WAZUH_AR_RATE_LIMIT_COMMAND"),
     # Identity provider
     "okta_domain": ("IAM", "OKTA_DOMAIN"),
+    "okta_login_domain": ("IAM", "OKTA_LOGIN_DOMAIN"),
     "okta_api_token": ("IAM", "OKTA_API_TOKEN"),
     # ITSM / notifications
     "jira_base_url": ("ITSM", "JIRA_BASE_URL"),
@@ -43,6 +71,8 @@ INTEGRATION_KEYS: Dict[str, Tuple[str, str]] = {
     "jira_api_token": ("ITSM", "JIRA_API_TOKEN"),
     "jira_project_key": ("ITSM", "JIRA_PROJECT_KEY"),
     "jira_webhook_url": ("ITSM", "JIRA_WEBHOOK_URL"),
+    "jira_api_version": ("ITSM", "JIRA_API_VERSION"),
+    "jira_issue_type": ("ITSM", "JIRA_ISSUE_TYPE"),
     "slack_webhook_url": ("ITSM", "SLACK_WEBHOOK_URL"),
     # Orchestration guardrails
     "hotl_enabled": ("ORCHESTRATION", "PHANTOM_HOTL_ENABLED"),
@@ -56,6 +86,8 @@ INTEGRATION_KEYS: Dict[str, Tuple[str, str]] = {
     # Explicit operator acknowledgement that simulation mode is intended in a production environment
     # even though real connectors are configured (see production_safety_errors).
     "simulation_confirmed_in_production": ("ORCHESTRATION", "PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION"),
+    # Administrators must have MFA enabled to sign in (enforced by backend/security.py).
+    "require_mfa_for_admin": ("ORCHESTRATION", "PHANTOM_REQUIRE_MFA_FOR_ADMIN"),
 }
 
 DEFAULTS: Dict[str, str] = {

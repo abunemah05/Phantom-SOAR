@@ -225,6 +225,7 @@ def request_with_retry(
     *,
     idempotent: bool = True,
     max_attempts: int = 3,
+    retry_statuses: Optional[frozenset] = None,
     **kwargs: Any,
 ) -> httpx.Response:
     """client.request() with bounded retries and exponential backoff plus jitter.
@@ -238,7 +239,11 @@ def request_with_retry(
     Returns the last response (callers still call raise_for_status()); if every attempt raised, the
     last exception is re-raised. The number of attempts is available from ``attempts_of()``:
     ``response.extensions["phantom_attempts"]`` or ``exc.phantom_attempts``.
+
+    ``retry_statuses`` overrides which HTTP statuses are retried (default RETRY_STATUSES); callers that
+    already wait out 429 themselves (backend/integrations/throttle.py) pass RETRY_STATUSES minus 429.
     """
+    statuses = RETRY_STATUSES if retry_statuses is None else frozenset(retry_statuses)
     max_attempts = max(1, int(max_attempts))
     attempt = 0
     while True:
@@ -257,7 +262,7 @@ def request_with_retry(
 
         response.extensions["phantom_attempts"] = attempt
         retry_after = parse_retry_after(response.headers.get("Retry-After"))
-        if attempt >= max_attempts or not _status_is_retryable(response.status_code, retry_after, idempotent):
+        if attempt >= max_attempts or not _status_is_retryable(response.status_code, retry_after, idempotent, statuses):
             return response
         delay = retry_after if retry_after is not None else _backoff_delay(attempt)
         logger.info(f"[retry] {method} {_safe_host(url)} got HTTP {response.status_code}; "
@@ -275,8 +280,9 @@ def _error_is_retryable(exc: Exception, idempotent: bool) -> bool:
     return isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
 
 
-def _status_is_retryable(status: int, retry_after: Optional[float], idempotent: bool) -> bool:
-    if status not in RETRY_STATUSES:
+def _status_is_retryable(status: int, retry_after: Optional[float], idempotent: bool,
+                         statuses: frozenset = RETRY_STATUSES) -> bool:
+    if status not in statuses:
         return False
     if idempotent:
         return True
