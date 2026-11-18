@@ -5,8 +5,8 @@
 #   scripts/dev.sh backend     backend only
 #   scripts/dev.sh frontend    frontend only
 #
-# Loads .env when present, then fills in development defaults for anything unset.
-# Ctrl+C stops both servers.
+# Loads .env when present (see scripts/dev_env.py), then fills in development defaults for anything
+# unset. Ctrl+C stops both servers. Development only: for a deployment use docker compose.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,40 +18,22 @@ case "$MODE" in
   *) echo "usage: $0 [all|backend|frontend]" >&2; exit 2 ;;
 esac
 
-BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"  # 0.0.0.0 to accept webhooks from other machines
+# Environment for development: variables already set in the shell win, then .env, then random
+# development secrets kept in .phantom_dev_secrets (git-ignored), then safe defaults (loopback API host,
+# simulation mode on). All parsing is done by scripts/dev_env.py, shared with the Windows scripts.
+if ! command -v python3 > /dev/null 2>&1; then
+  echo "[dev] python3 not found: install Python 3.12+" >&2
+  exit 1
+fi
+while IFS= read -r line; do
+  [[ "$line" == *=* ]] || continue
+  export "${line%%=*}=${line#*=}"
+done < <(python3 "$ROOT/scripts/dev_env.py")
+
+BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"  # 0.0.0.0 only on a trusted lab network (plain HTTP!)
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
-
-# KEY=VALUE lines from .env; variables already set in the shell win, empty values
-# stay unset. The file is parsed, not executed.
-load_env_file() {
-  local line key value
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%$'\r'}"
-    [[ -z "$line" || "$line" == \#* ]] && continue
-    key="${line%%=*}"
-    value="${line#*=}"
-    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-    [[ -z "$value" || -n "${!key:-}" ]] && continue
-    if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
-      value="${BASH_REMATCH[1]}"
-    fi
-    export "$key=$value"
-  done < "$1"
-}
-
-if [[ -f .env ]]; then
-  echo "[dev] loading .env"
-  load_env_file .env
-fi
-
-# Development defaults for anything still unset.
-: "${PHANTOM_ENV:=development}"
-: "${PHANTOM_SIMULATION_MODE:=true}"
-: "${PHANTOM_INGEST_TOKEN:=dev-ingest-token}"
-: "${PHANTOM_CORS_ORIGINS:=http://localhost:${FRONTEND_PORT},http://127.0.0.1:${FRONTEND_PORT}}"
-: "${NEXT_PUBLIC_API_URL:=http://localhost:${BACKEND_PORT}}"
-export PHANTOM_ENV PHANTOM_SIMULATION_MODE PHANTOM_INGEST_TOKEN PHANTOM_CORS_ORIGINS NEXT_PUBLIC_API_URL
+export NEXT_PUBLIC_API_URL="${NEXT_PUBLIC_API_URL:-http://localhost:${BACKEND_PORT}}"
 
 # ----------------------------------------------------------------------------- backend
 setup_backend() {
@@ -77,20 +59,14 @@ setup_backend() {
     fi
     echo "$want" > "$stamp"
   fi
-
-  if [[ -z "${PHANTOM_JWT_SECRET:-}" ]]; then
-    # Stable for this launch (survives uvicorn --reload); sessions end when dev.sh exits.
-    PHANTOM_JWT_SECRET="$("$py" -c 'import secrets; print(secrets.token_urlsafe(48))')"
-    export PHANTOM_JWT_SECRET
-  fi
 }
 
 run_backend() {
   echo "[dev] backend:  http://${BACKEND_HOST}:${BACKEND_PORT}  (docs: /docs)"
-  echo "[dev] webhook ingest token: ${PHANTOM_INGEST_TOKEN}"
+  echo "[dev] development secrets live in .phantom_dev_secrets (git-ignored, never printed)"
   if [[ -z "${PHANTOM_BOOTSTRAP_ADMIN_PASSWORD:-}" ]]; then
-    echo "[dev] PHANTOM_BOOTSTRAP_ADMIN_PASSWORD is unset: on a fresh database the generated"
-    echo "[dev] admin password is printed once in the backend log (WARNING)."
+    echo "[dev] PHANTOM_BOOTSTRAP_ADMIN_PASSWORD is unset: on a fresh database a one-time admin"
+    echo "[dev] password is written to phantom_bootstrap_admin_password.txt (path in the backend log)."
   fi
   exec "$ROOT/.venv/bin/python" -m uvicorn backend.main:app \
     --host "$BACKEND_HOST" --port "$BACKEND_PORT" --reload --reload-dir backend

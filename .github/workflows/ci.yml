@@ -2,79 +2,279 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, real-soar]
   pull_request:
   workflow_dispatch:
 
+# Least privilege: every job only reads the repository.
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+
 jobs:
-  backend:
-    name: Backend tests
+  # ---------------------------------------------------------------------------------------------
+  lint:
+    name: Lint, scripts and docs consistency
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Ruff (rules and ignored rules are explained in ruff.toml)
+        run: |
+          python -m pip install "ruff==0.16.9"
+          ruff check .
+      - name: Shell scripts
+        run: |
+          shellcheck -s bash scripts/dev.sh scripts/smoke_test.sh
+          shellcheck -s sh deploy/backup/backup.sh
+      - name: Documentation and environment variables are consistent with the code
+        run: python scripts/check_docs.py
+      - name: docker compose config fails without the required secrets
+        run: |
+          if docker compose config --quiet 2> /dev/null; then
+            echo "docker compose config succeeded without secrets; a REQUIRED variable has a default again" >&2
+            exit 1
+          fi
+      - name: docker compose config is valid (default and plain-dev override, backup profile)
+        env:
+          POSTGRES_PASSWORD: ci-placeholder
+          REDIS_PASSWORD: ci-placeholder
+          PHANTOM_JWT_SECRET: ci-placeholder-ci-placeholder-ci-placeholder
+          PHANTOM_ENCRYPTION_KEY: ci-placeholder
+        run: |
+          docker compose --profile backup config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.override.example.yml config --quiet
+
+  # ---------------------------------------------------------------------------------------------
+  backend-sqlite:
+    name: Backend tests (SQLite, ${{ matrix.deps }} dependencies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # lock   = exactly what the Docker image installs (backend/requirements.lock)
+        # latest = newest versions allowed by backend/requirements.txt (early warning)
+        deps: [lock, latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: |
             backend/requirements.txt
+            backend/requirements.lock
             backend/requirements-dev.txt
       - name: Install dependencies
-        run: python -m pip install -r backend/requirements-dev.txt
-      # backend/tests/conftest.py provides a throwaway SQLite DB and test secrets,
-      # and strips third-party API keys, so no services or secrets are needed here.
+        run: |
+          if [ "${{ matrix.deps }}" = "lock" ]; then
+            python -m pip install -r backend/requirements.lock "pytest>=8.1.1,<10" "pytest-asyncio>=0.23.6,<2"
+          else
+            python -m pip install -r backend/requirements-dev.txt
+          fi
+          python -m pip check
+      # backend/tests/conftest.py provides a throwaway SQLite database and test secrets and strips
+      # third-party API keys, so no services or secrets are needed here.
       - name: Run pytest
         run: python -m pytest backend/tests -q -p no:warnings
 
-  frontend:
-    name: Frontend typecheck and build
+  # ---------------------------------------------------------------------------------------------
+  backend-postgres:
+    name: Backend tests (Postgres 16)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16.10-alpine
+        env:
+          POSTGRES_USER: phantom
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U phantom"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGPASSWORD: ci-only-password
+      PG_BASE: postgresql+psycopg2://phantom:ci-only-password@localhost:5432
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.lock
+            backend/requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r backend/requirements.lock "pytest>=8.1.1,<10" "pytest-asyncio>=0.23.6,<2"
+      - name: Create throwaway databases
+        run: |
+          for db in suite migrations cli; do
+            psql -h localhost -U phantom -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE $db"
+          done
+      # backend/tests/conftest.py forces a SQLite DATABASE_URL, so the whole suite is pointed at Postgres
+      # by a small pytest plugin (scripts/ci/pg_suite_plugin.py). Tables are created with create_all here.
+      - name: Whole test suite on Postgres
+        env:
+          PHANTOM_TEST_DATABASE_URL: ${{ env.PG_BASE }}/suite
+          PYTHONPATH: scripts/ci
+        run: python -m pytest backend/tests -p pg_suite_plugin -q -p no:warnings
+      # Postgres-only migration tests (they DROP the public schema of the database they are given).
+      - name: Migration tests on Postgres
+        env:
+          PHANTOM_TEST_POSTGRES_URL: ${{ env.PG_BASE }}/migrations
+        run: python -m pytest backend/tests/test_ws5_migrations.py -q -p no:warnings
+      - name: Real migration path, as the container runs it (upgrade, check, idempotent re-run)
+        env:
+          DATABASE_URL: ${{ env.PG_BASE }}/cli
+          PHANTOM_ENV: development
+          REPORTS_DIR: ${{ runner.temp }}/reports
+        run: |
+          python -m backend.db_migrate upgrade
+          python -m backend.db_migrate check
+          python -m backend.db_migrate upgrade
+          python -m backend.db_migrate current
+
+  # ---------------------------------------------------------------------------------------------
+  dependency-audit:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Audit backend/requirements.txt (resolved) and the pinned lock file
+        run: |
+          python -m pip install pip-audit
+          pip-audit -r backend/requirements.txt
+          pip-audit -r backend/requirements.lock --no-deps --disable-pip
+
+  # ---------------------------------------------------------------------------------------------
+  frontend:
+    name: Frontend typecheck, lint, test, build, audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: frontend
     env:
       NEXT_TELEMETRY_DISABLED: "1"
-      NEXT_PUBLIC_API_URL: http://localhost:8000
+      # Same-origin build, as the Docker image and the reverse proxy use it.
+      NEXT_PUBLIC_API_URL: ""
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
       - name: Typecheck
         run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint
+      - name: Unit tests (when the project has any)
+        run: |
+          if [ -x node_modules/.bin/vitest ]; then npx vitest run --passWithNoTests; else echo "no vitest installed; skipped"; fi
       - name: Production build
         run: npx next build
+      - name: Dependency audit (production dependencies, high and critical)
+        run: npm audit --omit=dev --audit-level=high
 
-  compose:
-    name: Docker Compose config
+  # ---------------------------------------------------------------------------------------------
+  docker-build:
+    name: Docker build (${{ matrix.image }})
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [backend, frontend]
     steps:
       - uses: actions/checkout@v5
-      - name: Secrets are required (config must fail without them)
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.image }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.image }}
+          file: ./${{ matrix.image }}/Dockerfile
+          push: false
+          load: true
+          tags: phantom-soar-${{ matrix.image }}:ci
+          build-args: |
+            ${{ matrix.image == 'frontend' && 'NEXT_PUBLIC_API_URL=' || '' }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+      - name: Backend image has consistent dependencies and runs as a non-root user
+        if: matrix.image == 'backend'
         run: |
-          if docker compose config --quiet 2> /dev/null; then
-            echo "docker compose config succeeded without secrets; a secret has a default again" >&2
-            exit 1
-          fi
-      - name: Validate docker-compose.yml
+          docker run --rm --entrypoint python phantom-soar-backend:ci -m pip check
+          test "$(docker run --rm --entrypoint id phantom-soar-backend:ci -u)" != "0"
+      - name: Frontend image runs as a non-root user
+        if: matrix.image == 'frontend'
+        run: test "$(docker run --rm --entrypoint id phantom-soar-frontend:ci -u)" != "0"
+
+  # ---------------------------------------------------------------------------------------------
+  compose-smoke:
+    name: Compose smoke test (proxy, API, worker, Postgres, Redis, backup)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create a throwaway .env with generated secrets
+        run: |
+          ingest="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          admin="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+          echo "::add-mask::$ingest"
+          echo "::add-mask::$admin"
+          python3 scripts/gen_env.py --set "PHANTOM_INGEST_TOKEN=$ingest" --set "PHANTOM_BOOTSTRAP_ADMIN_PASSWORD=$admin"
+          {
+            echo "PHANTOM_INGEST_TOKEN=$ingest"
+            echo "PHANTOM_BOOTSTRAP_ADMIN_PASSWORD=$admin"
+          } >> "$GITHUB_ENV"
+      - name: Build and start the stack (waits for every healthcheck)
+        run: docker compose up -d --build --wait --wait-timeout 420
+      - name: Smoke test through the proxy (HTTPS, health, hidden docs, webhook, sign-in)
         env:
-          POSTGRES_PASSWORD: ci-placeholder
-          REDIS_PASSWORD: ci-placeholder
-          PHANTOM_JWT_SECRET: ci-placeholder
-          PHANTOM_BOOTSTRAP_ADMIN_PASSWORD: ci-placeholder
-          PHANTOM_INGEST_TOKEN: ci-placeholder
-        run: docker compose config --quiet
+          SMOKE_HTTP_URL: http://localhost
+        run: scripts/smoke_test.sh https://localhost
+      - name: Worker is up and beat is scheduled by this one worker
+        run: |
+          docker compose exec -T celery_worker celery -A backend.celery_app.celery_app inspect ping --timeout 10
+          docker compose logs celery_worker | grep -i "beat: Starting"
+      - name: Migrations are at head and a re-run changes nothing
+        run: |
+          docker compose exec -T backend python -m backend.db_migrate check
+          docker compose exec -T backend python -m backend.db_migrate upgrade
+      - name: Backup, verify and prune
+        run: |
+          docker compose --profile backup build backup
+          docker compose --profile backup run --rm backup once
+          docker compose --profile backup run --rm backup verify
+          docker compose --profile backup run --rm backup list
+      - name: Logs (always, for diagnosis)
+        if: always()
+        run: |
+          docker compose --profile backup ps -a
+          docker compose --profile backup logs --no-color --tail=300
+      - name: Tear down
+        if: always()
+        run: docker compose --profile backup down -v --remove-orphans

@@ -1,71 +1,182 @@
-# Phantom SOAR — full stack (Postgres, Redis, FastAPI API, Celery worker, Next.js UI).
+# Phantom SOAR - full stack: Caddy (TLS reverse proxy), Next.js console, FastAPI API,
+# Celery worker (+ embedded scheduler), Postgres 16 and Redis 7.
 #
-#   cp .env.example .env    # then fill in the REQUIRED secrets
-#   docker compose up --build
+#   python scripts/gen_env.py           # creates .env with generated secrets (or: cp .env.example .env and edit)
+#   docker compose up -d --build --wait
+#   open https://localhost              # certificate from Caddy's internal CA until you set PHANTOM_DOMAIN
 #
-# Secrets have no defaults: compose refuses to start until they are set in .env.
-# Postgres and Redis are only reachable on the internal compose network.
+# Everything is served from ONE origin by the "proxy" service (see deploy/caddy/Caddyfile). It is the only
+# service with published ports (bound to 127.0.0.1 unless PHANTOM_PUBLISH_HOST says otherwise). Postgres and
+# Redis sit on an internal-only network with no route to the outside and no published port.
+# Plain local development without the proxy: copy docker-compose.override.example.yml to
+# docker-compose.override.yml (see docs/DEPLOYMENT.md).
+#
+# Secrets have no defaults: compose refuses to start until the REQUIRED ones are set in .env.
+# Image tags are pinned; bump them deliberately (and re-run the tests) when you upgrade.
 
 name: phantom-soar
 
+x-postgres-image: &postgres-image postgres:16.10-alpine
+
 x-backend-env: &backend-env
+  # ---- core --------------------------------------------------------------------------------------
   PHANTOM_ENV: ${PHANTOM_ENV:-production}
+  HOME: /tmp
   DATABASE_URL: postgresql://${POSTGRES_USER:-phantom}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/${POSTGRES_DB:-phantom_soar}
   PHANTOM_ALLOW_SQLITE_FALLBACK: "false"
   REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
   CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
   CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
   REPORTS_DIR: /app/backend/reports
-  # Auth and ingestion
+  PHANTOM_DB_POOL_SIZE: ${PHANTOM_DB_POOL_SIZE:-}
+  PHANTOM_DB_MAX_OVERFLOW: ${PHANTOM_DB_MAX_OVERFLOW:-}
+  PHANTOM_DB_POOL_RECYCLE: ${PHANTOM_DB_POOL_RECYCLE:-}
+  PHANTOM_DB_POOL_TIMEOUT: ${PHANTOM_DB_POOL_TIMEOUT:-}
+  # ---- secrets and auth --------------------------------------------------------------------------
+  # REQUIRED: the API refuses to start in production without a >= 32 character JWT secret and a valid Fernet key.
   PHANTOM_JWT_SECRET: ${PHANTOM_JWT_SECRET:?set PHANTOM_JWT_SECRET in .env}
+  PHANTOM_ENCRYPTION_KEY: ${PHANTOM_ENCRYPTION_KEY:?set PHANTOM_ENCRYPTION_KEY in .env (see .env.example)}
+  # Key rotation: first key encrypts, every key decrypts (leave empty normally; see SECURITY.md).
+  PHANTOM_ENCRYPTION_KEYS: ${PHANTOM_ENCRYPTION_KEYS:-}
   PHANTOM_JWT_EXPIRE_MINUTES: ${PHANTOM_JWT_EXPIRE_MINUTES:-720}
-  PHANTOM_BOOTSTRAP_ADMIN_PASSWORD: ${PHANTOM_BOOTSTRAP_ADMIN_PASSWORD:?set PHANTOM_BOOTSTRAP_ADMIN_PASSWORD in .env}
-  PHANTOM_INGEST_TOKEN: ${PHANTOM_INGEST_TOKEN:?set PHANTOM_INGEST_TOKEN in .env}
+  PHANTOM_REQUIRE_MFA_FOR_ADMIN: ${PHANTOM_REQUIRE_MFA_FOR_ADMIN:-}
+  # Bootstrap administrator (first start only). Without a password, a random one-time password is written
+  # to PHANTOM_BOOTSTRAP_PASSWORD_FILE (read it with: docker compose exec backend cat /app/run/bootstrap_admin_password.txt).
+  PHANTOM_BOOTSTRAP_ADMIN_USERNAME: ${PHANTOM_BOOTSTRAP_ADMIN_USERNAME:-}
+  PHANTOM_BOOTSTRAP_ADMIN_PASSWORD: ${PHANTOM_BOOTSTRAP_ADMIN_PASSWORD:-}
+  PHANTOM_BOOTSTRAP_PASSWORD_FILE: /app/run/bootstrap_admin_password.txt
+  # Legacy single shared webhook token (ignored unless >= 32 characters). Prefer per-sender tokens
+  # created by an admin (Accounts page / POST /api/ingest-tokens).
+  PHANTOM_INGEST_TOKEN: ${PHANTOM_INGEST_TOKEN:-}
+  # ---- network / proxy ---------------------------------------------------------------------------
+  # Browsers use the proxy's own origin, so CORS only matters for the plain-dev override.
   PHANTOM_CORS_ORIGINS: ${PHANTOM_CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
-  # Orchestration / agent guardrails (empty = application default; values saved
-  # in the Configuration page take precedence over these)
+  # Emit HSTS from the API as well (the proxy already sends it for any real domain).
+  PHANTOM_BEHIND_TLS: ${PHANTOM_BEHIND_TLS:-false}
+  # Peers whose X-Forwarded-For is believed (rate limits / audit use the real client address).
+  # Only the proxy can reach the backend, so the private ranges of the compose network are trusted.
+  PHANTOM_TRUSTED_PROXIES: ${PHANTOM_TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+  PHANTOM_ENABLE_DOCS: ${PHANTOM_ENABLE_DOCS:-}
+  PHANTOM_RATELIMIT_REDIS_URL: ${PHANTOM_RATELIMIT_REDIS_URL:-}
+  PHANTOM_RATE_LIMIT_LOGIN: ${PHANTOM_RATE_LIMIT_LOGIN:-}
+  PHANTOM_RATE_LIMIT_CHANGE_PASSWORD: ${PHANTOM_RATE_LIMIT_CHANGE_PASSWORD:-}
+  PHANTOM_RATE_LIMIT_MFA: ${PHANTOM_RATE_LIMIT_MFA:-}
+  PHANTOM_RATE_LIMIT_WEBHOOKS: ${PHANTOM_RATE_LIMIT_WEBHOOKS:-}
+  PHANTOM_RATE_LIMIT_TEST_CONNECTION: ${PHANTOM_RATE_LIMIT_TEST_CONNECTION:-}
+  PHANTOM_RATE_LIMIT_SERVICE_KEY_FAILURES: ${PHANTOM_RATE_LIMIT_SERVICE_KEY_FAILURES:-}
+  PHANTOM_RATE_LIMIT_INGEST_FAILURES: ${PHANTOM_RATE_LIMIT_INGEST_FAILURES:-}
+  PHANTOM_LOGIN_DELAY_SECONDS: ${PHANTOM_LOGIN_DELAY_SECONDS:-}
+  PHANTOM_LOG_RETENTION_DAYS: ${PHANTOM_LOG_RETENTION_DAYS:-}
+  # ---- orchestration / guardrails (empty = application default; values saved in the console win) ------
   PHANTOM_SIMULATION_MODE: ${PHANTOM_SIMULATION_MODE:-}
+  PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION: ${PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION:-}
   PHANTOM_HOTL_ENABLED: ${PHANTOM_HOTL_ENABLED:-}
   PHANTOM_PROTECTED_HOSTS: ${PHANTOM_PROTECTED_HOSTS:-}
   PHANTOM_PROTECTED_USERS: ${PHANTOM_PROTECTED_USERS:-}
   PHANTOM_PROTECTED_IPS: ${PHANTOM_PROTECTED_IPS:-}
   PHANTOM_AGENT_MIN_CONFIDENCE: ${PHANTOM_AGENT_MIN_CONFIDENCE:-}
   PHANTOM_AGENT_AUTONOMY: ${PHANTOM_AGENT_AUTONOMY:-}
-  # Threat intelligence
+  # ---- built-in AI triage (optional; off by default) ---------------------------------------------------
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+  PHANTOM_AI_ENABLED: ${PHANTOM_AI_ENABLED:-}
+  PHANTOM_AI_AUTO_TRIAGE: ${PHANTOM_AI_AUTO_TRIAGE:-}
+  PHANTOM_AI_MAX_ALERTS_PER_MINUTE: ${PHANTOM_AI_MAX_ALERTS_PER_MINUTE:-}
+  PHANTOM_AI_SEND_RAW_PAYLOAD: ${PHANTOM_AI_SEND_RAW_PAYLOAD:-}
+  # ---- threat intelligence -------------------------------------------------------------------------
   VIRUSTOTAL_API_KEY: ${VIRUSTOTAL_API_KEY:-}
   ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY:-}
   ALIENVAULT_OTX_API_KEY: ${ALIENVAULT_OTX_API_KEY:-}
   THREATFOX_API_KEY: ${THREATFOX_API_KEY:-}
   NVD_API_KEY: ${NVD_API_KEY:-}
-  # Wazuh manager API
+  VT_REQUESTS_PER_MINUTE: ${VT_REQUESTS_PER_MINUTE:-}
+  VT_REQUESTS_PER_DAY: ${VT_REQUESTS_PER_DAY:-}
+  ABUSEIPDB_DAILY_LIMIT: ${ABUSEIPDB_DAILY_LIMIT:-}
+  NVD_REQUESTS_PER_30S: ${NVD_REQUESTS_PER_30S:-}
+  TIP_MAX_WAIT_SECONDS: ${TIP_MAX_WAIT_SECONDS:-}
+  VT_MALICIOUS_WEIGHT: ${VT_MALICIOUS_WEIGHT:-}
+  VT_SUSPICIOUS_WEIGHT: ${VT_SUSPICIOUS_WEIGHT:-}
+  VT_MALICIOUS_THRESHOLD: ${VT_MALICIOUS_THRESHOLD:-}
+  VT_MIN_DETECTIONS: ${VT_MIN_DETECTIONS:-}
+  TIP_MALICIOUS_THRESHOLD: ${TIP_MALICIOUS_THRESHOLD:-}
+  TIP_SUSPICIOUS_THRESHOLD: ${TIP_SUSPICIOUS_THRESHOLD:-}
+  TIP_CRITICAL_THRESHOLD: ${TIP_CRITICAL_THRESHOLD:-}
+  # ---- Wazuh manager API and active response -------------------------------------------------------
   WAZUH_API_URL: ${WAZUH_API_URL:-}
   WAZUH_API_USER: ${WAZUH_API_USER:-}
   WAZUH_API_PASSWORD: ${WAZUH_API_PASSWORD:-}
   WAZUH_VERIFY_TLS: ${WAZUH_VERIFY_TLS:-}
-  # Identity provider
+  # Path INSIDE the container (mount the PEM with docker-compose.override.yml, see docs/DEPLOYMENT.md).
+  WAZUH_CA_BUNDLE: ${WAZUH_CA_BUNDLE:-}
+  WAZUH_AR_SCRIPT_PREFIX: ${WAZUH_AR_SCRIPT_PREFIX:-}
+  WAZUH_WINDOWS_AGENT_IDS: ${WAZUH_WINDOWS_AGENT_IDS:-}
+  WAZUH_FIREWALL_AGENT_IDS: ${WAZUH_FIREWALL_AGENT_IDS:-}
+  WAZUH_DEFAULT_BLOCK_HOURS: ${WAZUH_DEFAULT_BLOCK_HOURS:-}
+  WAZUH_DEFAULT_RATE_LIMIT_HOURS: ${WAZUH_DEFAULT_RATE_LIMIT_HOURS:-}
+  WAZUH_AR_BLOCK_COMMAND: ${WAZUH_AR_BLOCK_COMMAND:-}
+  WAZUH_AR_UNBLOCK_COMMAND: ${WAZUH_AR_UNBLOCK_COMMAND:-}
+  WAZUH_AR_ISOLATE_COMMAND: ${WAZUH_AR_ISOLATE_COMMAND:-}
+  WAZUH_AR_UNISOLATE_COMMAND: ${WAZUH_AR_UNISOLATE_COMMAND:-}
+  WAZUH_AR_KILL_COMMAND: ${WAZUH_AR_KILL_COMMAND:-}
+  WAZUH_AR_QUARANTINE_COMMAND: ${WAZUH_AR_QUARANTINE_COMMAND:-}
+  WAZUH_AR_RATE_LIMIT_COMMAND: ${WAZUH_AR_RATE_LIMIT_COMMAND:-}
+  # ---- identity provider ---------------------------------------------------------------------------
   OKTA_DOMAIN: ${OKTA_DOMAIN:-}
+  OKTA_LOGIN_DOMAIN: ${OKTA_LOGIN_DOMAIN:-}
   OKTA_API_TOKEN: ${OKTA_API_TOKEN:-}
-  # ITSM / notifications
+  # ---- ITSM / notifications ------------------------------------------------------------------------
   JIRA_BASE_URL: ${JIRA_BASE_URL:-}
   JIRA_EMAIL: ${JIRA_EMAIL:-}
   JIRA_API_TOKEN: ${JIRA_API_TOKEN:-}
   JIRA_PROJECT_KEY: ${JIRA_PROJECT_KEY:-}
   JIRA_WEBHOOK_URL: ${JIRA_WEBHOOK_URL:-}
+  JIRA_API_VERSION: ${JIRA_API_VERSION:-}
+  JIRA_ISSUE_TYPE: ${JIRA_ISSUE_TYPE:-}
   SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+
+# Hardening shared by the two Python services: no root filesystem writes, no extra capabilities,
+# bounded memory/processes. Writable paths are only the volumes and tmpfs listed per service.
+x-app-hardening: &app-hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+
+x-backend-build: &backend-build
+  context: ./backend
+  dockerfile: Dockerfile
 
 services:
   db:
-    image: postgres:16-alpine
-    container_name: phantom_soar_db
+    image: *postgres-image
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-phantom}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-phantom_soar}
-    # No published port. To reach it from the host for debugging, add:
-    # ports: ["127.0.0.1:5432:5432"]
+    # No published port. For debugging from the host use docker-compose.override.example.yml or:
+    #   docker compose exec db psql -U phantom phantom_soar
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks: [data]
+    # The image entrypoint starts as root, fixes ownership of the data directory and then runs the
+    # server as the unprivileged "postgres" user, so only these capabilities are kept.
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+      - /run/postgresql:size=16m,mode=1777
+    deploy:
+      resources:
+        limits:
+          pids: 256
+          cpus: "2.0"
+          memory: 1g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
@@ -73,42 +184,58 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
-    container_name: phantom_soar_redis
+    image: redis:7.4-alpine
     restart: unless-stopped
     command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}", "--appendonly", "yes"]
     environment:
       REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
-    # No published port (see the db service for a loopback-only example).
+    # No published port (see db). The entrypoint chowns /data, then runs redis as the "redis" user.
     volumes:
       - redis_data:/data
+    networks: [data]
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    deploy:
+      resources:
+        limits:
+          pids: 128
+          cpus: "1.0"
+          memory: 256m
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
       timeout: 5s
       retries: 10
 
+  # API. Migrations run here at start-up (FastAPI lifespan) under a Postgres advisory lock, once per
+  # start; the worker below waits for this service to be healthy, i.e. for the schema to be at head.
+  # Check or run them by hand with:  docker compose exec backend python -m backend.db_migrate check|upgrade
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    build: *backend-build
     image: phantom-soar-backend:local
-    container_name: phantom_soar_backend
     restart: unless-stopped
     environment: *backend-env
-    ports:
-      # Loopback by default. Set PHANTOM_PUBLISH_HOST=0.0.0.0 when Wazuh or other
-      # browsers must reach the API from another machine.
-      - "${PHANTOM_PUBLISH_HOST:-127.0.0.1}:8000:8000"
+    <<: *app-hardening
     volumes:
       - reports_data:/app/backend/reports
-    security_opt:
-      - no-new-privileges:true
+      - run_data:/app/run
+    networks: [data, edge]
+    deploy:
+      resources:
+        limits:
+          pids: 512
+          cpus: "2.0"
+          memory: 1g
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)"]
       interval: 10s
       timeout: 5s
-      retries: 6
+      retries: 12
       start_period: 20s
     depends_on:
       db:
@@ -116,19 +243,35 @@ services:
       redis:
         condition: service_healthy
 
+  # Background jobs. "-B" embeds the Celery beat scheduler (tasks.maintenance every 5 minutes).
+  # ONLY ONE worker container may run with -B: two schedulers would each queue every periodic task.
+  # If you ever add worker replicas, keep this service as the single scheduler and start the extra
+  # ones from a separate service that omits -B (and --schedule).
+  # The schedule file is kept on tmpfs; it only stores the last-run times of an interval schedule.
   celery_worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    build: *backend-build
     image: phantom-soar-backend:local
-    container_name: phantom_soar_celery
     restart: unless-stopped
-    command: ["celery", "-A", "backend.celery_app.celery_app", "worker", "--loglevel=info"]
+    command:
+      - celery
+      - -A
+      - backend.celery_app.celery_app
+      - worker
+      - -B
+      - --schedule=/tmp/celerybeat-schedule
+      - --concurrency=${CELERY_CONCURRENCY:-4}
+      - --loglevel=info
     environment: *backend-env
+    <<: *app-hardening
     volumes:
       - reports_data:/app/backend/reports
-    security_opt:
-      - no-new-privileges:true
+    networks: [data, edge]
+    deploy:
+      resources:
+        limits:
+          pids: 512
+          cpus: "2.0"
+          memory: 1g
     healthcheck:
       test: ["CMD-SHELL", "celery -A backend.celery_app.celery_app inspect ping --timeout 5 -d \"celery@$$HOSTNAME\" > /dev/null"]
       interval: 30s
@@ -139,31 +282,131 @@ services:
       backend:
         condition: service_healthy
 
+  # Console. NEXT_PUBLIC_API_URL is a BUILD argument baked into the browser bundle. Empty (the default)
+  # means same-origin: the browser calls /api on whatever origin served the page, which the proxy routes
+  # to the backend. Rebuild after changing it:  docker compose build frontend
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # Baked into the browser bundle at build time: must be reachable from the
-        # user's browser. Rebuild (docker compose build frontend) after changing it.
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
-    container_name: phantom_soar_frontend
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
+    image: phantom-soar-frontend:local
     restart: unless-stopped
-    ports:
-      - "${PHANTOM_PUBLISH_HOST:-127.0.0.1}:3000:3000"
+    read_only: true
+    cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /app/.next/cache:size=64m,uid=1000,gid=1000,mode=0755
+    networks: [edge]
+    deploy:
+      resources:
+        limits:
+          pids: 256
+          cpus: "1.0"
+          memory: 512m
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.status < 500 ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  # TLS reverse proxy: the only published entry point. Runs as root inside the container (it binds
+  # ports 80/443) with every capability dropped except NET_BIND_SERVICE.
+  proxy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    environment:
+      PHANTOM_DOMAIN: ${PHANTOM_DOMAIN:-localhost}
+    ports:
+      # Loopback by default. Set PHANTOM_PUBLISH_HOST=0.0.0.0 (and PHANTOM_DOMAIN to your DNS name) to
+      # serve other machines, including a Wazuh manager that posts alerts over HTTPS.
+      - "${PHANTOM_PUBLISH_HOST:-127.0.0.1}:${PHANTOM_HTTP_PORT:-80}:80"
+      - "${PHANTOM_PUBLISH_HOST:-127.0.0.1}:${PHANTOM_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [edge]
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    deploy:
+      resources:
+        limits:
+          pids: 512
+          cpus: "1.0"
+          memory: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8081/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       backend:
         condition: service_healthy
+      frontend:
+        condition: service_healthy
+
+  # Database backups: not started by default. Enable with the "backup" profile:
+  #   docker compose --profile backup up -d backup
+  # One-off dump / verify / restore: see docs/DEPLOYMENT.md ("Backups and restore") and deploy/backup/backup.sh.
+  # PHANTOM_BACKUP_DIR: a named volume (default) or an absolute host path owned by uid 70.
+  backup:
+    profiles: ["backup"]
+    build:
+      context: ./deploy/backup
+      args:
+        PG_IMAGE: *postgres-image
+    image: phantom-soar-backup:local
+    restart: unless-stopped
+    environment:
+      PGHOST: db
+      PGUSER: ${POSTGRES_USER:-phantom}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      PGDATABASE: ${POSTGRES_DB:-phantom_soar}
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+    volumes:
+      - ${PHANTOM_BACKUP_DIR:-backup_data}:/backups
+      - reports_data:/reports:ro
+    networks: [data]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    deploy:
+      resources:
+        limits:
+          pids: 64
+          cpus: "1.0"
+          memory: 256m
+    depends_on:
+      db:
+        condition: service_healthy
+
+networks:
+  # No route to the outside: Postgres and Redis (and the backup job) can only talk to the app services.
+  data:
+    internal: true
+  # Proxy, console and the app services that need outbound access to vendor APIs.
+  edge:
 
 volumes:
   postgres_data:
   redis_data:
   reports_data:
+  run_data:
+  caddy_data:
+  caddy_config:
+  backup_data:

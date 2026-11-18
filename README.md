@@ -1,140 +1,175 @@
-# Phantom SOAR: Enterprise Security Orchestration, Automation, and Response Platform
+# Phantom SOAR
 
-Phantom SOAR is an enterprise-grade Security Orchestration, Automation, and Response (SOAR) platform built to bridge Security Operations Centers (SOC) with automated threat containment. Designed around the **SANS PICERL** incident response framework, **SOAPA** (Security Operations and Analytics Platform Architecture), **MITRE ATT&CK**, and **Wazuh SIEM** telemetry.
+Phantom SOAR receives security alerts (Wazuh, EDR and XDR webhooks), enriches their indicators with threat
+intelligence, matches a response playbook, and either waits for an analyst to approve the response or, under strict
+conditions, runs it automatically. An optional AI triage step can propose a verdict and actions, which a human approves.
+Everything an automated actor does passes one policy check and is recorded with whether it was real, simulated, skipped,
+blocked or failed.
 
----
+It started as a university graduation project and is developed in this repository. **Treat it as a lab platform until
+you have worked through [`LIVE_CHECKLIST.md`](LIVE_CHECKLIST.md) yourself.** The code and its several hundred automated
+tests mock every vendor; the authors have not tested it against live Wazuh, Okta, Jira, Slack or the threat-intel
+providers, and it has not had an independent security audit.
 
-## 🛡️ Architecture & Core Standards
+## What it does
 
-### 1. SANS PICERL Lifecycle Integration
-- **Preparation:** Pre-configured catalog of 12 standard MITRE/SANS IR playbooks (Ransomware, Brute Force, Phishing, PrivEsc, WebShell, Exfiltration, etc.).
-- **Identification:** Ingestion of Wazuh SIEM JSON telemetry, artifact extraction, and TIP enrichment.
-- **Containment:** Severity-based dual-routing engine:
-  - **HOTL (Human-On-The-Loop / Autonomous Containment):** Critical/High severity (or VirusTotal Threat Score > 50). Instantly executes host isolation, malicious process termination, and edge firewall IP blocking with sub-2-second MTTR.
-  - **HITL (Human-In-The-Loop):** Low/Medium severity. Pauses in `Triaged` state awaiting manual analyst sign-off via one-click approval or denial.
-- **Eradication:** Threat elimination via EDR file quarantine, process termination, and IAM credential resets.
-- **Recovery:** Session revocation, token invalidation, and network restoration.
-- **Lessons Learned:** Automated executive incident report generation using ReportLab Platypus.
+* **Ingestion**: `POST /api/webhooks/wazuh`, `/edr`, `/xdr` with a per-sender ingest token. Indicators (IPs, hashes, URLs,
+  domains, at most 25 per alert) are extracted and stored.
+* **Enrichment**: VirusTotal, AbuseIPDB, AlienVault OTX, ThreatFox (indicators) and NVD (CVE details). A provider without a
+  key reports `not_configured`; with no keys indicators stay `Unknown`. Rate limits are respected and retried.
+* **Playbooks**: 13 templates (ransomware, brute force, phishing, privilege escalation, web shell, exfiltration, lateral
+  movement, DDoS, credential dumping, SQL injection, supply chain, insider threat, reconnaissance), editable in the console.
+* **Response actions** (12): isolate/unisolate endpoint, terminate process, quarantine file, block/unblock IP, rate limit
+  (all through Wazuh active response), disable account, revoke sessions, force password reset (Okta), create ticket (Jira),
+  send notification (Slack).
+* **Guardrails**: protected hosts/users/IPs, simulation mode, an HOTL master switch that is **off by default**, MFA,
+  roles, audit log, encrypted secrets.
+* **AI triage (optional, off by default)**: OpenRouter-backed proposals, validated and policy-checked, waiting for a
+  human unless you change the autonomy setting. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+* **Console**: Dashboard, Alerts and Cases (Investigate drawer, approve/dismiss), AI Agent, Playbooks, Logs, Reports
+  (incident PDF per alert, analyst-activity PDF), Configuration, Accounts, My Security.
 
-### 2. Enterprise Integration Hub
-- **EDR Connector (`backend/integrations/edr.py`):** Network isolation and process termination.
-- **TIP Connector (`backend/integrations/tip.py`):** VirusTotal v3 and AbuseIPDB threat intelligence enrichment.
-- **Firewall Connector (`backend/integrations/firewall.py`):** Dynamic IP blocking and rate limiting.
-- **IAM Connector (`backend/integrations/iam.py`):** Account disabling and active OAuth/SSO token revocation.
-- **ITSM Connector (`backend/integrations/itsm.py`):** Automated Jira ticketing and webhook alerting.
+What it is **not**: there is no built-in alert source (you need Wazuh or another sender that posts JSON), no shipped
+Wazuh-side forwarder, no benchmark of throughput or response time (mean time to respond is the real elapsed time of each
+alert), and no high-availability setup (one API process, one worker with the scheduler).
 
----
+## Simulation and live mode
 
-## 📁 Repository Structure
+With **simulation mode on (the default)**, a connector without credentials records a clearly labelled `Simulated`
+action; nothing reaches a real system. A simulated action never counts as containment: an alert whose actions were all
+simulated gets status `Simulated`, not `Contained`, and running it again after the connector is configured performs the
+action for real. With simulation off, an unconfigured connector records `Skipped`. The "Generate demo data" button on the
+dashboard (admin only) works only in simulation mode and sends lab alerts through the real pipeline.
 
-```
-SOAR/
-├── docker-compose.yml              # Complete 5-tier multi-container orchestration
-├── .env.example                    # Configuration template
-├── backend/
-│   ├── config.py                   # Pydantic Settings & environment config
-│   ├── database.py                 # SQLAlchemy engine & SQLite/Postgres fallback
-│   ├── models.py                   # Alert, IocArtifact, Playbook, PlaybookExecution, ContainmentAction, IncidentReport
-│   ├── schemas.py                  # Pydantic v2 schemas
-│   ├── crud.py                     # Complete CRUD operations & get_ioc_artifacts_by_alert
-│   ├── celery_app.py               # Celery async background worker configuration
-│   ├── main.py                     # FastAPI application & router lifecycle
-│   ├── integrations/               # Modular connector framework
-│   │   ├── edr.py                  # Endpoint isolation & process termination
-│   │   ├── tip.py                  # VirusTotal & AbuseIPDB threat queries
-│   │   ├── firewall.py             # Perimeter IP blocking & rate limiting
-│   │   ├── iam.py                  # Active Directory / Okta user containment
-│   │   └── itsm.py                 # Jira tickets & webhook alerting
-│   ├── engine/
-│   │   ├── runner.py               # Automated HOTL / HITL severity routing engine
-│   │   ├── reporter.py             # ReportLab Platypus executive PDF report generator
-│   │   └── playbooks_catalog.py    # 12 pre-configured SANS / MITRE IR playbooks
-│   ├── routers/
-│   │   ├── webhooks.py             # POST /api/webhooks/wazuh
-│   │   ├── alerts.py               # GET, approve, dismiss, and PDF streaming
-│   │   ├── playbooks.py            # CRUD & toggle endpoints
-│   │   └── demo.py                 # POST /api/demo/seed
-│   ├── tests/                      # Pytest test suite (13 passing unit & integration tests)
-│   └── Dockerfile
-├── frontend/
-│   ├── src/
-│   │   ├── app/
-│   │   │   ├── page.tsx            # Real-time SOC metrics & "Generate Demo Data"
-│   │   │   ├── alerts/page.tsx     # Investigation Workspace & HITL action bar
-│   │   │   └── playbooks/page.tsx  # Playbook Library, 12 templates & JSON editor
-│   │   ├── components/
-│   │   │   ├── Sidebar.tsx         # Client component with active route highlighting
-│   │   │   ├── Navbar.tsx          # Real-time UTC clock & SOC status
-│   │   │   ├── InvestigateModal.tsx# Executive modal with IoCs, MITRE & PDF streaming
-│   │   │   └── PlaybookModal.tsx   # Live JSON workflow editor modal
-│   │   └── lib/
-│   │       ├── api.ts              # API client methods
-│   │       └── types.ts            # TypeScript models
-│   ├── package.json
-│   └── Dockerfile
-└── README.md
-```
+**Autonomous response (HOTL) is off by default.** It can only be switched on after protected users and hosts/IPs are
+configured, and even then a playbook runs without approval only if the playbook is a HOTL playbook chosen by a strong
+signal and a `Malicious` indicator is backed by live threat-intel data. Telemetry severity alone is never enough.
+Everything else waits in status `Triaged` for an analyst.
 
----
+**AI agent autonomy defaults to `recommend_only`**: every AI proposal waits for a human to approve it.
 
-## 🚀 Quickstart Guide
+## Quick start (Docker Compose)
 
-### Option 1: Docker Compose (Production Environment)
+Requires Docker Engine with the Compose plugin.
+
 ```bash
-docker-compose up --build
+python scripts/gen_env.py                 # creates .env with generated secrets (or: cp .env.example .env and fill it)
+docker compose up -d --build --wait       # Postgres, Redis, API, worker, console and the TLS proxy
+docker compose exec backend cat /app/run/bootstrap_admin_password.txt   # one-time admin password
 ```
-Services exposed:
-- **Frontend Dashboard:** [http://localhost:3000](http://localhost:3000)
-- **FastAPI Backend & Swagger Docs:** [http://localhost:8000/docs](http://localhost:8000/docs)
-- **PostgreSQL:** Port 5432
-- **Redis:** Port 6379
 
----
+Open <https://localhost> (a certificate from Caddy's internal CA: the browser warns until you trust it, see
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)), sign in as `admin`, change the password, delete the password file and enable
+MFA under *My Security*. To use a real DNS name and a Let's Encrypt certificate set `PHANTOM_DOMAIN` and
+`PHANTOM_PUBLISH_HOST=0.0.0.0`. Compose refuses to start until `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `PHANTOM_JWT_SECRET`
+and `PHANTOM_ENCRYPTION_KEY` are set; the API refuses to start in production without a strong JWT secret and a valid
+encryption key. Back the encryption key up separately from database backups.
 
-### Option 2: Local Development Environment
+Only the proxy publishes ports (80 and 443, on `127.0.0.1` unless you change `PHANTOM_PUBLISH_HOST`). Postgres and
+Redis are never published. For plain local development without TLS see `docker-compose.override.example.yml`.
 
-#### Backend:
+### Safe order to make it real
+
+1. Start with simulation **on** and HOTL **off** (the defaults). Click through the demo data, approve one alert, download
+   a PDF, enable MFA, create an ingest token and post a test alert with `curl`.
+2. List protected hosts, users and IPs on the Configuration page (your Wazuh manager, gateways, DNS, domain controllers,
+   break-glass admins; the manager, this server, loopback and the gateway are protected automatically).
+3. Add the threat-intel keys one by one and use the Test buttons. Free tiers rate-limit hard.
+4. Prepare Wazuh active response on **one lab agent** ([`wazuh/README.md`](wazuh/README.md)), then add the Wazuh API settings, with a CA bundle instead of disabling TLS verification.
+5. Add Okta, Jira and Slack, each against a sandbox or test project first.
+6. Only then turn simulation mode off (the API refuses to start in production with simulation on next to real credentials),
+   send a real low-severity test alert and approve its actions by hand.
+7. Enable HOTL last, if at all, and test it with one playbook you trust.
+
+[`LIVE_CHECKLIST.md`](LIVE_CHECKLIST.md) turns this order into a test plan with expected results and rollback steps.
+
+## Wazuh response architecture
+
+Phantom does not run commands on endpoints itself. It calls the **Wazuh manager API** (`PUT /active-response`) naming a
+command and one or more agents; the manager tells each agent to run the script. Wazuh ships only a few stock scripts, so
+the repository provides the rest in [`wazuh/`](wazuh/): `phantom-isolate-host`, `phantom-unisolate-host`,
+`phantom-block-ip`, `phantom-unblock-ip`, `phantom-rate-limit`, `phantom-kill-process`, `phantom-quarantine-file` for Linux
+(nftables) and Windows (Windows Firewall, PowerShell 5.1; rate limiting is not supported on Windows). The scripts validate
+their input strictly, refuse to touch the manager, loopback and an allow-list, and log every decision. Install them on each
+agent that should respond and create a Wazuh API user with the `active-response:command` permission. The Windows scripts
+could not be executed during development: dry-run them on a lab agent first.
+
+## Configuration
+
+Settings come from the Configuration page (stored in the database, secrets encrypted) or from environment variables; a value
+saved in the console wins. [`.env.example`](.env.example) documents every variable. The most important ones:
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `POSTGRES_PASSWORD`, `REDIS_PASSWORD` | compose | passwords of the bundled database and broker |
+| `PHANTOM_JWT_SECRET` | production | at least 32 random characters; signs login tokens |
+| `PHANTOM_ENCRYPTION_KEY` | production | Fernet key encrypting stored secrets (`PHANTOM_ENCRYPTION_KEYS` for rotation) |
+| `PHANTOM_ENV` | no | `development`, `production` (compose default) or `test` |
+| `PHANTOM_DOMAIN`, `PHANTOM_PUBLISH_HOST` | no | public name for the TLS certificate; interface to publish on |
+| `PHANTOM_BOOTSTRAP_ADMIN_USERNAME`, `PHANTOM_BOOTSTRAP_ADMIN_PASSWORD` | no | first admin; without a password a one-time one is written to a file |
+| `PHANTOM_INGEST_TOKEN` | no | legacy shared webhook token (ignored under 32 characters); prefer per-sender tokens |
+| `PHANTOM_REQUIRE_MFA_FOR_ADMIN` | no | admins must use MFA |
+| `PHANTOM_SIMULATION_MODE` | no | default `true` |
+| `PHANTOM_HOTL_ENABLED` | no | default `false` |
+| `PHANTOM_PROTECTED_HOSTS`, `PHANTOM_PROTECTED_USERS`, `PHANTOM_PROTECTED_IPS` | no | never touched by automated actions |
+| `PHANTOM_AGENT_AUTONOMY`, `PHANTOM_AGENT_MIN_CONFIDENCE` | no | `recommend_only` / 0.85 by default |
+| `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `PHANTOM_AI_ENABLED`, `PHANTOM_AI_AUTO_TRIAGE`, `PHANTOM_AI_MAX_ALERTS_PER_MINUTE`, `PHANTOM_AI_SEND_RAW_PAYLOAD` | no | AI triage, all off by default |
+| `VIRUSTOTAL_API_KEY`, `ABUSEIPDB_API_KEY`, `ALIENVAULT_OTX_API_KEY`, `THREATFOX_API_KEY`, `NVD_API_KEY` | no | threat intelligence |
+| `WAZUH_API_URL`, `WAZUH_API_USER`, `WAZUH_API_PASSWORD`, `WAZUH_VERIFY_TLS`, `WAZUH_CA_BUNDLE` | no | Wazuh manager API |
+| `OKTA_DOMAIN`, `OKTA_API_TOKEN` | no | Okta |
+| `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY`, `SLACK_WEBHOOK_URL` | no | ticketing and notifications |
+| `NEXT_PUBLIC_API_URL` | no | **build-time** API URL for the console; empty = same origin (default). Rebuild the frontend after changing it |
+
+## Backups and migrations
+
+* `docker compose --profile backup up -d backup` starts a daily `pg_dump` job with retention; `backup verify` restores the
+  newest dump into a scratch database and checks it. Restore instructions and the reports archive are in
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Copy backups off the host and test a restore before you rely on them.
+* Schema changes are Alembic migrations, applied automatically when the API starts (under a lock, so several processes
+  starting together do not race). `python -m backend.db_migrate current|check|upgrade` and `backend/alembic/README.md`
+  describe the details.
+
+## Local development (without Docker)
+
+Requires Python 3.12+ and Node.js 20+ (CI uses 22).
+
 ```bash
-# 1. Install Python dependencies
-pip install -r backend/requirements.txt
-
-# 2. Run backend test suite
-python -m pytest backend/tests -v
-
-# 3. Start FastAPI server
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+scripts/dev.sh              # Linux/macOS: API on 127.0.0.1:8000 and console on :3000 (Ctrl+C stops both)
+start_all.bat               # Windows: checks prerequisites and ports, opens two windows; any key stops both; stop_all.bat cleans up
+python -m pytest backend/tests -q        # backend tests (SQLite)
+cd frontend && npm ci && npx tsc --noEmit && npm run lint && npm run build
 ```
 
-#### Frontend:
-```bash
-# In frontend/ directory:
-npm install
-npm run dev
-```
+The dev scripts bind the API to loopback only, keep random development secrets in `.phantom_dev_secrets` (git-ignored) and
+read `.env` if present. Only set `BACKEND_HOST=0.0.0.0` on a trusted lab network: the dev server speaks plain HTTP.
 
----
+CI (`.github/workflows/ci.yml`) runs ruff, shellcheck, the backend tests on SQLite and on Postgres 16, `pip-audit`, the
+frontend typecheck/lint/build/`npm audit`, Docker builds of both images, and a Compose smoke test (HTTPS through the proxy,
+webhook ingest, backup and restore check).
 
-## 🎓 University Graduation Defense Demonstration Steps
+## Troubleshooting
 
-1. **Dashboard Launch:** Open [http://localhost:3000](http://localhost:3000).
-2. **Instant Demo Seeder:** Click the prominent **"Generate Demo Data"** button on the header banner.
-   - Instantly populates the database with:
-     - 12 SANS / MITRE IR Playbooks.
-     - **Critical LockBit 3.0 Ransomware Alert:** Executed under **HOTL (Human-On-The-Loop)** policy with automated endpoint isolation, process kill, IP block, and MTTR under 1.50 seconds.
-     - **Medium Spearphishing Alert:** Routed under **HITL (Human-In-The-Loop)** policy, set to `Triaged` awaiting analyst review.
-     - **High WebShell Attack:** Autonomously contained.
-3. **HITL Review & Analyst Sign-off:**
-   - Navigate to **"Alerts & Cases"** in the sidebar.
-   - Click on the **Medium Phishing alert (#2)**.
-   - The modal displays the **Executive IR Summary**, **IoC Artifacts & VirusTotal threat score**, **Containment timeline**, and **MITRE ATT&CK tags**.
-   - Click **"Approve Containment"** (Green button).
-   - The orchestrator instantly executes the containment actions, marks the alert `Contained`, calculates MTTR, and produces the executive incident report!
-4. **Download Executive Incident PDF Report:**
-   - Click **"Download PDF"** on any contained incident.
-   - The ReportLab engine streams the executive PDF incident report complete with SANS PICERL classification, Threat Intelligence scorecard, and containment signatures.
-5. **Playbook Library & Logic Editor:**
-   - Navigate to **"Playbooks"** in the sidebar.
-   - Inspect the 12 pre-configured SANS / MITRE cards.
-   - Click the **Power Toggle** to dynamically activate/deactivate a playbook (`PATCH`).
-   - Click the **Settings Icon** to launch the interactive live JSON workflow editor (`PUT`).
-   - Click **"New Playbook"** and select any template from the 12 pre-configured templates dropdown.
+* **Windows: `next dev` fails with `EINVAL` / `readlink` errors on `.next`, or builds are flaky.** The project is inside a
+  OneDrive (or other cloud-synced) folder; the sync client turns build files into placeholders that Next.js cannot read.
+  Move the project to a local folder outside OneDrive (for example `C:\dev\phantom-soar`) and delete `frontend\.next`.
+* **`required variable ... is missing a value`**: run `python scripts/gen_env.py`, or fill the REQUIRED values in `.env`.
+* **API exits with `Insecure configuration`**: JWT secret under 32 characters, or `PHANTOM_ENCRYPTION_KEY` missing or not a Fernet key.
+* **API exits with `... simulation mode ON while real connectors are configured`**: see the safe order above.
+* **A secret saved in the console shows as unset after a restart**: the encryption key changed; restore the old
+  `PHANTOM_ENCRYPTION_KEY` (or list it in `PHANTOM_ENCRYPTION_KEYS`).
+* **Locked out after failed sign-ins**: lockouts are per username and client address and expire on their own (15-minute window);
+  another admin can unlock an account on the Accounts page. There is no command-line password reset: keep a second admin
+  account (with MFA) and a recent database backup.
+
+## More documentation
+
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how it works), [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (TLS, backups,
+upgrades), [SECURITY.md](SECURITY.md) (reporting, threat model, key rotation, hardening checklist),
+[LIVE_CHECKLIST.md](LIVE_CHECKLIST.md) (manual test plan against real systems), [wazuh/README.md](wazuh/README.md),
+`backend/alembic/README.md`. Two generated guides ([HTML](Phantom_SOAR_Educational_Guide.html),
+[educational PDF](Phantom_SOAR_Educational_Guide.pdf), [architecture PDF](Phantom_SOAR_Master_Architecture_and_AI_Guide.pdf))
+are rebuilt with `python build_educational_pdf.py` and `python generate_architecture_pdf.py`.
+
+## License
+
+No license has been chosen yet; see [LICENSE](LICENSE). Until the owner adds one, all rights are reserved.

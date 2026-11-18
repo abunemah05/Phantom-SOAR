@@ -1,0 +1,99 @@
+# Phantom SOAR reverse proxy (Caddy 2): ONE origin for the console, the API and the webhooks.
+#
+#   https://<PHANTOM_DOMAIN>/                  -> frontend (Next.js)
+#   https://<PHANTOM_DOMAIN>/api/*             -> backend  (FastAPI), including /api/webhooks/* for Wazuh
+#   https://<PHANTOM_DOMAIN>/docs|redoc|openapi.json -> 404 (API docs are never exposed through the proxy)
+#
+# PHANTOM_DOMAIN (set in .env, default "localhost"):
+#   * a real DNS name that points at this host and is reachable on ports 80 and 443: Caddy obtains and
+#     renews a Let's Encrypt certificate automatically and redirects HTTP to HTTPS.
+#   * "localhost" (or an IP address): Caddy issues a certificate from its own internal CA. Browsers show
+#     a warning until you trust that CA; see docs/DEPLOYMENT.md ("Trusting the local certificate").
+# Caddy docs: https://caddyserver.com/docs/caddyfile  and  https://caddyserver.com/docs/automatic-https
+
+{
+	# No admin API socket (nothing here needs live reconfiguration).
+	admin off
+
+	servers {
+		# HTTP/1.1 and HTTP/2 only: HTTP/3 would need UDP 443 published as well.
+		protocols h1 h2
+		timeouts {
+			read_header 10s
+			read_body 60s
+			idle 2m
+		}
+	}
+}
+
+{$PHANTOM_DOMAIN:localhost} {
+	encode zstd gzip
+
+	# Largest request body accepted anywhere (the webhook endpoints cap themselves at 1 MiB, the
+	# console only sends small JSON). Larger requests get HTTP 413 from the proxy.
+	request_body {
+		max_size 2MB
+	}
+
+	# HSTS only for a real host name: browsers would otherwise pin "localhost" to HTTPS and break
+	# every other plain-HTTP development server on that name.
+	@real_host {
+		not host localhost 127.0.0.1
+	}
+	header @real_host Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# The interactive API docs are not exposed through the proxy (the backend also disables them in
+	# production). To use them, publish the backend port with docker-compose.override.example.yml.
+	# (Routing uses handle blocks, which run in the order written; a bare top-level "respond"
+	# would be evaluated after them.)
+	@api_docs path /docs /docs/* /redoc /redoc/* /openapi.json
+	handle @api_docs {
+		respond 404
+	}
+
+	# Optional: only let the Wazuh manager / your SIEM reach the webhook endpoints. Uncomment and
+	# replace the ranges. Note that Docker Desktop (Windows/macOS) hides the real client address
+	# behind its own gateway, so this only works as intended on a Linux Docker host.
+	#
+	# @webhook_from_elsewhere {
+	# 	path /api/webhooks/*
+	# 	not remote_ip 203.0.113.10 198.51.100.0/24
+	# }
+	# handle @webhook_from_elsewhere {
+	# 	respond 403
+	# }
+
+	handle /api/* {
+		header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		# A webhook can take a while when the Celery broker is down and the API processes the alert inline.
+		reverse_proxy backend:8000 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 120s
+			}
+		}
+	}
+
+	# Everything else is the console. The Next.js app sends its own Content-Security-Policy.
+	handle {
+		reverse_proxy frontend:3000 {
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 60s
+			}
+		}
+	}
+}
+
+# Container health probe only: loopback inside the proxy container, not published.
+http://127.0.0.1:8081 {
+	bind 127.0.0.1
+	respond /healthz 200
+}
