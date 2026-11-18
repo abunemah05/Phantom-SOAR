@@ -314,6 +314,47 @@ def test_quarantine_refuses_symlinks_system_paths_and_relative(env, tmp_path):
     assert rc == 1
 
 
+# --- review fixes: strict IPs, protected processes, symlinked directories ------------------------------
+
+@pytest.mark.parametrize("bad", ["::ffff:198.51.100.7", "::ffff:203.0.113.9", "0:0:0:0:0:ffff:c633:6407"])
+def test_ipv4_mapped_ipv6_is_rejected_so_it_cannot_bypass_manager_and_allowlist_checks(env, bad):
+    rc, log = run(env, "block-ip", bad, "1", "both")
+    assert rc == 2 and "IPv4-mapped" in log and executed(log) == []
+
+
+def test_connector_sends_the_plain_ipv4_form_of_a_mapped_address():
+    from backend.integrations import firewall
+    assert firewall._clean_ip("::ffff:198.51.100.7") == "198.51.100.7"
+    assert firewall._clean_ip("2001:db8::1") == "2001:db8::1"
+
+
+@pytest.mark.parametrize("name", ["sshd-session", "sshd-auth", "containerd-shim-runc-v2", "dbus-broker", "wazuh-execd",
+                                  "phantom-kill-process", "cron", "rsyslogd", "NetworkManager", "systemd-resolved"])
+def test_protected_process_list_covers_helpers_and_daemons(env, monkeypatch, name):
+    mod = load_module(env, monkeypatch)
+    assert mod._is_protected_process(name, None) and mod._is_protected_process(None, name)
+
+
+def test_ordinary_process_names_are_not_protected(env, monkeypatch):
+    mod = load_module(env, monkeypatch)
+    for name in ("sleep", "evil", "python3", "xmrig"):
+        assert not mod._is_protected_process(name, name)
+
+
+def test_quarantine_refuses_a_protected_path_reached_through_a_symlinked_directory(env, tmp_path):
+    hidden = tmp_path / "etc-link"
+    hidden.symlink_to("/etc")
+    # dry-run on purpose: a regression must not be able to move a real system file
+    rc, log = run(env, "quarantine-file", str(hidden / "passwd"))
+    assert rc == 1 and "protected location" in log and "would move file" not in log
+
+
+def test_path_is_extended_for_minimal_execd_environments(env, monkeypatch):
+    monkeypatch.setenv("PATH", "/nonexistent")
+    load_module(env, monkeypatch)
+    assert "/usr/sbin" in os.environ["PATH"].split(os.pathsep)
+
+
 # --- protocol handling -----------------------------------------------------------------------------
 
 @pytest.mark.parametrize("raw", ["", "not json", "[]", "null", '{"command":"add","parameters":{"extra_args":"x"}}',
@@ -417,6 +458,10 @@ def test_windows_script_is_strict_and_refuses_the_right_things():
                    "is loopback", "ReparsePoint", "New-NetFirewallRule", "Register-ScheduledTask",
                    "Set-NetFirewallProfile", "not supported on Windows", "active-responses.log", "PHANTOM_AR_DRY_RUN"):
         assert needle in ps1, needle
+    # review fixes (static: no PowerShell here): strict dotted-quad IPv4, no mapped IPv6, wider protected lists
+    for needle in ("$octet", "IPv4-mapped IPv6 addresses are not accepted", "'registry'", "'sshd'", "'cmd'", "$PID",
+                   "Program Files (x86)", "is a link or junction"):
+        assert needle in ps1, needle
     assert "phantom-ar.ps1" in cmd and "%~n0" in cmd and "-ExecutionPolicy Bypass" in cmd
     assert "%1" not in cmd and "%*" not in cmd  # nothing from the command line reaches PowerShell
 
@@ -425,3 +470,13 @@ def test_linux_script_never_uses_a_shell():
     source = SCRIPT.read_text()
     assert "shell=True" not in source and "os.system" not in source and "os.popen" not in source
     assert source.startswith("#!/usr/bin/env python3") and os.access(SCRIPT, os.X_OK)
+
+
+def test_linux_installer_handles_old_and_new_group_names_and_is_shellcheck_clean():
+    installer = WAZUH_DIR / "linux" / "install-linux.sh"
+    text = installer.read_text()
+    assert "getent group wazuh" in text and "getent group ossec" in text and "-g wazuh" not in text
+    assert "/var/ossec/active-response/bin" in text and "-m 0750" in text
+    if shutil.which("shellcheck"):
+        proc = subprocess.run(["shellcheck", str(installer)], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout

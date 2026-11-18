@@ -5,26 +5,46 @@ each action authenticates against the Wazuh API (the JWT is cached until shortly
 before it expires) and sends an active-response command to the alert's Wazuh
 agent. Otherwise the action is simulated (when simulation mode is on) or skipped.
 
-Request shape, verified against the Wazuh 4.x server API (v4.9 OpenAPI spec and
-framework/wazuh/active_response.py):
+Request shape, checked against the official Wazuh sources and docs (Wazuh manager and agents >= 4.2.0):
 
-* PUT /active-response?agents_list=<id>[,<id>...]   (omitting agents_list would
-  target EVERY agent, so this client never sends a request without agent ids and
-  refuses agent 000, the manager itself)
-* body {"command": ..., "arguments": [...], "alert": {"data": {...}}}
-  https://documentation.wazuh.com/current/user-manual/api/reference.html
-* A command that does not start with "!" must be a name listed in the manager's
-  etc/shared/ar.conf. Those names are "<command name><timeout>" (e.g.
-  "firewall-drop600"), so the bare name "firewall-drop" is rejected (error 1652).
-  A command starting with "!" names a script in the agent's active-response/bin
-  directory that is run directly, with no <command>/<active-response> blocks and
-  no automatic timeout/"delete" message.
-  https://github.com/wazuh/wazuh/blob/v4.9.0/src/os_execd/exec.c (GetCommandbyName)
-* Agents older than 4.2.0 receive a legacy string message instead of JSON; the
-  scripts in wazuh/ require agents >= 4.2.0.
-* POST /security/user/authenticate (HTTP Basic) returns {"data": {"token": jwt}};
-  the token lives auth_token_exp_timeout seconds (default 900).
+* PUT /active-response?agents_list=<id>[,<id>...]   agents_list is "a list of agent IDs (separated by
+  comma), all agents selected by default if not specified" (API spec, parameter agents_list), so omitting it
+  would target EVERY agent: this client never sends a request without agent ids and refuses agent 000, the
+  manager itself (API error 1703).
+* body {"command": ..., "arguments": [...], "alert": {"data": {...}}}; "arguments" is an array of strings,
+  "alert" an object with a "data" object, "command" is the only required field. Spec (ActiveResponseBody):
+  https://github.com/wazuh/wazuh/blob/v4.14.0/api/api/spec/spec.yaml
+  Rendered reference: https://documentation.wazuh.com/current/user-manual/api/reference.html
+  (Active-response > Run command).
+* The body has NO "custom" field, on purpose. Older managers (4.2 to 4.7) accepted `"custom": bool`, but it only
+  changed anything for agents older than 4.2.0 (it prepended "!" to the name for the legacy text message);
+  for agents >= 4.2.0 the JSON message is built from the command exactly as sent
+  (create_json_message in https://github.com/wazuh/wazuh/blob/v4.7.0/framework/wazuh/core/active_response.py).
+  Managers >= 4.8.0 REMOVED the field ("Removed `custom` parameter from `PUT /active-response` endpoint",
+  https://github.com/wazuh/wazuh/blob/v4.8.0/CHANGELOG.md, PR 17048) and reject unknown body keys with HTTP 400
+  "Invalid field found ['custom']" (Body.get_kwargs in api/api/models/base_model_.py). Sending "custom": true
+  would therefore break every manager >= 4.8. The version-independent way to run a custom script is the
+  documented "!" prefix: "If this value starts with `!`, then it refers to a script name instead of a command
+  name" (spec text above).
+* A command that does not start with "!" must be a name listed in the manager's etc/shared/ar.conf (otherwise
+  error 1652 "The command used is not defined in the configuration"; validate_command in
+  https://github.com/wazuh/wazuh/blob/v4.14.0/framework/wazuh/core/active_response.py). Those names are
+  "<command name><timeout>" (e.g. "firewall-drop600"; src/config/active-response.c), so the bare name
+  "firewall-drop" is rejected. A command starting with "!" names a script in the agent's active-response/bin
+  directory that execd runs directly, with no <command>/<active-response> blocks and no automatic
+  timeout/"delete" message (GetCommandbyName in https://github.com/wazuh/wazuh/blob/v4.9.0/src/os_execd/exec.c;
+  the API only accepts an optional leading "!" followed by word characters, "-", ".", "/", "\\" and ":"
+  in the name, api/api/validator.py, so "!phantom-block-ip.cmd" is valid).
+* Agents older than 4.2.0 receive a legacy string message instead of JSON; the scripts in wazuh/ require agents
+  >= 4.2.0 and so a manager >= 4.2.0. Other errors surfaced in failed_items: 1707 (agent not active), 1750
+  (active-response disabled in the agent's ossec.conf).
+* POST /security/user/authenticate (HTTP Basic) returns {"data": {"token": jwt}}; with ?raw=true (what the
+  docs recommend for curl) the body is the bare token instead. This client uses the JSON form because it also
+  carries error details. The token is sent as "Authorization: Bearer <jwt>" and lives auth_token_exp_timeout
+  seconds (default 900).
   https://documentation.wazuh.com/current/user-manual/api/getting-started.html
+* TLS: the manager API uses a self-signed certificate by default (the docs use curl -k for that reason); here
+  verification stays on unless siem_verify_tls=false, and wazuh_ca_bundle pins the CA (see below).
 
 So by default every command name is sent with a "!" prefix (setting
 wazuh_ar_script_prefix=true). The scripts shipped in the repo's wazuh/ folder

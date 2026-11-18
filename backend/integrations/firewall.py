@@ -46,9 +46,13 @@ def _firewall_agents(agent_id: Optional[str]) -> List[str]:
 
 def _clean_ip(ip_address: str) -> Optional[str]:
     try:
-        return str(ipaddress.ip_address(str(ip_address).strip()))
+        ip = ipaddress.ip_address(str(ip_address).strip())
     except ValueError:
         return None
+    # the agent scripts reject ::ffff:a.b.c.d (it would bypass their IPv4 manager/allow-list checks): send the IPv4 form
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return str(ip)
 
 
 def _hours_setting(key: str, fallback: int) -> int:

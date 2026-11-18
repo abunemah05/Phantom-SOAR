@@ -38,6 +38,9 @@ import subprocess
 import sys
 import time
 
+# execd may start the script with a minimal PATH that lacks /usr/sbin (nft, ip live there on many distributions)
+os.environ["PATH"] = os.pathsep.join(p for p in (os.environ.get("PATH"), "/usr/sbin", "/usr/bin", "/sbin", "/bin") if p)
+
 OSSEC_DIR = os.environ.get("PHANTOM_AR_OSSEC_DIR", "/var/ossec")
 LOG_FILE = os.environ.get("PHANTOM_AR_LOG", os.path.join(OSSEC_DIR, "logs", "active-responses.log"))
 ALLOWLIST_FILE = os.environ.get("PHANTOM_AR_ALLOWLIST", os.path.join(OSSEC_DIR, "etc", "phantom-allowlist.txt"))
@@ -58,8 +61,11 @@ HASH_RE = re.compile(r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 PROTECTED_PROCESSES = {
     "init", "systemd", "sshd", "dbus-daemon", "kthreadd", "nft", "iptables", "login", "agetty",
     "systemd-journald", "systemd-logind", "systemd-udevd", "containerd", "dockerd", "phantom-ar",
+    "cron", "crond", "rsyslogd", "auditd", "udevd", "polkitd", "NetworkManager", "chronyd", "ntpd",
 }
-PROTECTED_PREFIXES = ("wazuh-", "ossec", "systemd")
+# Prefixes also cover helper processes such as sshd-session / sshd-auth (OpenSSH >= 9.8 runs every login in one),
+# containerd-shim-*, dbus-broker, wazuh-agentd / wazuh-execd / wazuh-modulesd and phantom-* (this script itself).
+PROTECTED_PREFIXES = ("wazuh-", "ossec", "systemd", "sshd", "containerd", "dbus", "phantom-")
 PROTECTED_PATHS = (
     "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/proc", "/root", "/run",
     "/sbin", "/sys", "/usr/bin", "/usr/sbin", "/usr/lib", "/var/ossec", "/var/lib/dpkg", "/var/lib/rpm",
@@ -119,9 +125,13 @@ def parse_ip(text):
     if not isinstance(text, str) or not re.fullmatch(r"[0-9A-Fa-f:.]{2,45}", text):
         raise BadInput("not an IP address")
     try:
-        return ipaddress.ip_address(text)
+        ip = ipaddress.ip_address(text)
     except ValueError as exc:
         raise BadInput("not an IP address") from exc
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        # ::ffff:a.b.c.d would slip past the IPv4 manager / allow-list comparisons: only the plain form is accepted
+        raise BadInput("IPv4-mapped IPv6 addresses are not accepted; use the IPv4 address")
+    return ip
 
 
 def parse_hours(text, default):
@@ -422,10 +432,16 @@ def quarantine_file(path, expected_hash):
     if "\0" in path or not os.path.isabs(path) or len(path) > 4096:
         raise BadInput("path must be absolute")
     path = os.path.normpath(path)
-    if any(path == p or path.startswith(p.rstrip("/") + "/") for p in PROTECTED_PATHS if p != "/") or path == "/":
-        raise Refused(f"{path} is in a protected location")
-    if os.path.commonpath([os.path.abspath(QUARANTINE_DIR), path]) == os.path.abspath(QUARANTINE_DIR):
-        raise Refused("file is already in quarantine")
+    # Symlinked directories in the path must not hide a protected location (/tmp/link -> /etc): check the path
+    # as given AND with its directory resolved (this also covers merged-/usr, where /bin is /usr/bin).
+    resolved = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+    quarantine_root = os.path.realpath(QUARANTINE_DIR)
+    for candidate in dict.fromkeys((path, resolved)):
+        if candidate == "/" or any(candidate == p or candidate.startswith(p.rstrip("/") + "/")
+                                   for p in PROTECTED_PATHS if p != "/"):
+            raise Refused(f"{path} is in a protected location")
+        if os.path.commonpath([quarantine_root, candidate]) == quarantine_root:
+            raise Refused("file is already in quarantine")
     try:
         info = os.lstat(path)
     except OSError:

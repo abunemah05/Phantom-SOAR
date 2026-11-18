@@ -123,6 +123,80 @@ def test_manager_agent_and_malformed_agent_ids_are_refused_without_calls(setting
     assert fake.requests == []
 
 
+# Body schema of PUT /active-response, from the official API spec (ActiveResponseBody) at
+# https://github.com/wazuh/wazuh/blob/v4.14.0/api/api/spec/spec.yaml : properties arguments (array of strings),
+# command (string, required, "!" prefix = script name), alert ({"data": object}). There is deliberately no
+# "custom" property: it was only used for agents < 4.2.0 and was removed in manager 4.8.0 (CHANGELOG 4.8.0,
+# "Removed `custom` parameter from `PUT /active-response` endpoint"), which answers 400 "Invalid field found
+# ['custom']" for any unknown key (api/api/models/base_model_.py get_kwargs).
+DOCUMENTED_BODY_KEYS = {"command", "arguments", "alert"}
+# Name pattern accepted by the API validator (api/api/validator.py _active_response_command).
+API_COMMAND_RE = r"^!?[\w\-.\\/:]+$"
+
+ALL_ACTIONS = [
+    ("isolate", lambda: edr_client.isolate_endpoint("h", agent_id="004")),
+    ("unisolate", lambda: edr_client.unisolate_endpoint("h", agent_id="004")),
+    ("kill", lambda: edr_client.terminate_process("evil.exe", agent_id="004", pid=4242)),
+    ("quarantine", lambda: edr_client.quarantine_file("/tmp/x", agent_id="004", file_hash="ab" * 32)),
+    ("block", lambda: firewall_client.block_ip("198.51.100.45", agent_id="004", duration_hours=2)),
+    ("unblock", lambda: firewall_client.unblock_ip("198.51.100.45", agent_id="004")),
+    ("rate", lambda: firewall_client.apply_rate_limit("198.51.100.45", agent_id="004")),
+]
+
+
+@pytest.mark.parametrize("name,call", ALL_ACTIONS, ids=[a[0] for a in ALL_ACTIONS])
+def test_every_action_body_matches_the_documented_schema_without_custom(settings, monkeypatch, name, call):
+    import re
+    fake = Wazuh(monkeypatch)
+    assert call()["status"] == "Success"
+    req = fake.ar_requests[0]
+    body = json.loads(req.content)
+    assert set(body) == DOCUMENTED_BODY_KEYS
+    assert "custom" not in body
+    assert isinstance(body["command"], str) and body["command"].startswith("!phantom-")
+    assert re.match(API_COMMAND_RE, body["command"])
+    assert isinstance(body["arguments"], list) and all(isinstance(a, str) for a in body["arguments"])
+    assert isinstance(body["alert"], dict) and isinstance(body["alert"]["data"], dict)
+    assert req.method == "PUT" and req.url.path == "/active-response"
+    assert req.headers["content-type"].startswith("application/json")
+    assert req.headers["authorization"].startswith("Bearer ")
+    assert list(req.url.params) == ["agents_list"]  # no other query keys; agents_list is never empty
+
+
+def test_windows_command_name_is_still_valid_for_the_api(settings, monkeypatch):
+    import re
+    settings["wazuh_windows_agent_ids"] = "004"
+    fake = Wazuh(monkeypatch)
+    edr_client.isolate_endpoint("h", agent_id="004")
+    body = json.loads(fake.ar_requests[0].content)
+    assert body["command"] == "!phantom-isolate-host.cmd" and re.match(API_COMMAND_RE, body["command"])
+    assert set(body) == DOCUMENTED_BODY_KEYS
+
+
+def test_login_is_post_with_basic_auth_and_no_body(settings, monkeypatch):
+    # https://documentation.wazuh.com/current/user-manual/api/getting-started.html :
+    # POST /security/user/authenticate with HTTP Basic credentials; the JWT then goes in "Authorization: Bearer".
+    fake = Wazuh(monkeypatch)
+    edr_client.isolate_endpoint("h", agent_id="004")
+    login = fake.requests[0]
+    assert login.method == "POST" and login.url.path == "/security/user/authenticate"
+    expected = base64.b64encode(b"wazuh-wui:wazuh-secret").decode()
+    assert login.headers["authorization"] == f"Basic {expected}"
+    assert login.url.params.get("raw") is None  # JSON form ({"data": {"token": ...}}) is parsed, not raw=true
+    assert fake.requests[1].headers["authorization"].startswith("Bearer ey")
+
+
+def test_agents_list_is_comma_separated_ids_never_all_or_empty(settings, monkeypatch):
+    settings["wazuh_firewall_agent_ids"] = "010, 011\n012"
+    fake = Wazuh(monkeypatch, affected=("010", "011", "012"))
+    firewall_client.block_ip("198.51.100.45")
+    assert fake.ar_requests[0].url.params["agents_list"] == "010,011,012"
+    fake.requests.clear()
+    settings["wazuh_firewall_agent_ids"] = ""
+    assert firewall_client.block_ip("198.51.100.45")["status"] == "Failed"  # no agent known: no request at all
+    assert fake.requests == []
+
+
 # --- JWT cache ----------------------------------------------------------------------------
 
 def test_token_is_cached_across_actions(settings, monkeypatch):

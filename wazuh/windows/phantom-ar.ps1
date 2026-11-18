@@ -61,8 +61,18 @@ function Test-DryRun([string]$What) {
 # --- validation ------------------------------------------------------------------------
 function ConvertTo-StrictIp([string]$Text) {
     if ($Text -notmatch '^[0-9A-Fa-f:.]{2,45}$') { throw [BadInput]::new('not an IP address') }
+    # .NET also accepts shorthand such as '10', '127.1' or '3232235777' as IPv4: require the plain dotted quad
+    $octet = '(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+    if ($Text -notmatch ':' -and $Text -notmatch ('^(' + $octet + '\.){3}' + $octet + '$')) { throw [BadInput]::new('not an IP address') }
     $ip = $null
     if (-not [System.Net.IPAddress]::TryParse($Text, [ref]$ip)) { throw [BadInput]::new('not an IP address') }
+    if ($ip.AddressFamily -eq 'InterNetworkV6') {
+        # ::ffff:a.b.c.d would slip past the IPv4 manager / allow-list comparisons
+        $b = $ip.GetAddressBytes()
+        if (@($b[0..9] | Where-Object { $_ -ne 0 }).Count -eq 0 -and $b[10] -eq 255 -and $b[11] -eq 255) {
+            throw [BadInput]::new('IPv4-mapped IPv6 addresses are not accepted; use the IPv4 address')
+        }
+    }
     return $ip
 }
 
@@ -220,7 +230,9 @@ function Invoke-Unisolate {
 }
 
 # --- processes and files ---------------------------------------------------------------
-$ProtectedProcesses = @('system', 'idle', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass', 'svchost', 'ossec-agent', 'wazuh-agent', 'powershell', 'dwm', 'explorer')
+$ProtectedProcesses = @('system', 'idle', 'registry', 'memory compression', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass',
+    'lsaiso', 'lsm', 'svchost', 'spoolsv', 'fontdrvhost', 'sihost', 'taskhostw', 'ctfmon', 'msmpeng', 'sshd', 'conhost', 'cmd',
+    'ossec-agent', 'wazuh-agent', 'powershell', 'pwsh', 'dwm', 'explorer')
 
 function Invoke-Kill([string]$Name, [string]$PidText) {
     $leaf = ($Name -replace '/', '\').Split('\')[-1] -replace '\.exe$', ''
@@ -236,6 +248,7 @@ function Invoke-Kill([string]$Name, [string]$PidText) {
         if ($procs.Count -eq 0) { throw [Refused]::new("no running process named '$leaf'") }
         if ($procs.Count -gt 10) { throw [Refused]::new("$($procs.Count) processes match '$leaf'; refusing to kill more than 10") }
     }
+    if (@($procs | Where-Object { $_.Id -eq $PID }).Count -gt 0) { throw [Refused]::new('refusing to stop the active-response script itself') }
     if (Test-DryRun "stop $($procs.Count) process(es) named $leaf") { return 'dry run: kill' }
     $procs | Stop-Process -Force
     return "killed $leaf pid(s) " + (($procs | ForEach-Object { $_.Id }) -join ',')
@@ -244,12 +257,19 @@ function Invoke-Kill([string]$Name, [string]$PidText) {
 function Invoke-Quarantine([string]$Path, [string]$Hash) {
     if ($Path -notmatch '^[A-Za-z]:\\' -or $Path.Contains([char]0) -or $Path.Length -gt 1024 -or $Path -match '(^|\\)\.\.(\\|$)') { throw [BadInput]::new('path must be an absolute drive path without ..') }
     $Path = [System.IO.Path]::GetFullPath($Path)
-    foreach ($prefix in "$env:SystemRoot\", 'C:\Program Files\', "$AgentDir\", 'C:\ProgramData\phantom-quarantine\') {
+    foreach ($prefix in "$env:SystemRoot\", 'C:\Program Files\', 'C:\Program Files (x86)\', "$AgentDir\", 'C:\ProgramData\phantom-quarantine\') {
         if ($Path.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { throw [Refused]::new("$Path is in a protected location") }
     }
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     if (-not $item -or $item.PSIsContainer) { throw [Refused]::new("$Path is not an existing file") }
     if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw [Refused]::new("$Path is a link (links are not followed)") }
+    # a junction/symlink further up the path could hide a protected location behind an innocent-looking prefix
+    $dir = [System.IO.Path]::GetDirectoryName($Path)
+    while ($dir) {
+        $parent = Get-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue
+        if ($parent -and ($parent.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { throw [Refused]::new("$dir is a link or junction (links are not followed)") }
+        $dir = [System.IO.Path]::GetDirectoryName($dir)
+    }
     $sha = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
     if ($Hash) {
         if ($Hash -notmatch '^([0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$') { throw [BadInput]::new('invalid hash') }
