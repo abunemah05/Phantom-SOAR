@@ -1,7 +1,9 @@
 "use client";
 
-import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
+import { describeError } from "@/lib/errors";
+import { usePolling } from "@/hooks/usePolling";
 import { RuntimeStatus } from "@/lib/types";
 
 interface RuntimeStatusContextValue {
@@ -25,25 +27,23 @@ export function RuntimeStatusProvider({ children }: { children: React.ReactNode 
 
   const refresh = useCallback(async () => {
     try {
-      const next = await api.getRuntimeStatus();
-      setStatus(next);
+      setStatus(await api.getRuntimeStatus());
       setError(null);
-    } catch (err: any) {
-      setError(err?.message || "Runtime status unavailable.");
+    } catch (err) {
+      // Keep the last known status (if any) but surface the failure instead of hiding it.
+      setError(describeError(err, "Runtime status unavailable."));
     }
   }, []);
 
   useEffect(() => {
-    refresh();
-    const interval = setInterval(refresh, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+    void refresh();
   }, [refresh]);
 
-  return (
-    <RuntimeStatusContext.Provider value={{ status, error, refresh }}>
-      {children}
-    </RuntimeStatusContext.Provider>
-  );
+  // Paused while the tab is hidden; refreshes once when it becomes visible again.
+  usePolling(() => void refresh(), POLL_INTERVAL_MS);
+
+  const value = useMemo(() => ({ status, error, refresh }), [status, error, refresh]);
+  return <RuntimeStatusContext.Provider value={value}>{children}</RuntimeStatusContext.Provider>;
 }
 
 export function useRuntimeStatus(): RuntimeStatusContextValue {

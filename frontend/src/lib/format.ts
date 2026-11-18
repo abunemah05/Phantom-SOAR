@@ -41,3 +41,16 @@ export function formatTimeOfDay(value?: string | null, fallback = "—"): string
   const d = parseApiDate(value);
   return d ? d.toLocaleTimeString() : fallback;
 }
+
+/** "12s ago" / "5m ago" / "3h ago" relative to now. */
+export function formatTimeAgo(value?: string | null, now: number = Date.now()): string {
+  const d = parseApiDate(value);
+  if (!d) return "\u2014";
+  const diffSec = Math.max(0, Math.floor((now - d.getTime()) / 1000));
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHour = Math.floor(diffMin / 60);
+  if (diffHour < 48) return `${diffHour}h ago`;
+  return `${Math.floor(diffHour / 24)}d ago`;
+}

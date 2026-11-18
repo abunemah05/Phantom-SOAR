@@ -11,6 +11,7 @@ from backend.models import (
     PlaybookExecution,
     ContainmentAction,
     IncidentReport,
+    User,
 )
 from backend.schemas import AlertCreate, PlaybookCreate
 
@@ -298,12 +299,15 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
 
     avg_mttr_seconds averages executions that actually contained an alert (mttr_seconds > 0)
     and is None when there are none; mttr_sample_size says how many runs it covers.
-    automated_actions counts actions that ran live or simulated; the per-mode counts say which.
+    live_actions / simulated_actions count every action that ran in that mode, whoever started it.
+    automated_actions counts only those NOT run by a signed-in person (playbook engine, built-in AI, agent service
+    accounts): an analyst clicking "approve" is a human decision, not automation.
     """
     total_alerts = db.query(Alert).count()
     new_alerts = db.query(Alert).filter(Alert.status == "New").count()
     triaged_alerts = db.query(Alert).filter(Alert.status == "Triaged").count()
     contained_alerts = db.query(Alert).filter(Alert.status == "Contained").count()
+    simulated_alerts = db.query(Alert).filter(Alert.status == "Simulated").count()
     resolved_alerts = db.query(Alert).filter(Alert.status.in_(["Resolved", "Closed"])).count()
     unresolved_alerts = db.query(Alert).filter(~Alert.status.in_(["Resolved", "Closed"])).count()
     review_gates_count = db.query(Alert).filter(Alert.status.in_(["Triaged", "New"])).count()
@@ -315,6 +319,13 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
     )
     live_actions = int(mode_counts.get("live", 0))
     simulated_actions = int(mode_counts.get("simulated", 0))
+    human_names = db.query(User.username).filter(User.is_service_account.is_(False))
+    automated_actions = (
+        db.query(func.count(ContainmentAction.action_id))
+        .filter(ContainmentAction.execution_mode.in_(["live", "simulated"]),
+                ~ContainmentAction.executed_by.in_(human_names))
+        .scalar()
+    ) or 0
 
     mttr_avg, mttr_count = (
         db.query(func.avg(PlaybookExecution.mttr_seconds), func.count(PlaybookExecution.execution_id))
@@ -332,10 +343,11 @@ def get_dashboard_metrics(db: Session) -> Dict[str, Any]:
         "new_alerts": new_alerts,
         "triaged_alerts": triaged_alerts,
         "contained_alerts": contained_alerts,
+        "simulated_alerts": simulated_alerts,  # rehearsed only: not contained, not resolved
         "resolved_alerts": resolved_alerts,
         "unresolved_alerts": unresolved_alerts,
         "review_gates_count": review_gates_count,
-        "automated_actions": live_actions + simulated_actions,
+        "automated_actions": int(automated_actions),
         "live_actions": live_actions,
         "simulated_actions": simulated_actions,
         "blocked_actions": int(mode_counts.get("blocked", 0)),

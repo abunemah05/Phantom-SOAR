@@ -1,8 +1,8 @@
 from datetime import datetime, timezone
 import json
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float, Text, JSON
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Float, Text, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
-from backend.database import Base
+from backend.database import Base, UTCDateTime  # UTCDateTime: aware-UTC DateTime column type (see database.py)
 
 def utc_now():
     return datetime.now(timezone.utc)
@@ -19,18 +19,18 @@ class User(Base):
 
     # NIST SP 800-63B Authentication & MFA Additions
     mfa_enabled = Column(Boolean, default=False, nullable=False)
-    mfa_secret = Column(String(64), nullable=True)  # RFC 6238 TOTP Base32 secret
-    password_changed_at = Column(DateTime, default=utc_now, nullable=False)
+    mfa_secret = Column(String(255), nullable=True)  # RFC 6238 TOTP Base32 secret (wide enough for the encrypted form)
+    password_changed_at = Column(UTCDateTime, default=utc_now, nullable=False)
     compromised_reset_required = Column(Boolean, default=False, nullable=False)  # Resets ONLY on suspicion
     failed_login_attempts = Column(Integer, default=0, nullable=False)
-    locked_until = Column(DateTime, nullable=True)  # Temporary rate-limiting against brute force
+    locked_until = Column(UTCDateTime, nullable=True)  # Temporary rate-limiting against brute force
 
     # Service accounts (AI agents, integrations) authenticate with an API key instead of a password
     is_service_account = Column(Boolean, default=False, nullable=False)
     api_key_hash = Column(String(255), nullable=True)
     api_key_prefix = Column(String(16), nullable=True, index=True)
 
-    created_at = Column(DateTime, default=utc_now, nullable=False)
+    created_at = Column(UTCDateTime, default=utc_now, nullable=False)
 
     def to_dict(self):
         return {
@@ -49,13 +49,16 @@ class User(Base):
 
 class SystemConfig(Base):
     __tablename__ = "system_configs"
+    __table_args__ = (
+        UniqueConstraint("category", "key_name", name="uq_system_configs_category_key_name"),
+    )
 
     config_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     category = Column(String(50), index=True, nullable=False)  # AI, EDR, XDR, SIEM, TIP, FIREWALL, ITSM
     key_name = Column(String(100), index=True, nullable=False)
-    key_value = Column(String(1000), default="", nullable=False)
+    key_value = Column(Text, default="", nullable=False)  # Text: encrypted values are longer than plain ones
     is_secret = Column(Boolean, default=True, nullable=False)
-    updated_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(UTCDateTime, default=utc_now, nullable=False)
 
     def to_dict(self):
         return {
@@ -82,9 +85,9 @@ class Alert(Base):
     # RBAC & Analyst Assignment Tracking
     assigned_analyst = Column(String(50), nullable=True, index=True)
     resolved_by = Column(String(50), nullable=True, index=True)
-    resolved_at = Column(DateTime, nullable=True)
+    resolved_at = Column(UTCDateTime, nullable=True)
 
-    created_at = Column(DateTime, default=utc_now, nullable=False)
+    created_at = Column(UTCDateTime, default=utc_now, nullable=False)
 
     # Relationships
     ioc_artifacts = relationship("IocArtifact", back_populates="alert", cascade="all, delete-orphan")
@@ -122,7 +125,7 @@ class IocArtifact(Base):
     verdict = Column(String(20), default="Unknown", nullable=False)  # Malicious, Suspicious, Clean, Unknown
     enrichment_status = Column(String(30), default="pending", nullable=False)  # enriched, partial, unavailable, not_configured, pending
     tip_results = Column(JSON, nullable=True)  # per-provider results, each with its own status
-    created_at = Column(DateTime, default=utc_now, nullable=False)
+    created_at = Column(UTCDateTime, default=utc_now, nullable=False)
 
     # Relationship
     alert = relationship("Alert", back_populates="ioc_artifacts")
@@ -150,10 +153,12 @@ class Playbook(Base):
     execution_mode = Column(String(20), default="HOTL", nullable=False)  # HOTL or HITL
     workflow_logic = Column(Text, nullable=False)  # JSON or YAML string
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=utc_now, nullable=False)
+    created_at = Column(UTCDateTime, default=utc_now, nullable=False)
 
     # Relationship
-    executions = relationship("PlaybookExecution", back_populates="playbook", cascade="all, delete-orphan")
+    # Deleting a playbook keeps its execution history (MTTR and audit records): the database
+    # FK is ON DELETE SET NULL and the ORM does the same, so both layers agree.
+    executions = relationship("PlaybookExecution", back_populates="playbook")
 
     def to_dict(self):
         try:
@@ -179,7 +184,7 @@ class PlaybookExecution(Base):
     playbook_id = Column(Integer, ForeignKey("playbooks.playbook_id", ondelete="SET NULL"), nullable=True, index=True)
     status = Column(String(50), default="Completed", nullable=False)
     mttr_seconds = Column(Float, default=0.0, nullable=False)
-    executed_at = Column(DateTime, default=utc_now, nullable=False)
+    executed_at = Column(UTCDateTime, default=utc_now, nullable=False)
 
     # Relationships
     alert = relationship("Alert", back_populates="playbook_executions")
@@ -209,7 +214,7 @@ class ContainmentAction(Base):
     connector = Column(String(50), nullable=True)  # edr, firewall, iam, itsm, ...
     execution_mode = Column(String(20), nullable=True)  # live, simulated, skipped, blocked
     details = Column(JSON, nullable=True)  # raw connector response / error / policy reasons
-    timestamp = Column(DateTime, default=utc_now, nullable=False)
+    timestamp = Column(UTCDateTime, default=utc_now, nullable=False)
 
     # Relationship
     alert = relationship("Alert", back_populates="containment_actions")
@@ -235,7 +240,7 @@ class IncidentReport(Base):
     report_id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     alert_id = Column(Integer, ForeignKey("alerts.alert_id", ondelete="CASCADE"), nullable=False, index=True)
     pdf_path = Column(String(500), nullable=False)
-    generated_at = Column(DateTime, default=utc_now, nullable=False)
+    generated_at = Column(UTCDateTime, default=utc_now, nullable=False)
 
     # Relationship
     alert = relationship("Alert", back_populates="incident_reports")
@@ -258,7 +263,7 @@ class AnalystActionLog(Base):
     action_type = Column(String(100), nullable=False)  # "take_action", "keep_and_monitor", "approve", "dismiss"
     decision = Column(String(150), nullable=True)
     notes = Column(Text, nullable=True)
-    timestamp = Column(DateTime, default=utc_now, nullable=False, index=True)
+    timestamp = Column(UTCDateTime, default=utc_now, nullable=False, index=True)
 
     # Relationship
     alert = relationship("Alert", back_populates="analyst_actions")
@@ -284,7 +289,7 @@ class SystemLog(Base):
     message = Column(Text, nullable=False)
     target = Column(String(200), nullable=True)  # IP, Hostname, User, Rule ID
     details = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    created_at = Column(UTCDateTime, default=utc_now, nullable=False, index=True)
 
     def to_dict(self):
         return {
@@ -319,9 +324,9 @@ class AgentProposal(Base):
     status = Column(String(30), default="pending_approval", nullable=False, index=True)
     # pending_approval, auto_executed, partially_executed, approved, rejected, blocked, no_action
     decided_by = Column(String(50), nullable=True)
-    decided_at = Column(DateTime, nullable=True)
+    decided_at = Column(UTCDateTime, nullable=True)
     decision_notes = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    created_at = Column(UTCDateTime, default=utc_now, nullable=False, index=True)
 
     alert = relationship("Alert", back_populates="agent_proposals")
 

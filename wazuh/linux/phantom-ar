@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""phantom-ar: Wazuh active-response script for Phantom SOAR (Linux agents, Python 3 stdlib only).
+
+One file, installed under several names in /var/ossec/active-response/bin/; the name selects the action:
+
+    phantom-isolate-host      cut the host off the network except Wazuh manager + allow-list
+    phantom-unisolate-host    undo the isolation
+    phantom-block-ip          args: IP [DURATION_HOURS [DIRECTION]]   direction: inbound|outbound|both
+    phantom-unblock-ip        args: IP
+    phantom-rate-limit        args: IP RATE [DURATION_HOURS]          RATE like 10/minute
+    phantom-kill-process      args: PROCESS_NAME [PID]
+    phantom-quarantine-file   args: ABSOLUTE_PATH [HASH]              hash: md5 / sha1 / sha256 hex
+
+Wazuh sends one JSON line on stdin (https://documentation.wazuh.com/current/user-manual/capabilities/active-response/custom-active-response-scripts.html):
+    {"version":1,"origin":{...},"command":"add","parameters":{"extra_args":[...],"alert":{...},"program":"..."}}
+Only parameters.extra_args are acted on (the API's "arguments"). Alert contents are untrusted and are
+never used to build a command; every value is validated strictly and commands are executed as argument
+lists (no shell). Block / rate-limit / isolate refuse the Wazuh manager, loopback, link-local, multicast,
+this host's own addresses and anything in the allow-list file.
+
+Manual use without a manager (see wazuh/README.md):
+    echo '{"command":"add","parameters":{"extra_args":["198.51.100.7","1","inbound"]}}' | PHANTOM_AR_DRY_RUN=1 ./phantom-block-ip
+
+Environment overrides (used by the tests and for dry runs): PHANTOM_AR_OSSEC_DIR, PHANTOM_AR_LOG,
+PHANTOM_AR_ALLOWLIST, PHANTOM_AR_STATE_DIR, PHANTOM_AR_QUARANTINE_DIR, PHANTOM_AR_MANAGER_IPS,
+PHANTOM_AR_DRY_RUN=1 (log the commands that would run, change nothing).
+Exit status: 0 done, 1 refused or failed, 2 bad input.
+"""
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+# execd may start the script with a minimal PATH that lacks /usr/sbin (nft, ip live there on many distributions)
+os.environ["PATH"] = os.pathsep.join(p for p in (os.environ.get("PATH"), "/usr/sbin", "/usr/bin", "/sbin", "/bin") if p)
+
+OSSEC_DIR = os.environ.get("PHANTOM_AR_OSSEC_DIR", "/var/ossec")
+LOG_FILE = os.environ.get("PHANTOM_AR_LOG", os.path.join(OSSEC_DIR, "logs", "active-responses.log"))
+ALLOWLIST_FILE = os.environ.get("PHANTOM_AR_ALLOWLIST", os.path.join(OSSEC_DIR, "etc", "phantom-allowlist.txt"))
+OSSEC_CONF = os.path.join(OSSEC_DIR, "etc", "ossec.conf")
+STATE_DIR = os.environ.get("PHANTOM_AR_STATE_DIR", os.path.join(OSSEC_DIR, "var", "phantom"))
+QUARANTINE_DIR = os.environ.get("PHANTOM_AR_QUARANTINE_DIR", os.path.join(OSSEC_DIR, "quarantine"))
+DRY_RUN = os.environ.get("PHANTOM_AR_DRY_RUN") == "1"
+
+NFT_TABLE = "phantom"
+ISOLATE_TABLE = "phantom_isolate"
+MAX_HOURS = 720
+MAX_ARGS = 8
+MAX_ARG_LEN = 4096
+DIRECTIONS = ("inbound", "outbound", "both")
+RATE_RE = re.compile(r"^([1-9][0-9]{0,5})/(second|minute|hour|day)$")
+NAME_RE = re.compile(r"^[A-Za-z0-9._+@-]{1,128}$")
+HASH_RE = re.compile(r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+PROTECTED_PROCESSES = {
+    "init", "systemd", "sshd", "dbus-daemon", "kthreadd", "nft", "iptables", "login", "agetty",
+    "systemd-journald", "systemd-logind", "systemd-udevd", "containerd", "dockerd", "phantom-ar",
+    "cron", "crond", "rsyslogd", "auditd", "udevd", "polkitd", "NetworkManager", "chronyd", "ntpd",
+}
+# Prefixes also cover helper processes such as sshd-session / sshd-auth (OpenSSH >= 9.8 runs every login in one),
+# containerd-shim-*, dbus-broker, wazuh-agentd / wazuh-execd / wazuh-modulesd and phantom-* (this script itself).
+PROTECTED_PREFIXES = ("wazuh-", "ossec", "systemd", "sshd", "containerd", "dbus", "phantom-")
+PROTECTED_PATHS = (
+    "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/proc", "/root", "/run",
+    "/sbin", "/sys", "/usr/bin", "/usr/sbin", "/usr/lib", "/var/ossec", "/var/lib/dpkg", "/var/lib/rpm",
+)
+
+EXECUTED = []  # commands run (or, in dry-run mode, that would have run); read by the tests
+
+
+class Refused(Exception):
+    """The request is valid but unsafe to carry out."""
+
+
+class BadInput(Exception):
+    """The request is malformed."""
+
+
+# --- logging -----------------------------------------------------------------------
+
+def _clean(value):
+    """One log-safe line: control characters and newlines cannot forge log entries."""
+    text = str(value)
+    return "".join(c if c.isprintable() else "?" for c in text)[:300]
+
+
+def log(level, action, message, **fields):
+    extras = " ".join(f"{k}={_clean(v)}" for k, v in fields.items())
+    line = f"{time.strftime('%Y/%m/%d %H:%M:%S')} phantom-ar: {level} action={action} {extras} msg={_clean(message)}".replace("  ", " ")
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        sys.stderr.write(line + "\n")
+
+
+# --- command execution (never through a shell) ---------------------------------------
+
+def run_cmd(args, stdin_text=None, check=True):
+    EXECUTED.append(list(args))
+    if DRY_RUN:
+        log("DRYRUN", "exec", "would run", cmd=" ".join(args))
+        return 0, ""
+    try:
+        proc = subprocess.run(args, input=stdin_text, capture_output=True, text=True, timeout=30, shell=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        if check:
+            raise RuntimeError(f"{args[0]} failed: {exc.__class__.__name__}") from exc
+        return 127, ""
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"{args[0]} exited {proc.returncode}: {proc.stderr.strip()[:200]}")
+    return proc.returncode, proc.stdout
+
+
+# --- validation ----------------------------------------------------------------------
+
+def parse_ip(text):
+    if not isinstance(text, str) or not re.fullmatch(r"[0-9A-Fa-f:.]{2,45}", text):
+        raise BadInput("not an IP address")
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError as exc:
+        raise BadInput("not an IP address") from exc
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        # ::ffff:a.b.c.d would slip past the IPv4 manager / allow-list comparisons: only the plain form is accepted
+        raise BadInput("IPv4-mapped IPv6 addresses are not accepted; use the IPv4 address")
+    return ip
+
+
+def parse_hours(text, default):
+    if text in (None, ""):
+        return default
+    if not re.fullmatch(r"[0-9]{1,3}", str(text)) or not 0 <= int(text) <= MAX_HOURS:
+        raise BadInput(f"duration must be a whole number of hours from 0 to {MAX_HOURS}")
+    return int(text)
+
+
+def read_allowlist():
+    networks = []
+    try:
+        with open(ALLOWLIST_FILE, encoding="utf-8") as handle:
+            for raw in handle:
+                entry = raw.split("#", 1)[0].strip()
+                if not entry:
+                    continue
+                try:
+                    networks.append(ipaddress.ip_network(entry, strict=False))
+                except ValueError:
+                    log("WARN", "allowlist", "ignoring invalid allow-list entry", entry=entry)
+    except OSError:
+        pass
+    return networks
+
+
+def manager_addresses():
+    """Wazuh manager IPs from the agent's ossec.conf <server><address>, plus PHANTOM_AR_MANAGER_IPS."""
+    names = [n.strip() for n in os.environ.get("PHANTOM_AR_MANAGER_IPS", "").split(",") if n.strip()]
+    try:
+        with open(OSSEC_CONF, encoding="utf-8", errors="replace") as handle:
+            conf = handle.read()
+        for server in re.findall(r"<server>(.*?)</server>", conf, re.S):
+            names += re.findall(r"<address>\s*([^<\s]+)\s*</address>", server)
+    except OSError:
+        pass
+    found = set()
+    for name in names:
+        try:
+            found.add(ipaddress.ip_address(name))
+            continue
+        except ValueError:
+            pass
+        try:
+            for info in socket.getaddrinfo(name, None):
+                found.add(ipaddress.ip_address(info[4][0].split("%")[0]))
+        except (OSError, ValueError):
+            log("WARN", "manager", "could not resolve manager address", address=name)
+    return found
+
+
+def own_addresses():
+    found = set()
+    try:
+        code, out = run_cmd(["ip", "-o", "addr"], check=False) if not DRY_RUN else (1, "")
+        if code == 0:
+            for match in re.finditer(r"inet6? ([0-9a-fA-F:.]+)/", out):
+                found.add(ipaddress.ip_address(match.group(1)))
+    except (ValueError, RuntimeError):
+        pass
+    return found
+
+
+def refuse_if_protected(ip):
+    if ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local:
+        raise Refused(f"{ip} is loopback, unspecified, multicast or link-local")
+    if ip in manager_addresses():
+        raise Refused(f"{ip} is the Wazuh manager")
+    if ip in own_addresses():
+        raise Refused(f"{ip} is an address of this host")
+    for network in read_allowlist():
+        if ip.version == network.version and ip in network:
+            raise Refused(f"{ip} is in the allow-list ({network})")
+
+
+# --- nftables ------------------------------------------------------------------------
+
+BASE_RULESET = """table inet phantom {
+  set block4_in  { type ipv4_addr; flags timeout; }
+  set block6_in  { type ipv6_addr; flags timeout; }
+  set block4_out { type ipv4_addr; flags timeout; }
+  set block6_out { type ipv6_addr; flags timeout; }
+  chain input   { type filter hook input priority -10; policy accept;
+                  ip saddr @block4_in drop; ip6 saddr @block6_in drop; }
+  chain output  { type filter hook output priority -10; policy accept;
+                  ip daddr @block4_out drop; ip6 daddr @block6_out drop; }
+  chain forward { type filter hook forward priority -10; policy accept;
+                  ip saddr @block4_in drop; ip6 saddr @block6_in drop;
+                  ip daddr @block4_out drop; ip6 daddr @block6_out drop; }
+}
+"""
+
+
+def ensure_table():
+    code, _ = run_cmd(["nft", "list", "table", "inet", NFT_TABLE], check=False)
+    if code != 0:
+        run_cmd(["nft", "-f", "-"], stdin_text=BASE_RULESET)
+
+
+def _fam(ip):
+    return "4" if ip.version == 4 else "6"
+
+
+def block_ip(ip, hours, direction):
+    refuse_if_protected(ip)
+    ensure_table()
+    sets = []
+    if direction in ("inbound", "both"):
+        sets.append(f"block{_fam(ip)}_in")
+    if direction in ("outbound", "both"):
+        sets.append(f"block{_fam(ip)}_out")
+    for name in sets:
+        run_cmd(["nft", "delete", "element", "inet", NFT_TABLE, name, "{ %s }" % ip], check=False)
+        element = "{ %s timeout %ds }" % (ip, hours * 3600) if hours else "{ %s }" % ip
+        run_cmd(["nft", "add", "element", "inet", NFT_TABLE, name, element])
+    return f"blocked {ip} {direction}" + (f" for {hours}h" if hours else " until unblocked")
+
+
+def unblock_ip(ip):
+    ensure_table()
+    for name in (f"block{_fam(ip)}_in", f"block{_fam(ip)}_out"):
+        run_cmd(["nft", "delete", "element", "inet", NFT_TABLE, name, "{ %s }" % ip], check=False)
+    remove_rate_limit(ip)
+    return f"unblocked {ip}"
+
+
+def _state_path(name):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    return os.path.join(STATE_DIR, name)
+
+
+def _load_state(name):
+    try:
+        with open(_state_path(name), encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(name, data):
+    path = _state_path(name)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    os.replace(tmp, path)
+
+
+def remove_rate_limit(ip):
+    removed = False
+    for chain in ("input", "forward"):
+        code, out = run_cmd(["nft", "-a", "list", "chain", "inet", NFT_TABLE, chain], check=False)
+        if code != 0:
+            continue
+        for handle in re.findall(r'comment "phantom-rl-%s".*# handle ([0-9]+)' % re.escape(str(ip)), out):
+            run_cmd(["nft", "delete", "rule", "inet", NFT_TABLE, chain, "handle", handle], check=False)
+            removed = True
+    state = _load_state("rate_limits.json")
+    if state.pop(str(ip), None) is not None:
+        _save_state("rate_limits.json", state)
+    return removed
+
+
+def rate_limit(ip, rate, hours):
+    refuse_if_protected(ip)
+    ensure_table()
+    remove_rate_limit(ip)
+    for chain in ("input", "forward"):
+        run_cmd(["nft", "add", "rule", "inet", NFT_TABLE, chain, "ip" if ip.version == 4 else "ip6", "saddr", str(ip),
+                 "limit", "rate", "over", rate, "drop", "comment", f"phantom-rl-{ip}"])
+    if hours:
+        state = _load_state("rate_limits.json")
+        state[str(ip)] = int(time.time()) + hours * 3600
+        _save_state("rate_limits.json", state)
+        if not DRY_RUN:
+            subprocess.Popen([sys.executable, os.path.abspath(__file__), "__expire", str(ip), str(hours * 3600)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True)
+    return f"rate-limited {ip} to {rate}" + (f" for {hours}h" if hours else " until removed")
+
+
+def sweep_expired():
+    """Remove rate limits whose time is up (also catches expirer processes lost to a reboot)."""
+    state = _load_state("rate_limits.json")
+    for ip, expiry in list(state.items()):
+        if isinstance(expiry, (int, float)) and expiry <= time.time():
+            try:
+                remove_rate_limit(ipaddress.ip_address(ip))
+                log("INFO", "rate_limit_expired", "removed expired rate limit", ip=ip)
+            except (ValueError, RuntimeError):
+                pass
+
+
+def isolate_host():
+    managers = manager_addresses()
+    if not managers:
+        raise Refused("cannot find the Wazuh manager address in ossec.conf; isolating would cut the agent off")
+    networks = [ipaddress.ip_network(m) for m in managers] + read_allowlist()
+    v4 = [str(n) for n in ipaddress.collapse_addresses([n for n in networks if n.version == 4])]
+    v6 = [str(n) for n in ipaddress.collapse_addresses([n for n in networks if n.version == 6])]
+    rules = []
+    for chain, direction in (("input", "saddr"), ("output", "daddr")):
+        lines = ['iifname "lo" accept' if chain == "input" else 'oifname "lo" accept']
+        if v4:
+            lines.append("ip %s { %s } accept" % (direction, ", ".join(v4)))
+        if v6:
+            lines.append("ip6 %s { %s } accept" % (direction, ", ".join(v6)))
+        rules.append("  chain %s { type filter hook %s priority -5; policy drop;\n    %s\n  }" % (chain, chain, "\n    ".join(lines)))
+    ruleset = "table inet %s {\n%s\n}\n" % (ISOLATE_TABLE, "\n".join(rules))
+    run_cmd(["nft", "delete", "table", "inet", ISOLATE_TABLE], check=False)
+    run_cmd(["nft", "-f", "-"], stdin_text=ruleset)
+    _save_state("isolated.json", {"since": int(time.time()), "allowed": v4 + v6})
+    return f"host isolated; still reachable: {', '.join(v4 + v6)}"
+
+
+def unisolate_host():
+    run_cmd(["nft", "delete", "table", "inet", ISOLATE_TABLE], check=False)
+    try:
+        os.remove(_state_path("isolated.json"))
+    except OSError:
+        pass
+    return "host network isolation removed"
+
+
+# --- processes -----------------------------------------------------------------------
+
+def _proc_name(pid):
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as handle:
+            comm = handle.read().strip()
+        exe = os.path.basename(os.readlink(f"/proc/{pid}/exe"))
+        return comm, exe
+    except OSError:
+        return None, None
+
+
+def _is_protected_process(comm, exe):
+    for name in (comm, exe):
+        if name and (name in PROTECTED_PROCESSES or name.startswith(PROTECTED_PREFIXES)):
+            return True
+    return False
+
+
+def kill_process(name, pid_text):
+    base_name = os.path.basename(name.replace("\\", "/"))
+    if not NAME_RE.match(base_name):
+        raise BadInput("invalid process name")
+    targets = []
+    if pid_text:
+        if not re.fullmatch(r"[0-9]{1,8}", pid_text) or int(pid_text) < 2:
+            raise BadInput("invalid pid")
+        pid = int(pid_text)
+        comm, exe = _proc_name(pid)
+        if comm is None:
+            raise Refused(f"pid {pid} is not running or is a kernel thread")
+        if base_name not in (comm, exe) and base_name[:15] != comm:
+            raise Refused(f"pid {pid} is '{comm}', not '{base_name}'; refusing (pid may have been reused)")
+        targets.append((pid, comm, exe))
+    else:
+        for entry in os.listdir("/proc"):
+            if entry.isdigit() and int(entry) > 1:
+                comm, exe = _proc_name(entry)
+                if comm and (base_name == exe or base_name[:15] == comm):
+                    targets.append((int(entry), comm, exe))
+        if len(targets) > 10:
+            raise Refused(f"{len(targets)} processes match '{base_name}'; refusing to kill more than 10")
+    own = {os.getpid(), os.getppid()}
+    killed = []
+    for pid, comm, exe in targets:
+        if pid in own or _is_protected_process(comm, exe):
+            raise Refused(f"'{comm}' (pid {pid}) is a protected process")
+    for pid, comm, exe in targets:
+        if DRY_RUN:
+            log("DRYRUN", "kill_process", "would send SIGKILL", pid=pid, name=comm)
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+        killed.append(pid)
+    if not killed:
+        raise Refused(f"no running process named '{base_name}'")
+    return f"killed {base_name} pid(s) {killed}"
+
+
+# --- quarantine ----------------------------------------------------------------------
+
+def _hash_file(path, algorithm):
+    digest = hashlib.new(algorithm)
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def quarantine_file(path, expected_hash):
+    if "\0" in path or not os.path.isabs(path) or len(path) > 4096:
+        raise BadInput("path must be absolute")
+    path = os.path.normpath(path)
+    # Symlinked directories in the path must not hide a protected location (/tmp/link -> /etc): check the path
+    # as given AND with its directory resolved (this also covers merged-/usr, where /bin is /usr/bin).
+    resolved = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+    quarantine_root = os.path.realpath(QUARANTINE_DIR)
+    for candidate in dict.fromkeys((path, resolved)):
+        if candidate == "/" or any(candidate == p or candidate.startswith(p.rstrip("/") + "/")
+                                   for p in PROTECTED_PATHS if p != "/"):
+            raise Refused(f"{path} is in a protected location")
+        if os.path.commonpath([quarantine_root, candidate]) == quarantine_root:
+            raise Refused("file is already in quarantine")
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise Refused(f"{path} does not exist")
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise Refused(f"{path} is not a regular file (symlinks are not followed)")
+    sha256 = _hash_file(path, "sha256")
+    if expected_hash:
+        if not HASH_RE.match(expected_hash):
+            raise BadInput("invalid hash")
+        algorithm = {32: "md5", 40: "sha1", 64: "sha256"}[len(expected_hash)]
+        actual = sha256 if algorithm == "sha256" else _hash_file(path, algorithm)
+        if actual.lower() != expected_hash.lower():
+            raise Refused("file hash does not match the expected hash; the file changed or the wrong file was named")
+    qid = f"{int(time.time())}-{sha256[:16]}"
+    os.makedirs(QUARANTINE_DIR, mode=0o700, exist_ok=True)
+    destination = os.path.join(QUARANTINE_DIR, qid)
+    meta = {"original_path": path, "sha256": sha256, "mode": info.st_mode & 0o7777, "uid": info.st_uid,
+            "gid": info.st_gid, "quarantined_at": int(time.time())}
+    if DRY_RUN:
+        log("DRYRUN", "quarantine_file", "would move file", src=path, dst=destination)
+    else:
+        shutil.move(path, destination)
+        os.chmod(destination, 0o000)
+        with open(destination + ".json", "w", encoding="utf-8") as handle:
+            json.dump(meta, handle)
+    return f"quarantined {path} as {qid}"
+
+
+def restore_file(qid):
+    """Manual, reversible counterpart: phantom-ar restore <id> (not reachable from Wazuh)."""
+    if not re.fullmatch(r"[0-9]{9,12}-[0-9a-f]{16}", qid):
+        raise BadInput("invalid quarantine id")
+    with open(os.path.join(QUARANTINE_DIR, qid + ".json"), encoding="utf-8") as handle:
+        meta = json.load(handle)
+    if os.path.lexists(meta["original_path"]):
+        raise Refused("original path already exists; not overwriting")
+    source = os.path.join(QUARANTINE_DIR, qid)
+    shutil.move(source, meta["original_path"])
+    os.chmod(meta["original_path"], meta["mode"])
+    os.chown(meta["original_path"], meta["uid"], meta["gid"])
+    os.remove(os.path.join(QUARANTINE_DIR, qid + ".json"))
+    return f"restored {meta['original_path']}"
+
+
+# --- dispatch ------------------------------------------------------------------------
+
+def handle(action, args):
+    """Validate args and perform the action; returns a message. Raises BadInput / Refused."""
+    count = len(args)
+
+    def need(low, high):
+        if not low <= count <= high:
+            raise BadInput(f"{action} takes {low}-{high} argument(s), got {count}")
+
+    if action in ("isolate-host", "unisolate-host"):
+        need(0, 0)
+        return isolate_host() if action == "isolate-host" else unisolate_host()
+    if action == "block-ip":
+        need(1, 3)
+        direction = args[2] if count > 2 else "inbound"
+        if direction not in DIRECTIONS:
+            raise BadInput("direction must be inbound, outbound or both")
+        return block_ip(parse_ip(args[0]), parse_hours(args[1] if count > 1 else None, 24), direction)
+    if action == "unblock-ip":
+        need(1, 1)
+        return unblock_ip(parse_ip(args[0]))
+    if action == "rate-limit":
+        need(2, 3)
+        rate = args[1].strip().lower()
+        if not RATE_RE.match(rate):
+            raise BadInput("rate must look like 10/minute")
+        return rate_limit(parse_ip(args[0]), rate, parse_hours(args[2] if count > 2 else None, 24))
+    if action == "kill-process":
+        need(1, 2)
+        return kill_process(args[0], args[1] if count > 1 else "")
+    if action == "quarantine-file":
+        need(1, 2)
+        return quarantine_file(args[0], args[1] if count > 1 else "")
+    raise BadInput(f"unknown action '{action}'")
+
+
+def read_request(stream):
+    line = stream.readline(1_000_000)
+    try:
+        message = json.loads(line)
+    except ValueError as exc:
+        raise BadInput("stdin is not valid JSON") from exc
+    if not isinstance(message, dict):
+        raise BadInput("stdin JSON must be an object")
+    params = message.get("parameters") or {}
+    extra = params.get("extra_args") or []
+    if not isinstance(extra, list) or len(extra) > MAX_ARGS:
+        raise BadInput("extra_args must be a short list")
+    args = []
+    for item in extra:
+        if not isinstance(item, str) or len(item) > MAX_ARG_LEN or "\0" in item or "\n" in item:
+            raise BadInput("extra_args must be strings without newlines")
+        args.append(item)
+    return message.get("command"), args
+
+
+def main(argv, stdin=None):
+    stdin = stdin or sys.stdin
+    script = os.path.basename(argv[0])
+    if len(argv) == 4 and argv[1] == "__expire":  # detached expirer for timed rate limits
+        time.sleep(min(int(argv[3]), MAX_HOURS * 3600))
+        sweep_expired()
+        return 0
+    if script == "phantom-ar" or not script.startswith("phantom-"):
+        if len(argv) < 2:
+            sys.stderr.write(__doc__)
+            return 2
+        action = argv[1]
+        if action == "restore" and len(argv) == 3:
+            try:
+                log("INFO", "restore_file", restore_file(argv[2]))
+                return 0
+            except (BadInput, Refused, OSError, ValueError) as exc:
+                log("ERROR", "restore_file", str(exc))
+                return 1
+    else:
+        action = script[len("phantom-"):]
+    try:
+        command, args = read_request(stdin)
+        if command != "add":
+            log("INFO", action, "ignored non-add message", command=command)
+            return 0
+        sweep_expired()
+        message = handle(action, args)
+        log("INFO", action, message, result="ok")
+        return 0
+    except BadInput as exc:
+        log("ERROR", action, f"rejected input: {exc}", result="bad-input")
+        return 2
+    except Refused as exc:
+        log("WARN", action, f"refused: {exc}", result="refused")
+        return 1
+    except Exception as exc:  # never let an unexpected error hide in a traceback nobody reads
+        log("ERROR", action, f"failed: {exc.__class__.__name__}: {exc}", result="failed")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,20 +1,44 @@
 import {
+  AdminReportData,
+  AgentProposal,
+  AgentStatus,
   Alert,
   AlertDetail,
-  DashboardMetrics,
-  Playbook,
-  User,
-  LoginResponse,
-  SystemConfigGroup,
+  AnalystOption,
+  ChangePasswordRequest,
+  ChangePasswordResponse,
   ConfigUpdateItem,
-  RuntimeStatus,
+  ConfigUpdateResult,
+  CreatedUser,
+  DashboardMetrics,
   HotlStatus,
-  TestConnectionResult,
+  IngestTokenCreated,
+  IngestTokenInfo,
+  JsonObject,
+  LoginResponse,
+  MfaSetupResponse,
+  MfaStatusResponse,
+  Playbook,
+  ProposalApprovalResult,
+  ProposalList,
+  RuntimeStatus,
+  ServiceAccountKey,
+  ServiceAccountPolicyChange,
+  SystemConfigGroup,
   SystemLog,
-  AdminReportData,
-  VulnerabilityIntel
+  TestConnectionResult,
+  User,
+  VulnerabilityIntel,
 } from './types';
 import { ActionCatalog } from './actions';
+import {
+  ApiError,
+  NETWORK_ERROR_MESSAGE,
+  isMfaEnrollmentRequired,
+  isPasswordChangeRequired,
+  parseErrorBody,
+  parseRetryAfter,
+} from './errors';
 import {
   getStoredToken,
   setStoredToken,
@@ -26,10 +50,11 @@ import {
   subscribeToAuth,
   TOKEN_KEY,
   USER_KEY,
-  AUTH_CHANGE_EVENT
+  AUTH_CHANGE_EVENT,
 } from './auth';
 
 export {
+  ApiError,
   getStoredToken,
   setStoredToken,
   clearStoredToken,
@@ -40,7 +65,7 @@ export {
   subscribeToAuth,
   TOKEN_KEY,
   USER_KEY,
-  AUTH_CHANGE_EVENT
+  AUTH_CHANGE_EVENT,
 };
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL
@@ -48,99 +73,88 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL
   : '/api';
 
 export const LOGIN_PATH = '/login';
-const PASSWORD_CHANGE_REQUIRED = 'password change required';
 
-export class ApiError extends Error {
-  status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.name = 'ApiError';
-    this.status = status;
-  }
-}
-
-function redirectToLogin(): void {
+function redirectToLogin(reason?: 'expired' | 'password' | 'mfa'): void {
   if (typeof window === 'undefined') return;
   if (window.location.pathname !== LOGIN_PATH) {
-    window.location.assign(LOGIN_PATH);
+    window.location.assign(reason ? `${LOGIN_PATH}?reason=${reason}` : LOGIN_PATH);
   }
 }
 
-async function readErrorMessage(res: Response): Promise<string> {
-  let errorMsg = `API Error [${res.status}]`;
-  try {
-    const errorText = await res.text();
-    try {
-      const errJson = JSON.parse(errorText);
-      const detail = errJson.detail ?? errJson.message;
-      if (typeof detail === 'string') {
-        errorMsg = detail;
-      } else if (Array.isArray(detail)) {
-        // FastAPI validation errors: [{loc, msg, type}]
-        errorMsg = detail.map((d: any) => d?.msg || JSON.stringify(d)).join('; ');
-      } else if (errorText) {
-        errorMsg = errorText;
-      }
-    } catch {
-      if (errorText) errorMsg = errorText;
-    }
-  } catch {
-    // body unreadable; keep the status-based message
-  }
-  return errorMsg;
-}
-
-function authHeaders(extra?: HeadersInit): Record<string, string> {
-  const headers: Record<string, string> = { ...((extra as Record<string, string>) || {}) };
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...(extra || {}) };
   const token = getStoredToken();
   if (token) headers['Authorization'] = `Bearer ${token}`;
   return headers;
 }
 
 /**
- * Handle an error response: a 401 clears the session and sends the user to /login,
- * as does a 403 telling us the account must change its password first.
+ * Turn an error response into an ApiError. A 401 (outside the sign-in form itself) ends the session and sends the
+ * user to /login; a 403 that says a password change or MFA enrolment is still owed also goes to /login, where
+ * the matching form opens.
  */
-async function handleErrorResponse(res: Response, isAuthRequest: boolean): Promise<never> {
-  const message = await readErrorMessage(res);
-  if (!isAuthRequest) {
+async function raiseForResponse(res: Response, isSignIn: boolean): Promise<never> {
+  const body = await res.text().catch(() => '');
+  const parsed = parseErrorBody(res.status, body);
+  if (!isSignIn) {
     if (res.status === 401) {
+      const hadSession = Boolean(getStoredToken());
       clearAuth();
-      redirectToLogin();
-    } else if (res.status === 403 && message.toLowerCase().includes(PASSWORD_CHANGE_REQUIRED)) {
-      // Flag the cached profile so /login opens the change-password form.
+      redirectToLogin(hadSession ? 'expired' : undefined);
+    } else if (isPasswordChangeRequired(res.status, parsed.message)) {
       const cached = getStoredUser();
       if (cached) setStoredUser({ ...cached, must_change_password: true });
-      redirectToLogin();
+      redirectToLogin('password');
+    } else if (isMfaEnrollmentRequired(res.status, parsed.message)) {
+      const cached = getStoredUser();
+      if (cached) setStoredUser({ ...cached, mfa_enrollment_required: true });
+      redirectToLogin('mfa');
     }
   }
-  throw new ApiError(res.status, message);
+  throw new ApiError(res.status, parsed.message, {
+    blockers: parsed.blockers,
+    retryAfterSeconds: parseRetryAfter(res.headers.get('Retry-After')),
+  });
+}
+
+async function send(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch {
+    // fetch rejects only when the request never completed (offline, refused, blocked by CSP/CORS).
+    throw new ApiError(0, NETWORK_ERROR_MESSAGE);
+  }
 }
 
 export async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const headers = authHeaders({
-    'Content-Type': 'application/json',
-    ...((options?.headers as Record<string, string>) || {}),
-  });
+  const extra = (options?.headers as Record<string, string> | undefined) || {};
+  const headers = authHeaders({ 'Content-Type': 'application/json', ...extra });
 
-  const res = await fetch(url, { ...options, headers });
-
+  const res = await send(url, { ...options, headers });
   if (!res.ok) {
     // Failed sign-in attempts return 401 too; those must surface as form errors, not redirects.
-    const isAuthRequest = url.includes('/auth/login') || url.includes('/auth/change-password');
-    await handleErrorResponse(res, isAuthRequest);
+    await raiseForResponse(res, url.endsWith('/auth/login'));
   }
 
   if (res.status === 204) return undefined as T;
   const text = await res.text();
-  return (text ? JSON.parse(text) : undefined) as T;
+  if (!text) return undefined as T;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new ApiError(res.status, 'The API returned a response that is not valid JSON.');
+  }
+}
+
+function jsonBody(data: unknown): string {
+  return JSON.stringify(data);
 }
 
 /** Fetch a protected file (e.g. a PDF report) with the session token and save it. */
 export async function downloadAuthenticated(url: string, fallbackFilename: string): Promise<void> {
-  const res = await fetch(url, { headers: authHeaders() });
+  const res = await send(url, { headers: authHeaders() });
   if (!res.ok) {
-    await handleErrorResponse(res, false);
+    await raiseForResponse(res, false);
   }
   const disposition = res.headers.get('Content-Disposition') || '';
   const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
@@ -157,6 +171,11 @@ export async function downloadAuthenticated(url: string, fallbackFilename: strin
   setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
 }
 
+/**
+ * Re-read the signed-in profile. Returns null (and clears the session) when the backend no longer accepts the
+ * token. On a network failure the cached profile is returned so a flaky link does not sign everyone out; the
+ * next API call re-checks the session and pages show their own error state.
+ */
 export async function syncCurrentUser(): Promise<User | null> {
   const token = getStoredToken();
   if (!token) {
@@ -176,11 +195,17 @@ export async function syncCurrentUser(): Promise<User | null> {
       return null;
     }
   }
-  // Network failure: keep the cached profile; the next API call re-checks the session.
   return getStoredUser();
 }
 
-function adminReportQuery(params?: { analyst?: string; period?: string; start_date?: string; end_date?: string }): string {
+export interface AdminReportParams {
+  analyst?: string;
+  period?: string;
+  start_date?: string;
+  end_date?: string;
+}
+
+function adminReportQuery(params?: AdminReportParams): string {
   const query = new URLSearchParams();
   if (params?.analyst) query.append('analyst', params.analyst);
   if (params?.period) query.append('period', params.period);
@@ -189,44 +214,47 @@ function adminReportQuery(params?: { analyst?: string; period?: string; start_da
   return query.toString();
 }
 
+export interface ProposalQuery {
+  status?: string;
+  alert_id?: number;
+  limit?: number;
+  offset?: number;
+}
+
+export interface LogQuery {
+  source?: string;
+  seconds?: number;
+  level?: string;
+  search?: string;
+  limit?: number;
+}
+
 export const api = {
-  // Authentication & MFA
+  // --- Authentication & MFA -------------------------------------------------
   login: (username: string, password: string, mfa_code?: string): Promise<LoginResponse> =>
     fetchJson(`${API_BASE}/auth/login`, {
       method: 'POST',
-      body: JSON.stringify({ username, password, mfa_code }),
+      body: jsonBody({ username, password, mfa_code }),
     }),
 
-  /** Returns a fresh session (access_token + user) when the backend issues one. */
-  changePassword: (data: { username: string; current_password: string; new_password: string; mfa_code?: string }): Promise<{
-    status?: string;
-    message?: string;
-    access_token?: string;
-    token_type?: string;
-    user?: User;
-  }> =>
-    fetchJson(`${API_BASE}/auth/change-password`, {
-      method: 'POST',
-      body: JSON.stringify(data),
-    }),
+  /**
+   * Changes the password of the signed-in account (Bearer session). Proof of the old credential is the
+   * current password (plus an MFA code when MFA is on), except for the forced first-login session.
+   * Returns a fresh session; earlier tokens are invalidated.
+   */
+  changePassword: (data: ChangePasswordRequest): Promise<ChangePasswordResponse> =>
+    fetchJson(`${API_BASE}/auth/change-password`, { method: 'POST', body: jsonBody(data) }),
 
-  setupMfa: (): Promise<{ secret: string; provisioning_uri: string; issuer: string; account: string; message: string }> =>
-    fetchJson(`${API_BASE}/auth/mfa/setup`, { method: 'POST' }),
+  setupMfa: (): Promise<MfaSetupResponse> => fetchJson(`${API_BASE}/auth/mfa/setup`, { method: 'POST' }),
 
-  verifyMfa: (code: string): Promise<{ mfa_enabled: boolean; status: string; message: string }> =>
-    fetchJson(`${API_BASE}/auth/mfa/verify`, {
-      method: 'POST',
-      body: JSON.stringify({ code }),
-    }),
+  verifyMfa: (code: string): Promise<MfaStatusResponse> =>
+    fetchJson(`${API_BASE}/auth/mfa/verify`, { method: 'POST', body: jsonBody({ code }) }),
 
-  disableMfa: (code?: string): Promise<{ mfa_enabled: boolean; status: string; message: string }> =>
-    fetchJson(`${API_BASE}/auth/mfa/disable`, {
-      method: 'POST',
-      body: JSON.stringify(code ? { code } : {}),
-    }),
+  /** While MFA is on the backend needs BOTH the account password and a current TOTP code. */
+  disableMfa: (data: { password: string; code: string }): Promise<MfaStatusResponse> =>
+    fetchJson(`${API_BASE}/auth/mfa/disable`, { method: 'POST', body: jsonBody(data) }),
 
-  getCurrentUser: (): Promise<User> =>
-    fetchJson(`${API_BASE}/auth/me`),
+  getCurrentUser: (): Promise<User> => fetchJson(`${API_BASE}/auth/me`),
 
   /** Revoke the session server-side (best effort), then clear local credentials. */
   logout: async (): Promise<void> => {
@@ -239,83 +267,97 @@ export const api = {
         });
       }
     } catch {
-      // Network failure: the local session is still cleared below.
+      // Network failure: the local session is still cleared below; the token expires on its own.
     } finally {
       clearAuth();
     }
   },
 
-  // User Accounts & RBAC Management (Admin Only)
-  getUsers: (): Promise<User[]> =>
-    fetchJson(`${API_BASE}/users`),
+  /** Unauthenticated liveness probe; true only for a 2xx answer. */
+  getHealth: async (): Promise<boolean> => {
+    try {
+      const res = await fetch(`${API_BASE}/health`, { cache: 'no-store' });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  },
 
-  createUser: (data: { username: string; role: string; mfa_enabled?: boolean }): Promise<User & { temporary_password?: string; default_password?: string }> =>
-    fetchJson(`${API_BASE}/users`, {
+  // --- User accounts & RBAC (admin only) --------------------------------------
+  getUsers: (): Promise<User[]> => fetchJson(`${API_BASE}/users`),
+
+  createUser: (data: { username: string; role: string }): Promise<CreatedUser> =>
+    fetchJson(`${API_BASE}/users`, { method: 'POST', body: jsonBody(data) }),
+
+  /** The API key is returned once; agents send it as X-Phantom-Agent-Key. */
+  createServiceAccount: (data: {
+    username: string;
+    expires_in_days?: number;
+    ip_allowlist?: string[];
+  }): Promise<ServiceAccountKey> =>
+    fetchJson(`${API_BASE}/users/service-accounts`, { method: 'POST', body: jsonBody(data) }),
+
+  /** Issues a new key; the previous one stops working immediately. The body optionally resets expiry / allow-list. */
+  rotateServiceAccountKey: (userId: number, change?: ServiceAccountPolicyChange): Promise<ServiceAccountKey> =>
+    fetchJson(`${API_BASE}/users/${userId}/rotate-api-key`, {
       method: 'POST',
-      body: JSON.stringify(data),
+      ...(change ? { body: jsonBody(change) } : {}),
     }),
 
-  /** Admin only. The API key is returned once; agents send it as X-Phantom-Agent-Key. */
-  createServiceAccount: (username: string): Promise<User & { api_key: string }> =>
-    fetchJson(`${API_BASE}/users/service-accounts`, {
-      method: 'POST',
-      body: JSON.stringify({ username }),
-    }),
+  /** Change a service account's key expiry and allow-list without rotating the key. */
+  updateServiceAccountPolicy: (userId: number, change: ServiceAccountPolicyChange): Promise<User> =>
+    fetchJson(`${API_BASE}/users/${userId}/service-policy`, { method: 'PUT', body: jsonBody(change) }),
 
-  /** Admin only. Issues a new key; the previous one stops working immediately. */
-  rotateServiceAccountKey: (userId: number): Promise<User & { api_key: string }> =>
-    fetchJson(`${API_BASE}/users/${userId}/rotate-api-key`, { method: 'POST' }),
+  updateUser: (
+    userId: number,
+    data: { role?: string; is_active?: boolean; compromised_reset_required?: boolean }
+  ): Promise<User> => fetchJson(`${API_BASE}/users/${userId}`, { method: 'PUT', body: jsonBody(data) }),
 
-  updateUser: (userId: number, data: { role?: string; is_active?: boolean; compromised_reset_required?: boolean }): Promise<User> =>
-    fetchJson(`${API_BASE}/users/${userId}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    }),
+  resetUserPassword: (userId: number): Promise<{ status: string; message: string; temporary_password?: string }> =>
+    fetchJson(`${API_BASE}/users/${userId}/reset-password`, { method: 'POST' }),
 
-  resetUserPassword: (userId: number): Promise<{ status: string; message: string; temporary_password?: string; default_password?: string }> =>
-    fetchJson(`${API_BASE}/users/${userId}/reset-password`, {
-      method: 'POST',
-    }),
+  unlockUser: (userId: number): Promise<{ status: string; message: string }> =>
+    fetchJson(`${API_BASE}/users/${userId}/unlock`, { method: 'POST' }),
 
   flagUserCompromised: (userId: number): Promise<{ status: string; message: string }> =>
-    fetchJson(`${API_BASE}/users/${userId}/flag-compromised`, {
-      method: 'POST',
-    }),
+    fetchJson(`${API_BASE}/users/${userId}/flag-compromised`, { method: 'POST' }),
 
   deleteUser: (userId: number): Promise<{ status: string; message: string }> =>
-    fetchJson(`${API_BASE}/users/${userId}`, {
-      method: 'DELETE',
-    }),
+    fetchJson(`${API_BASE}/users/${userId}`, { method: 'DELETE' }),
 
-  // Admin Reporting
-  getAvailableAnalysts: (): Promise<Array<{ user_id: number; username: string; role: string; is_active: boolean }>> =>
-    fetchJson(`${API_BASE}/reports/analysts`),
+  // --- Webhook ingest tokens (admin only) -------------------------------------
+  getIngestTokens: (): Promise<IngestTokenInfo[]> => fetchJson(`${API_BASE}/ingest-tokens`),
 
-  getAdminReport: (params?: { analyst?: string; period?: string; start_date?: string; end_date?: string }): Promise<AdminReportData> =>
+  /** The plaintext token is returned once, in `token`. */
+  createIngestToken: (data: { name: string; expires_in_days?: number }): Promise<IngestTokenCreated> =>
+    fetchJson(`${API_BASE}/ingest-tokens`, { method: 'POST', body: jsonBody(data) }),
+
+  revokeIngestToken: (tokenId: number): Promise<IngestTokenInfo> =>
+    fetchJson(`${API_BASE}/ingest-tokens/${tokenId}/revoke`, { method: 'POST' }),
+
+  // --- Admin reporting ----------------------------------------------------------
+  getAvailableAnalysts: (): Promise<AnalystOption[]> => fetchJson(`${API_BASE}/reports/analysts`),
+
+  getAdminReport: (params?: AdminReportParams): Promise<AdminReportData> =>
     fetchJson(`${API_BASE}/reports/analyst-activity?${adminReportQuery(params)}`),
 
-  downloadAdminReportPdf: (params?: { analyst?: string; period?: string; start_date?: string; end_date?: string }): Promise<void> =>
+  downloadAdminReportPdf: (params?: AdminReportParams): Promise<void> =>
     downloadAuthenticated(
       `${API_BASE}/reports/analyst-activity/pdf?${adminReportQuery(params)}`,
       `phantom_soar_analyst_report_${params?.period || 'month'}.pdf`
     ),
 
-  // Configuration & Integrations
-  getConfigurations: (): Promise<SystemConfigGroup> =>
-    fetchJson(`${API_BASE}/configuration`),
+  // --- Configuration & integrations ---------------------------------------------
+  getConfigurations: (): Promise<SystemConfigGroup> => fetchJson(`${API_BASE}/configuration`),
 
-  /** An empty key_value for a secret keeps the stored value unless clear=true. */
-  updateConfigurations: (configs: ConfigUpdateItem[]): Promise<unknown> =>
-    fetchJson(`${API_BASE}/configuration`, {
-      method: 'POST',
-      body: JSON.stringify({ configs }),
-    }),
+  /** An empty key_value for a secret keeps the stored value unless clear=true. 409 carries {message, blockers}. */
+  updateConfigurations: (configs: ConfigUpdateItem[]): Promise<ConfigUpdateResult> =>
+    fetchJson(`${API_BASE}/configuration`, { method: 'POST', body: jsonBody({ configs }) }),
 
-  getRuntimeStatus: (): Promise<RuntimeStatus> =>
-    fetchJson(`${API_BASE}/configuration/runtime-status`),
+  getRuntimeStatus: (): Promise<RuntimeStatus> => fetchJson(`${API_BASE}/configuration/runtime-status`),
 
   /**
-   * Admin only. service_name is one of the RuntimeStatus.integrations keys (virustotal, wazuh, okta, ...).
+   * Admin only. service_name is one of the integration ids (virustotal, wazuh, okta, ...).
    * Stored settings are tested unless overrides are given (to test values before saving them).
    */
   testConnection: (
@@ -325,23 +367,22 @@ export const api = {
   ): Promise<TestConnectionResult> =>
     fetchJson<TestConnectionResult>(`${API_BASE}/configuration/test-connection`, {
       method: 'POST',
-      body: JSON.stringify({ category, service_name, ...(overrides || {}) }),
+      body: jsonBody({ category, service_name, ...(overrides || {}) }),
     }),
 
-  getHotlStatus: (): Promise<HotlStatus> =>
-    fetchJson(`${API_BASE}/configuration/hotl-status`),
+  getHotlStatus: (): Promise<HotlStatus> => fetchJson(`${API_BASE}/configuration/hotl-status`),
 
+  /** Admin only. Enabling can answer 409 {message, blockers} until protected assets are listed. */
   toggleHotl: (enabled?: boolean): Promise<HotlStatus> =>
     fetchJson(`${API_BASE}/configuration/hotl-toggle`, {
       method: 'POST',
-      body: JSON.stringify(enabled !== undefined ? { enabled } : {}),
+      body: jsonBody(enabled !== undefined ? { enabled } : {}),
     }),
 
-  // Metrics
-  getDashboardMetrics: (): Promise<DashboardMetrics> =>
-    fetchJson(`${API_BASE}/alerts/metrics/dashboard`),
+  // --- Metrics ---------------------------------------------------------------------
+  getDashboardMetrics: (): Promise<DashboardMetrics> => fetchJson(`${API_BASE}/alerts/metrics/dashboard`),
 
-  // Alerts & Forensics
+  // --- Alerts & forensics ------------------------------------------------------------
   getAlerts: (params?: { severity?: string; status?: string; skip?: number; limit?: number }): Promise<Alert[]> => {
     const query = new URLSearchParams();
     if (params?.severity) query.append('severity', params.severity);
@@ -351,38 +392,79 @@ export const api = {
     return fetchJson(`${API_BASE}/alerts?${query.toString()}`);
   },
 
-  purgeAlerts: (): Promise<{ status: string; message: string }> =>
-    fetchJson(`${API_BASE}/alerts/purge`, { method: 'DELETE' }),
+  /**
+   * Admin only. Two steps: the backend issues a one-time confirmation token (valid about two minutes, bound to
+   * this session) and the purge must present it as X-Confirm-Token. Call this only after the operator confirmed.
+   */
+  purgeAlerts: async (): Promise<{ status: string; message: string; deleted_alerts?: number }> => {
+    const issued = await fetchJson<{ confirm_token: string }>(`${API_BASE}/alerts/purge/confirm`);
+    return fetchJson(`${API_BASE}/alerts/purge`, {
+      method: 'DELETE',
+      headers: { 'X-Confirm-Token': issued.confirm_token },
+    });
+  },
 
-  getAlertDetail: (alertId: number): Promise<AlertDetail> =>
-    fetchJson(`${API_BASE}/alerts/${alertId}`),
+  getAlertDetail: (alertId: number): Promise<AlertDetail> => fetchJson(`${API_BASE}/alerts/${alertId}`),
 
-  approveAlert: (alertId: number) =>
+  approveAlert: (alertId: number): Promise<JsonObject> =>
     fetchJson(`${API_BASE}/alerts/${alertId}/approve`, { method: 'POST' }),
 
-  dismissAlert: (alertId: number) =>
+  dismissAlert: (alertId: number): Promise<JsonObject> =>
     fetchJson(`${API_BASE}/alerts/${alertId}/dismiss`, { method: 'POST' }),
 
-  submitAlertDecision: (alertId: number, decision: 'take_action' | 'keep_and_monitor' | 'dismiss', notes?: string) =>
+  submitAlertDecision: (
+    alertId: number,
+    decision: 'take_action' | 'keep_and_monitor' | 'dismiss',
+    notes?: string
+  ): Promise<JsonObject> =>
     fetchJson(`${API_BASE}/alerts/${alertId}/decision`, {
       method: 'POST',
-      body: JSON.stringify({ decision, notes }),
+      body: jsonBody({ decision, notes }),
     }),
 
   /** Re-run TIP enrichment for the alert's IOCs in the background. */
-  triggerBackgroundTipEnrichment: (alertId: number) =>
+  triggerBackgroundTipEnrichment: (alertId: number): Promise<JsonObject> =>
     fetchJson(`${API_BASE}/alerts/${alertId}/enrich-background`, { method: 'POST' }),
 
   getAlertVulnerabilities: (alertId: number): Promise<VulnerabilityIntel> =>
     fetchJson(`${API_BASE}/alerts/${alertId}/vulnerabilities`),
 
-  executeNvdHotl: (alertId: number) =>
+  executeNvdHotl: (alertId: number): Promise<JsonObject> =>
     fetchJson(`${API_BASE}/alerts/${alertId}/vulnerabilities/execute-hotl`, { method: 'POST' }),
 
   downloadAlertReport: (alertId: number): Promise<void> =>
     downloadAuthenticated(`${API_BASE}/alerts/${alertId}/report`, `phantom_soar_incident_${alertId}.pdf`),
 
-  // Playbooks
+  // --- AI agent (AI_API_CONTRACT.md) ----------------------------------------------------
+  getAgentStatus: (): Promise<AgentStatus> => fetchJson(`${API_BASE}/agent/status`),
+
+  getProposals: (params?: ProposalQuery): Promise<ProposalList> => {
+    const query = new URLSearchParams();
+    if (params?.status) query.append('status', params.status);
+    if (params?.alert_id !== undefined) query.append('alert_id', String(params.alert_id));
+    query.append('limit', String(params?.limit ?? 50));
+    query.append('offset', String(params?.offset ?? 0));
+    return fetchJson(`${API_BASE}/agent/proposals?${query.toString()}`);
+  },
+
+  getProposal: (proposalId: number): Promise<AgentProposal> =>
+    fetchJson(`${API_BASE}/agent/proposals/${proposalId}`),
+
+  /** Responder role. 409: AI disabled, key missing, rate limited or alert busy. 502: the model call failed. */
+  triageAlert: (alertId: number): Promise<AgentProposal> =>
+    fetchJson(`${API_BASE}/agent/triage/${alertId}`, { method: 'POST', body: jsonBody({}) }),
+
+  /** action_indexes omitted = approve every action. 409 when the proposal was already decided. */
+  approveProposal: (
+    proposalId: number,
+    data: { notes?: string; action_indexes?: number[] }
+  ): Promise<ProposalApprovalResult> =>
+    fetchJson(`${API_BASE}/agent/proposals/${proposalId}/approve`, { method: 'POST', body: jsonBody(data) }),
+
+  rejectProposal: (proposalId: number, data: { notes?: string }): Promise<AgentProposal> =>
+    fetchJson(`${API_BASE}/agent/proposals/${proposalId}/reject`, { method: 'POST', body: jsonBody(data) }),
+
+  // --- Playbooks ---------------------------------------------------------------------------
   getPlaybooks: (activeOnly: boolean = false): Promise<Playbook[]> =>
     fetchJson(`${API_BASE}/playbooks?active_only=${activeOnly}`),
 
@@ -390,33 +472,26 @@ export const api = {
     fetchJson(`${API_BASE}/playbooks/templates`),
 
   /** Actions a playbook step may use plus the runner's pseudo-steps. */
-  getPlaybookActions: (): Promise<ActionCatalog> =>
-    fetchJson(`${API_BASE}/playbooks/actions`),
+  getPlaybookActions: (): Promise<ActionCatalog> => fetchJson(`${API_BASE}/playbooks/actions`),
 
   createPlaybook: (data: Partial<Playbook>): Promise<Playbook> =>
-    fetchJson(`${API_BASE}/playbooks`, {
-      method: 'POST',
-      body: JSON.stringify(data),
-    }),
+    fetchJson(`${API_BASE}/playbooks`, { method: 'POST', body: jsonBody(data) }),
 
   updatePlaybook: (playbookId: number, data: Partial<Playbook>): Promise<Playbook> =>
-    fetchJson(`${API_BASE}/playbooks/${playbookId}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    }),
+    fetchJson(`${API_BASE}/playbooks/${playbookId}`, { method: 'PUT', body: jsonBody(data) }),
 
-  deletePlaybook: (playbookId: number) =>
+  deletePlaybook: (playbookId: number): Promise<JsonObject> =>
     fetchJson(`${API_BASE}/playbooks/${playbookId}`, { method: 'DELETE' }),
 
   togglePlaybook: (playbookId: number): Promise<{ is_active: boolean }> =>
     fetchJson(`${API_BASE}/playbooks/${playbookId}/toggle`, { method: 'PATCH' }),
 
   /** Admin only, simulation mode only (409 otherwise): sends lab payloads through the real ingest pipeline. */
-  seedDemoData: (): Promise<{ status?: string; message?: string; [key: string]: unknown }> =>
+  seedDemoData: (): Promise<{ status?: string; message?: string }> =>
     fetchJson(`${API_BASE}/demo/seed`, { method: 'POST' }),
 
-  // Telemetry & Security Logs
-  getLogs: (params?: { source?: string; seconds?: number; level?: string; search?: string; limit?: number }): Promise<SystemLog[]> => {
+  // --- Telemetry & security logs (append-only: there is no write or delete API) -------------
+  getLogs: (params?: LogQuery): Promise<SystemLog[]> => {
     const query = new URLSearchParams();
     if (params?.source) query.append('source', params.source);
     if (params?.seconds) query.append('seconds', String(params.seconds));
@@ -425,8 +500,4 @@ export const api = {
     if (params?.limit) query.append('limit', String(params.limit));
     return fetchJson(`${API_BASE}/logs?${query.toString()}`);
   },
-
-  /** Admin only. */
-  clearLogs: () =>
-    fetchJson(`${API_BASE}/logs`, { method: 'DELETE' }),
 };

@@ -1,0 +1,38 @@
+<!--
+  OPTIONAL manager-side configuration for the Phantom SOAR response commands.
+  Put these blocks in /var/ossec/etc/ossec.conf on the Wazuh MANAGER (inside <ossec_config>), then
+  `systemctl restart wazuh-manager`.
+
+  You only need this file if you turn OFF the "!" convention (setting wazuh_ar_script_prefix=false).
+  By default Phantom sends commands as "!phantom-isolate-host" etc., which the Wazuh API passes straight to the
+  script in the agent's active-response/bin directory, with no <command> block needed
+  (framework/wazuh/active_response.py validate_command; src/os_execd/exec.c GetCommandbyName).
+
+  Without "!" the API only accepts names listed in /var/ossec/etc/shared/ar.conf, and Wazuh writes each entry
+  there as "<command name><timeout>" (src/config/active-response.c). With the blocks below (timeout 0 = stateless
+  commands) the names are therefore  phantom-isolate-host0, phantom-block-ip0, ...  and those are the values to
+  put in the wazuh_ar_*_command settings.
+
+  The <active-response> blocks are what makes Wazuh list a command in ar.conf. They are pinned to rule 999999,
+  which no stock or custom rule uses, so they NEVER fire automatically from alerts: only Phantom triggers them
+  through the API. Do not change that to a level or a real rule id unless you want Wazuh itself to run them.
+
+  On Windows agents the executable has to carry the extension of the launcher (.cmd), see wazuh/README.md.
+-->
+
+<command><name>phantom-isolate-host</name>   <executable>phantom-isolate-host</executable>   <timeout_allowed>no</timeout_allowed></command>
+<command><name>phantom-unisolate-host</name> <executable>phantom-unisolate-host</executable> <timeout_allowed>no</timeout_allowed></command>
+<command><name>phantom-kill-process</name>   <executable>phantom-kill-process</executable>   <timeout_allowed>no</timeout_allowed></command>
+<command><name>phantom-quarantine-file</name><executable>phantom-quarantine-file</executable><timeout_allowed>no</timeout_allowed></command>
+<command><name>phantom-block-ip</name>       <executable>phantom-block-ip</executable>       <timeout_allowed>no</timeout_allowed></command>
+<command><name>phantom-unblock-ip</name>     <executable>phantom-unblock-ip</executable>     <timeout_allowed>no</timeout_allowed></command>
+<command><name>phantom-rate-limit</name>     <executable>phantom-rate-limit</executable>     <timeout_allowed>no</timeout_allowed></command>
+
+<!-- Timed blocks and rate limits expire inside the script (duration_hours argument), not through <timeout>. -->
+<active-response><disabled>no</disabled><command>phantom-isolate-host</command>   <location>local</location><rules_id>999999</rules_id></active-response>
+<active-response><disabled>no</disabled><command>phantom-unisolate-host</command> <location>local</location><rules_id>999999</rules_id></active-response>
+<active-response><disabled>no</disabled><command>phantom-kill-process</command>   <location>local</location><rules_id>999999</rules_id></active-response>
+<active-response><disabled>no</disabled><command>phantom-quarantine-file</command><location>local</location><rules_id>999999</rules_id></active-response>
+<active-response><disabled>no</disabled><command>phantom-block-ip</command>       <location>local</location><rules_id>999999</rules_id></active-response>
+<active-response><disabled>no</disabled><command>phantom-unblock-ip</command>     <location>local</location><rules_id>999999</rules_id></active-response>
+<active-response><disabled>no</disabled><command>phantom-rate-limit</command>     <location>local</location><rules_id>999999</rules_id></active-response>

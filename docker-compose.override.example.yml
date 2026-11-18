@@ -1,0 +1,35 @@
+# Plain local development WITHOUT the TLS proxy (browser -> http://localhost:3000 and the API on :8000).
+#
+#   cp docker-compose.override.example.yml docker-compose.override.yml   # compose loads it automatically
+#   docker compose up -d --build --wait
+#   -> console http://localhost:3000   API http://localhost:8000/api/health
+#
+# docker-compose.override.yml is git-ignored. Delete it to go back to the proxied (single-origin) setup.
+#
+# Differences from the default setup:
+#   * the "proxy" service only starts with the "with-proxy" profile, so there is no TLS;
+#   * backend and frontend publish loopback-only ports (never use these on a shared or internet-facing host);
+#   * the browser bundle calls the API at http://localhost:8000 (cross-origin), which is why
+#     PHANTOM_CORS_ORIGINS must list the console's origin; PHANTOM_ENV stays "production" unless you change it,
+#     so the encryption key and JWT secret are still enforced.
+#   * the API docs stay disabled while PHANTOM_ENV=production; set PHANTOM_ENABLE_DOCS=true in .env to see /docs.
+services:
+  proxy:
+    profiles: ["with-proxy"]
+
+  backend:
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  frontend:
+    build:
+      args:
+        # Baked into the bundle at build time; rebuild the frontend after changing it.
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  # Uncomment to inspect the database from the host (psql -h 127.0.0.1 -U phantom phantom_soar).
+  # db:
+  #   ports:
+  #     - "127.0.0.1:5432:5432"

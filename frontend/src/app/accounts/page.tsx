@@ -1,797 +1,775 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
-import { 
-  Users, 
-  UserPlus, 
-  ShieldCheck, 
-  KeyRound, 
-  Trash2, 
-  Power, 
-  AlertCircle, 
-  CheckCircle2, 
-  RefreshCw, 
-  Shield, 
-  Lock, 
-  UserCheck, 
-  Clock, 
-  X,
-  Search,
-  BadgeCheck,
+import React, { useCallback, useMemo, useRef, useState } from "react";
+import {
   Bot,
-  Copy,
-  Check,
-  RotateCw
+  KeyRound,
+  Loader2,
+
+  Plus,
+  Power,
+  RefreshCw,
+  RotateCw,
+  Search,
+  Settings2,
+  Shield,
+  ShieldCheck,
+  Trash2,
+  UserCheck,
+  UserPlus,
+  Users,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { User } from "@/lib/types";
-import { getStoredUser, subscribeToAuth } from "@/lib/auth";
-import { ASSIGNABLE_ROLES, ROLE_SOC_ANALYST, isAdmin, roleLevel } from "@/lib/roles";
-import { formatDate } from "@/lib/format";
+import { describeError } from "@/lib/errors";
+import { formatDate, formatDateTime } from "@/lib/format";
+import { ASSIGNABLE_ROLES, ROLE_SOC_ANALYST, canAdminister, isAdmin, roleLevel } from "@/lib/roles";
+import { IngestTokenInfo, User } from "@/lib/types";
+import { useResource } from "@/hooks/useResource";
+import { useAuth } from "@/components/AuthGate";
+import { useConfirm } from "@/components/ConfirmDialog";
+import Dialog from "@/components/Dialog";
+import SecretOnceDialog, { OneTimeSecret } from "@/components/SecretOnceDialog";
+import { AccessDenied, EmptyState, ErrorState, InlineNotice, LoadingState, StaleBanner } from "@/components/StateViews";
+import { useToast } from "@/components/Toast";
+
+const INPUT =
+  "w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500";
+const ICON_BTN =
+  "p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-30 disabled:cursor-not-allowed";
+
+/** "10.0.0.5, 192.168.1.0/24" or one entry per line -> trimmed list. The backend validates each entry. */
+function parseAllowlist(text: string): string[] {
+  return text
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function parseDays(text: string): { value?: number; error?: string } {
+  if (!text.trim()) return {};
+  if (!/^\d+$/.test(text.trim()) || Number(text) < 1 || Number(text) > 3650) {
+    return { error: "Expiry must be a whole number of days between 1 and 3650." };
+  }
+  return { value: Number(text) };
+}
 
 export default function AccountsPage() {
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [isAuthorized, setIsAuthorized] = useState<boolean>(true);
-  const [users, setUsers] = useState<User[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
-  const [successMsg, setSuccessMsg] = useState<string | null>(null);
-  const [searchQuery, setSearchQuery] = useState<string>("");
+  const { user: me } = useAuth();
+  const toast = useToast();
+  const confirm = useConfirm();
+  const allowed = canAdminister(me);
 
-  // Modal State
-  const [showCreateModal, setShowCreateModal] = useState<boolean>(false);
-  const [newUsername, setNewUsername] = useState<string>("");
-  const [newRole, setNewRole] = useState<string>(ROLE_SOC_ANALYST);
-  const [createLoading, setCreateLoading] = useState<boolean>(false);
-  const [modalError, setModalError] = useState<string | null>(null);
+  const usersFetcher = useCallback(() => api.getUsers(), []);
+  const users = useResource(usersFetcher, { enabled: allowed });
+  const tokensFetcher = useCallback(() => api.getIngestTokens(), []);
+  const tokens = useResource(tokensFetcher, { enabled: allowed });
 
-  // Service account (AI agent) state
-  const [showServiceModal, setShowServiceModal] = useState<boolean>(false);
-  const [serviceUsername, setServiceUsername] = useState<string>("");
-  const [serviceLoading, setServiceLoading] = useState<boolean>(false);
-  const [serviceError, setServiceError] = useState<string | null>(null);
-  const [issuedKey, setIssuedKey] = useState<{ username: string; apiKey: string } | null>(null);
-  const [keyCopied, setKeyCopied] = useState<boolean>(false);
+  const [search, setSearch] = useState("");
+  const [secret, setSecret] = useState<OneTimeSecret | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [showService, setShowService] = useState(false);
+  const [showToken, setShowToken] = useState(false);
+  const [policyFor, setPolicyFor] = useState<User | null>(null);
+  const [busyId, setBusyId] = useState<number | null>(null);
 
-  const evaluateAuth = (user: User | null) => {
-    setCurrentUser(user);
-    if (!user) {
-      setIsAuthorized(false);
-      return false;
-    }
-    const authorized = isAdmin(user);
-    setIsAuthorized(authorized);
-    return authorized;
-  };
+  const list = useMemo(() => users.data ?? [], [users.data]);
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return list;
+    return list.filter((u) => u.username.toLowerCase().includes(q) || u.role.toLowerCase().includes(q));
+  }, [list, search]);
 
-  // Load Users
-  const loadUsers = async () => {
-    try {
-      setLoading(true);
-      const data = await api.getUsers();
-      setUsers(data);
-      setError(null);
-    } catch (err: any) {
-      setError(err.message || "Failed to load operator accounts.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    const user = getStoredUser();
-    const authorized = evaluateAuth(user);
-    if (authorized) {
-      loadUsers();
-    } else {
-      setLoading(false);
-    }
-
-    const unsubscribe = subscribeToAuth((updatedUser) => {
-      const isAuth = evaluateAuth(updatedUser);
-      if (isAuth) {
-        loadUsers();
-      }
-    });
-
-    return () => {
-      unsubscribe();
-    };
-  }, []);
-
-  const handleCreateUser = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setCreateLoading(true);
-    setModalError(null);
-
-    try {
-      const created = await api.createUser({
-        username: newUsername.trim(),
-        role: newRole,
-      });
-      const tempPassword = created?.temporary_password || created?.default_password;
-      setShowCreateModal(false);
-      setNewUsername("");
-      setNewRole(ROLE_SOC_ANALYST);
-      setSuccessMsg(
-        tempPassword
-          ? `Operator '${created.username}' created. One-time password: ${tempPassword} (shown once; the operator must change it at first sign-in).`
-          : `Operator '${created?.username || newUsername.trim()}' created. The operator must change the initial password at first sign-in.`
-      );
-      loadUsers();
-    } catch (err: any) {
-      setModalError(err.message || "Failed to create user account.");
-    } finally {
-      setCreateLoading(false);
-    }
-  };
-
-  const handleResetPassword = async (target: User) => {
-    if (target.is_service_account) return;
-    if (!confirm(`Reset the password for '${target.username}'? Their current sessions end and they must set a new password at next sign-in.`)) {
-      return;
-    }
-
-    try {
-      const res = await api.resetUserPassword(target.user_id);
-      const tempPassword = res?.temporary_password || res?.default_password;
-      setSuccessMsg(
-        tempPassword
-          ? `Password for '${target.username}' was reset. One-time password: ${tempPassword} (shown once; it must be changed at next sign-in).`
-          : res?.message || `Password for '${target.username}' was reset; it must be changed at next sign-in.`
-      );
-      loadUsers();
-    } catch (err: any) {
-      setError(err.message || "Failed to reset operator password.");
-    }
-  };
-
-  const handleCreateServiceAccount = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setServiceLoading(true);
-    setServiceError(null);
-    try {
-      const created = await api.createServiceAccount(serviceUsername.trim());
-      setShowServiceModal(false);
-      setServiceUsername("");
-      setKeyCopied(false);
-      setIssuedKey({ username: created.username, apiKey: created.api_key });
-      loadUsers();
-    } catch (err: any) {
-      setServiceError(err.message || "Failed to create the service account.");
-    } finally {
-      setServiceLoading(false);
-    }
-  };
-
-  const handleRotateKey = async (target: User) => {
-    if (!confirm(`Issue a new API key for '${target.username}'? The current key stops working immediately.`)) return;
-    try {
-      const res = await api.rotateServiceAccountKey(target.user_id);
-      setKeyCopied(false);
-      setIssuedKey({ username: res.username || target.username, apiKey: res.api_key });
-      loadUsers();
-    } catch (err: any) {
-      setError(err.message || "Failed to rotate the API key.");
-    }
-  };
-
-  const handleFlagCompromised = async (userId: number, username: string) => {
-    if (!confirm(`Flag account '${username}' as suspected compromised per NIST SP 800-63B? The user will be required to change their credentials on next authentication.`)) {
-      return;
-    }
-
-    try {
-      await api.flagUserCompromised(userId);
-      setSuccessMsg(`Operator '${username}' has been flagged as compromised. Mandatory credential rotation enforced.`);
-      loadUsers();
-    } catch (err: any) {
-      setError(err.message || "Failed to flag account as compromised.");
-    }
-  };
-
-  const handleToggleActive = async (user: User) => {
-    const nextStatus = !user.is_active;
-    try {
-      await api.updateUser(user.user_id, { is_active: nextStatus });
-      setSuccessMsg(`Operator '${user.username}' is now ${nextStatus ? "Enabled" : "Disabled"}.`);
-      loadUsers();
-    } catch (err: any) {
-      setError(err.message || "Failed to update operator status.");
-    }
-  };
-
-  const handleDeleteUser = async (userId: number, username: string) => {
-    if (username === "abunemah") {
-      alert("Root administrator account 'abunemah' cannot be removed.");
-      return;
-    }
-
-    if (!confirm(`Permanently remove operator account '${username}' from Phantom SOAR?`)) {
-      return;
-    }
-
-    try {
-      await api.deleteUser(userId);
-      setSuccessMsg(`Operator account '${username}' was permanently deleted.`);
-      loadUsers();
-    } catch (err: any) {
-      setError(err.message || "Failed to delete operator account.");
-    }
-  };
-
-  // Filter users by search
-  const filteredUsers = users.filter((u) => 
-    u.username.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    u.role.toLowerCase().includes(searchQuery.toLowerCase())
-  );
-
-  // Statistics
-  const totalUsers = users.length;
-  const activeCount = users.filter((u) => u.is_active !== false).length;
-  const pendingPasswordCount = users.filter((u) => u.must_change_password && !u.is_service_account).length;
-  const adminCount = users.filter((u) => isAdmin(u)).length;
-  const serviceAccountCount = users.filter((u) => u.is_service_account).length;
-
-  if (!isAuthorized) {
+  if (!allowed) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-[70vh] text-center px-4">
-        <div className="h-16 w-16 rounded-2xl bg-rose-500/10 border border-rose-500/20 flex items-center justify-center text-rose-400 mb-4">
-          <Lock className="h-8 w-8" />
-        </div>
-        <h2 className="text-xl font-bold text-white mb-2">Access Restricted (Admin Only)</h2>
-        <p className="text-sm text-slate-400 max-w-md">
-          Operator provisioning, password resets, and RBAC governance are restricted exclusively to SOC Administrators. Your current role is <b>{currentUser?.role || "SOC Analyst"}</b>.
-        </p>
-      </div>
+      <AccessDenied title="Access restricted (administrators only)">
+        Operator provisioning, password resets and service accounts are limited to administrators. Your role is{" "}
+        <b>{me?.role || "unknown"}</b>.
+      </AccessDenied>
     );
   }
 
+  const run = async (target: User, fn: () => Promise<void>, failure: string) => {
+    setBusyId(target.user_id);
+    try {
+      await fn();
+    } catch (err) {
+      toast.error(describeError(err, failure));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const resetPassword = async (target: User) => {
+    const ok = await confirm({
+      title: `Reset the password for ${target.username}?`,
+      message: "The current password stops working and every active session for this account is signed out.",
+      items: ["A one-time password is shown once, to you.", "The operator must choose a new password at the next sign-in."],
+      confirmLabel: "Reset password",
+      tone: "warning",
+    });
+    if (!ok) return;
+    await run(target, async () => {
+      const res = await api.resetUserPassword(target.user_id);
+      if (res.temporary_password) {
+        setSecret({
+          title: `One-time password for ${target.username}`,
+          value: res.temporary_password,
+          note: "Shown once. Share it over a trusted channel. The operator must change it at first sign-in.",
+        });
+      } else {
+        toast.success(res.message || `Password for ${target.username} was reset.`);
+      }
+      void users.reload();
+    }, "Could not reset the password.");
+  };
+
+  const flagCompromised = async (target: User) => {
+    const ok = await confirm({
+      title: `Flag ${target.username} as compromised?`,
+      message: "This account is treated as breached (NIST SP 800-63B).",
+      items: ["Its sessions are revoked.", "A new password is required at the next authentication."],
+      confirmLabel: "Flag as compromised",
+      tone: "danger",
+    });
+    if (!ok) return;
+    await run(target, async () => {
+      await api.flagUserCompromised(target.user_id);
+      toast.success(`${target.username} was flagged as compromised; credential rotation is now mandatory.`);
+      void users.reload();
+    }, "Could not flag the account.");
+  };
+
+  const toggleActive = async (target: User) => {
+    const enable = target.is_active === false;
+    const ok = await confirm({
+      title: enable ? `Enable ${target.username}?` : `Disable ${target.username}?`,
+      message: enable
+        ? "The account can sign in (or authenticate with its API key) again."
+        : "The account is signed out and cannot authenticate until it is enabled again. Its history is kept.",
+      confirmLabel: enable ? "Enable account" : "Disable account",
+      tone: enable ? "default" : "warning",
+    });
+    if (!ok) return;
+    await run(target, async () => {
+      await api.updateUser(target.user_id, { is_active: enable });
+      toast.success(`${target.username} is now ${enable ? "enabled" : "disabled"}.`);
+      void users.reload();
+    }, "Could not change the account status.");
+  };
+
+  const removeUser = async (target: User) => {
+    const ok = await confirm({
+      title: `Permanently delete ${target.username}?`,
+      message: "The account is removed and cannot sign in or use its API key again. This cannot be undone.",
+      items: ["Audit-log entries written by this account are kept."],
+      confirmLabel: "Delete account",
+      tone: "danger",
+      requireText: target.username,
+    });
+    if (!ok) return;
+    await run(target, async () => {
+      await api.deleteUser(target.user_id);
+      toast.success(`${target.username} was deleted.`);
+      void users.reload();
+    }, "Could not delete the account.");
+  };
+
+  const rotateKey = async (target: User) => {
+    const ok = await confirm({
+      title: `Rotate the API key of ${target.username}?`,
+      message: "A new key is issued and the current key stops working immediately.",
+      items: ["Any agent still using the old key will get 401 until it is updated.", "The new key is shown once."],
+      confirmLabel: "Rotate key",
+      tone: "danger",
+    });
+    if (!ok) return;
+    await run(target, async () => {
+      const res = await api.rotateServiceAccountKey(target.user_id);
+      setSecret({
+        title: `API key for ${res.username || target.username}`,
+        value: res.api_key,
+        note: "Shown once; only a digest is stored. Send it as the X-Phantom-Agent-Key header. The previous key no longer works.",
+      });
+      void users.reload();
+    }, "Could not rotate the API key.");
+  };
+
+  const revokeToken = async (token: IngestTokenInfo) => {
+    const ok = await confirm({
+      title: `Revoke ingest token "${token.name}"?`,
+      message: "Senders that use this token are rejected immediately. A revoked token cannot be restored.",
+      confirmLabel: "Revoke token",
+      tone: "danger",
+    });
+    if (!ok) return;
+    try {
+      await api.revokeIngestToken(token.id);
+      toast.success(`Ingest token "${token.name}" was revoked.`);
+      void tokens.reload();
+    } catch (err) {
+      toast.error(describeError(err, "Could not revoke the token."));
+    }
+  };
+
+  const totalUsers = list.length;
+  const activeCount = list.filter((u) => u.is_active !== false).length;
+  const pendingPassword = list.filter((u) => u.must_change_password && !u.is_service_account).length;
+  const adminCount = list.filter((u) => isAdmin(u)).length;
+  const serviceCount = list.filter((u) => u.is_service_account).length;
+
   return (
-    <div className="space-y-6">
-      {/* Page Header */}
+    <div className="space-y-6 animate-fade-in">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-5">
-        <div>
-          <div className="flex items-center space-x-3">
-            <div className="p-2.5 rounded-xl bg-blue-600/10 border border-blue-500/20 text-blue-400">
-              <Users className="h-6 w-6" />
-            </div>
-            <div>
-              <h1 className="text-xl font-bold text-slate-100 flex items-center gap-2">
-                Operator Accounts & RBAC
-                <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                  IAM Security
-                </span>
-              </h1>
-              <p className="text-xs text-slate-400 mt-0.5">
-                Provision SOC analysts, assign role-based access, and oversee the first-login credential lifecycle.
-              </p>
-            </div>
+        <div className="flex items-center gap-3">
+          <div className="p-2.5 rounded-xl bg-blue-600/10 border border-blue-500/20 text-blue-400">
+            <Users className="h-6 w-6" aria-hidden="true" />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold text-slate-100">Operator accounts &amp; RBAC</h1>
+            <p className="text-xs text-slate-400 mt-0.5">Provision operators and AI agent accounts, assign roles and manage credentials.</p>
           </div>
         </div>
-
-        <div className="flex items-center space-x-3">
-          <button
-            onClick={loadUsers}
-            disabled={loading}
-            className="flex items-center space-x-1.5 px-3 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-semibold text-slate-300 transition"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
-            <span>Refresh</span>
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" onClick={() => { void users.reload(); void tokens.reload(); }} className="flex items-center gap-1.5 px-3 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 rounded-xl text-xs font-semibold text-slate-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500">
+            <RefreshCw className={`h-3.5 w-3.5 ${users.loading ? "animate-spin" : ""}`} aria-hidden="true" /> Refresh
           </button>
-
-          <button
-            onClick={() => {
-              setServiceError(null);
-              setShowServiceModal(true);
-            }}
-            className="flex items-center space-x-2 px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-cyan-500/30 text-cyan-300 rounded-xl text-xs font-bold transition"
-            title="Create a non-human account whose API key lets an AI triage agent use the agent API"
-          >
-            <Bot className="h-4 w-4" />
-            <span>Create AI Agent Account</span>
+          <button type="button" onClick={() => setShowService(true)} title="Non-human account whose API key lets an AI triage agent use the agent API" className="flex items-center gap-2 px-4 py-2 bg-slate-900 hover:bg-slate-800 border border-cyan-500/30 text-cyan-300 rounded-xl text-xs font-bold focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400">
+            <Bot className="h-4 w-4" aria-hidden="true" /> Create AI agent account
           </button>
-
-          <button
-            onClick={() => setShowCreateModal(true)}
-            className="flex items-center space-x-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold shadow-lg shadow-blue-600/20 transition transform hover:-translate-y-0.5"
-          >
-            <UserPlus className="h-4 w-4" />
-            <span>Create New Operator</span>
+          <button type="button" onClick={() => setShowCreate(true)} className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-300">
+            <UserPlus className="h-4 w-4" aria-hidden="true" /> Create operator
           </button>
         </div>
       </div>
 
-      {/* Notifications */}
-      {error && (
-        <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs flex items-center justify-between">
-          <div className="flex items-center space-x-2">
-            <AlertCircle className="h-4 w-4 flex-shrink-0" />
-            <span>{error}</span>
-          </div>
-          <button onClick={() => setError(null)} className="hover:text-rose-200">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-      )}
+      {users.error && !users.data ? (
+        <ErrorState title="Could not load accounts" message={users.error} onRetry={() => void users.reload()} />
+      ) : users.loading && !users.data ? (
+        <LoadingState label="Loading operator directory..." />
+      ) : (
+        <>
+          {users.error && <StaleBanner message={users.error} onRetry={() => void users.reload()} />}
+          <section aria-label="Account totals" className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <Stat label="Total accounts" value={totalUsers} icon={<Users className="h-4 w-4 text-blue-400" aria-hidden="true" />} sub={`${serviceCount} service account${serviceCount === 1 ? "" : "s"}`} />
+            <Stat label="Active" value={activeCount} tone="text-emerald-400" icon={<UserCheck className="h-4 w-4 text-emerald-400" aria-hidden="true" />} sub="Allowed to authenticate" />
+            <Stat label="Pending first login" value={pendingPassword} tone="text-amber-400" icon={<KeyRound className="h-4 w-4 text-amber-400" aria-hidden="true" />} sub="Must change password" />
+            <Stat label="Administrators" value={adminCount} tone="text-purple-400" icon={<Shield className="h-4 w-4 text-purple-400" aria-hidden="true" />} sub="High-privilege accounts" />
+          </section>
 
-      {successMsg && (
-        <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs flex items-center justify-between">
-          <div className="flex items-center space-x-2">
-            <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
-            <span>{successMsg}</span>
-          </div>
-          <button onClick={() => setSuccessMsg(null)} className="hover:text-emerald-200">
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-      )}
-
-      {/* Metrics Row */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-          <div className="flex items-center justify-between text-slate-400 text-xs mb-1">
-            <span>Total Accounts</span>
-            <Users className="h-4 w-4 text-blue-400" />
-          </div>
-          <div className="text-2xl font-black text-white">{totalUsers}</div>
-          <span className="text-[11px] text-slate-500 font-medium">Provisioned in system</span>
-        </div>
-
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-          <div className="flex items-center justify-between text-slate-400 text-xs mb-1">
-            <span>Active Operators</span>
-            <UserCheck className="h-4 w-4 text-emerald-400" />
-          </div>
-          <div className="text-2xl font-black text-emerald-400">{activeCount}</div>
-          <span className="text-[11px] text-slate-500 font-medium">Authorized to login</span>
-        </div>
-
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-          <div className="flex items-center justify-between text-slate-400 text-xs mb-1">
-            <span>Pending First Login</span>
-            <KeyRound className="h-4 w-4 text-amber-400" />
-          </div>
-          <div className="text-2xl font-black text-amber-400">{pendingPasswordCount}</div>
-          <span className="text-[11px] text-slate-500 font-medium">Must change initial password</span>
-        </div>
-
-        <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-          <div className="flex items-center justify-between text-slate-400 text-xs mb-1">
-            <span>Administrators</span>
-            <Shield className="h-4 w-4 text-purple-400" />
-          </div>
-          <div className="text-2xl font-black text-purple-400">{adminCount}</div>
-          <span className="text-[11px] text-slate-500 font-medium">High privilege accounts{serviceAccountCount > 0 ? ` · ${serviceAccountCount} service account${serviceAccountCount === 1 ? "" : "s"}` : ""}</span>
-        </div>
-      </div>
-
-      {/* Search and Table Container */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
-        {/* Table Search Toolbar */}
-        <div className="p-4 border-b border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="relative w-full sm:w-72">
-            <Search className="h-4 w-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search by username or role..."
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500"
-            />
-          </div>
-
-          <div className="text-xs text-slate-400 font-medium">
-            Showing {filteredUsers.length} of {totalUsers} accounts
-          </div>
-        </div>
-
-        {/* Table */}
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-slate-950/60 text-slate-400 font-semibold uppercase tracking-wider border-b border-slate-800">
-              <tr>
-                <th className="py-3.5 px-4">Operator</th>
-                <th className="py-3.5 px-4">Assigned Role</th>
-                <th className="py-3.5 px-4">Credential Status</th>
-                <th className="py-3.5 px-4">Account Status</th>
-                <th className="py-3.5 px-4">Provisioned Date</th>
-                <th className="py-3.5 px-4 text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/60">
-              {loading && users.length === 0 ? (
-                <tr>
-                  <td colSpan={6} className="py-8 text-center text-slate-500">
-                    <RefreshCw className="h-6 w-6 animate-spin mx-auto mb-2 text-blue-500" />
-                    Loading operator directory...
-                  </td>
-                </tr>
-              ) : filteredUsers.length === 0 ? (
-                <tr>
-                  <td colSpan={6} className="py-8 text-center text-slate-500">
-                    No operator accounts found matching &ldquo;{searchQuery}&rdquo;.
-                  </td>
-                </tr>
-              ) : (
-                filteredUsers.map((user) => {
-                  const isRootAdmin = user.username === "abunemah";
-                  const isActive = user.is_active !== false;
-                  const isService = Boolean(user.is_service_account);
-                  const level = roleLevel(user);
-
-                  return (
-                    <tr key={user.user_id} className="hover:bg-slate-800/40 transition">
-                      {/* Operator column */}
-                      <td className="py-3.5 px-4">
-                        <div className="flex items-center space-x-3">
-                          <div className={`h-8 w-8 rounded-lg flex items-center justify-center font-bold text-xs ${
-                            isRootAdmin 
-                              ? "bg-purple-600/20 text-purple-400 border border-purple-500/30" 
-                              : "bg-blue-600/20 text-blue-400 border border-blue-500/30"
-                          }`}>
-                            {user.username.charAt(0).toUpperCase()}
-                          </div>
-                          <div>
-                            <div className="font-bold text-slate-200 flex items-center gap-1.5">
-                              {user.username}
-                              {isRootAdmin && (
-                                <span className="text-[10px] bg-purple-500/20 text-purple-300 px-1.5 py-0.2 rounded border border-purple-500/30 font-semibold">
-                                  Root Admin
-                                </span>
-                              )}
-                              {isService && (
-                                <span
-                                  className="inline-flex items-center gap-1 text-[10px] bg-cyan-500/15 text-cyan-300 px-1.5 py-0.2 rounded border border-cyan-500/30 font-semibold"
-                                  title="Non-human account for the AI agent API. Authenticates with an API key, cannot sign in to the console."
-                                >
-                                  <Bot className="h-3 w-3" />
-                                  Service account
-                                </span>
-                              )}
-                            </div>
-                            <span className="text-[11px] text-slate-500 font-mono">ID #{user.user_id}</span>
-                          </div>
-                        </div>
-                      </td>
-
-                      {/* Assigned Role */}
-                      <td className="py-3.5 px-4">
-                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border ${
-                          level === "admin"
-                            ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
-                            : level === "security_engineer"
-                            ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
-                            : level === "analyst"
-                            ? "bg-blue-500/10 text-blue-400 border-blue-500/20"
-                            : level === "service"
-                            ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20"
-                            : "bg-slate-700/30 text-slate-300 border-slate-600/40"
-                        }`}>
-                          {user.role}
-                        </span>
-                      </td>
-
-                      {/* Credential Status */}
-                      <td className="py-3.5 px-4">
-                        {isService ? (
-                          <span className="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
-                            <KeyRound className="h-3 w-3" />
-                            <span>API key{user.api_key_prefix ? ` (${user.api_key_prefix}…)` : ""}</span>
-                          </span>
-                        ) : user.must_change_password ? (
-                          <span className="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                            <Clock className="h-3 w-3" />
-                            <span>Pending First Login Change</span>
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center space-x-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                            <BadgeCheck className="h-3 w-3" />
-                            <span>Secured & Active</span>
-                          </span>
-                        )}
-                      </td>
-
-                      {/* Account Status */}
-                      <td className="py-3.5 px-4">
-                        {isActive ? (
-                          <span className="inline-flex items-center space-x-1.5 text-emerald-400 font-medium">
-                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                            <span>Active</span>
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center space-x-1.5 text-slate-500 font-medium">
-                            <span className="h-1.5 w-1.5 rounded-full bg-slate-500" />
-                            <span>Disabled</span>
-                          </span>
-                        )}
-                      </td>
-
-                      {/* Provisioned Date */}
-                      <td className="py-3.5 px-4 text-slate-400 font-mono text-[11px]">
-                        {formatDate(user.created_at, "System Init")}
-                      </td>
-
-                      {/* Actions */}
-                      <td className="py-3.5 px-4 text-right">
-                        <div className="flex items-center justify-end space-x-2">
-                          {isService && (
-                            <button
-                              onClick={() => handleRotateKey(user)}
-                              title="Rotate API key (the current key stops working immediately)"
-                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 transition"
-                            >
-                              <RotateCw className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-
-                          {/* Password actions apply to human operators only; service accounts have no password. */}
-                          {!isService && (
-                            <>
-                              <button
-                                onClick={() => handleResetPassword(user)}
-                                title="Reset password (issues a one-time password that must be changed at next sign-in)"
-                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-400 transition"
-                              >
-                                <KeyRound className="h-3.5 w-3.5" />
-                              </button>
-
-                              <button
-                                onClick={() => handleFlagCompromised(user.user_id, user.username)}
-                                title="Flag as Compromised (Forces reset per NIST SP 800-63B)"
-                                className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-500/20 text-rose-400 transition"
-                              >
-                                <Shield className="h-3.5 w-3.5" />
-                              </button>
-                            </>
-                          )}
-
-                          {/* Toggle Active / Disabled */}
-                          {!isRootAdmin && (
-                            <button
-                              onClick={() => handleToggleActive(user)}
-                              title={isActive ? "Disable operator account" : "Enable operator account"}
-                              className={`p-1.5 rounded-lg transition ${
-                                isActive 
-                                  ? "bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-rose-400" 
-                                  : "bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600/30"
-                              }`}
-                            >
-                              <Power className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-
-                          {/* Delete Account */}
-                          {!isRootAdmin ? (
-                            <button
-                              onClick={() => handleDeleteUser(user.user_id, user.username)}
-                              title="Delete account"
-                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-500/20 text-slate-400 hover:text-rose-400 transition"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          ) : (
-                            <span className="p-1.5 opacity-20 cursor-not-allowed">
-                              <ShieldCheck className="h-3.5 w-3.5 text-slate-400" />
-                            </span>
-                          )}
-                        </div>
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+            <div className="p-4 border-b border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-3">
+              <div className="relative w-full sm:w-72">
+                <Search className="h-4 w-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" aria-hidden="true" />
+                <label htmlFor="user-search" className="sr-only">Search accounts</label>
+                <input id="user-search" type="search" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by username or role..." className={`${INPUT} pl-9`} />
+              </div>
+              <div className="text-xs text-slate-400 font-medium" aria-live="polite">Showing {filtered.length} of {totalUsers} accounts</div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <caption className="sr-only">Operator and service accounts</caption>
+                <thead className="bg-slate-950/60 text-slate-400 font-semibold uppercase tracking-wider border-b border-slate-800">
+                  <tr>
+                    <th scope="col" className="py-3.5 px-4">Account</th>
+                    <th scope="col" className="py-3.5 px-4">Role</th>
+                    <th scope="col" className="py-3.5 px-4">Credentials</th>
+                    <th scope="col" className="py-3.5 px-4">Status</th>
+                    <th scope="col" className="py-3.5 px-4">Created</th>
+                    <th scope="col" className="py-3.5 px-4 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {filtered.length === 0 ? (
+                    <tr>
+                      <td colSpan={6}>
+                        <EmptyState icon={Users} title={search ? `No accounts match "${search}"` : "No accounts yet"} />
                       </td>
                     </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* CREATE OPERATOR MODAL */}
-      {showCreateModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 relative animate-in zoom-in-95 duration-200">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-5">
-              <div className="flex items-center space-x-2.5">
-                <div className="p-2 rounded-xl bg-blue-600/10 text-blue-400 border border-blue-500/20">
-                  <UserPlus className="h-5 w-5" />
-                </div>
-                <div>
-                  <h3 className="font-bold text-slate-100 text-sm">Provision New Operator</h3>
-                  <p className="text-[11px] text-slate-400">Configure credentials and assign RBAC role</p>
-                </div>
-              </div>
-              <button 
-                onClick={() => setShowCreateModal(false)}
-                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            {modalError && (
-              <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs flex items-center space-x-2">
-                <AlertCircle className="h-4 w-4 flex-shrink-0" />
-                <span>{modalError}</span>
-              </div>
-            )}
-
-            {/* Informational Policy Box */}
-            <div className="mb-5 p-3.5 rounded-xl bg-blue-950/40 border border-blue-500/30 text-xs text-slate-300 space-y-1.5">
-              <div className="flex items-center space-x-2 text-blue-400 font-bold">
-                <KeyRound className="h-4 w-4" />
-                <span>Initial Password Policy:</span>
-              </div>
-              <p className="text-[11px] text-slate-400">
-                The server issues the initial password. If it returns a one-time password it is shown once after creation; share it with the operator over a trusted channel.
-              </p>
-              <p className="text-[11px] text-amber-400 font-medium">
-                * The operator must change it at first sign-in. For an AI agent, use &ldquo;Create AI Agent Account&rdquo; instead.
-              </p>
-            </div>
-
-            {/* Form */}
-            <form onSubmit={handleCreateUser} className="space-y-4">
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-300">Operator Username</label>
-                <input
-                  type="text"
-                  required
-                  value={newUsername}
-                  onChange={(e) => setNewUsername(e.target.value)}
-                  placeholder="e.g. analyst_sarah, lead_ahmed..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-blue-500 font-medium"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-300">RBAC Role Assignment</label>
-                <select
-                  value={newRole}
-                  onChange={(e) => setNewRole(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-200 focus:outline-none focus:border-blue-500 font-medium"
-                >
-                  {ASSIGNABLE_ROLES.map((r) => (
-                    <option key={r.role} value={r.role}>{r.role}</option>
-                  ))}
-                </select>
-                <p className="text-[11px] text-slate-500">
-                  {ASSIGNABLE_ROLES.find((r) => r.role === newRole)?.description}
-                </p>
-              </div>
-
-              <div className="pt-3 flex items-center justify-end space-x-3">
-                <button
-                  type="button"
-                  onClick={() => setShowCreateModal(false)}
-                  className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={createLoading}
-                  className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold shadow-lg shadow-blue-600/20 transition disabled:opacity-50 flex items-center space-x-2"
-                >
-                  {createLoading && <RefreshCw className="h-3.5 w-3.5 animate-spin" />}
-                  <span>{createLoading ? "Creating Operator..." : "Provision Account"}</span>
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* CREATE SERVICE ACCOUNT MODAL */}
-      {showServiceModal && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 relative">
-            <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-5">
-              <div className="flex items-center space-x-2.5">
-                <div className="p-2 rounded-xl bg-cyan-600/10 text-cyan-300 border border-cyan-500/20">
-                  <Bot className="h-5 w-5" />
-                </div>
-                <div>
-                  <h3 className="font-bold text-slate-100 text-sm">Create AI Agent Account</h3>
-                  <p className="text-[11px] text-slate-400">Service account for the guarded agent API</p>
-                </div>
-              </div>
-              <button
-                onClick={() => setShowServiceModal(false)}
-                className="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800 transition"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            {serviceError && (
-              <div className="mb-4 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs flex items-center space-x-2">
-                <AlertCircle className="h-4 w-4 flex-shrink-0" />
-                <span>{serviceError}</span>
-              </div>
-            )}
-
-            <div className="mb-5 p-3.5 rounded-xl bg-cyan-950/30 border border-cyan-500/20 text-[11px] text-slate-300 space-y-1.5">
-              <p>The account cannot sign in to this console. It authenticates to the agent API with an API key that is shown <b>once</b>.</p>
-              <p>Everything the agent proposes goes through the policy engine; with the default autonomy (recommend_only) every action waits for an analyst.</p>
-            </div>
-
-            <form onSubmit={handleCreateServiceAccount} className="space-y-4">
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-slate-300">Account name</label>
-                <input
-                  type="text"
-                  required
-                  value={serviceUsername}
-                  onChange={(e) => setServiceUsername(e.target.value)}
-                  placeholder="e.g. triage-agent"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-cyan-500 font-medium"
-                />
-              </div>
-              <div className="pt-3 flex items-center justify-end space-x-3">
-                <button
-                  type="button"
-                  onClick={() => setShowServiceModal(false)}
-                  className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold transition"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={serviceLoading}
-                  className="px-5 py-2.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold transition disabled:opacity-50 flex items-center space-x-2"
-                >
-                  {serviceLoading && <RefreshCw className="h-3.5 w-3.5 animate-spin" />}
-                  <span>{serviceLoading ? "Creating..." : "Create & Issue Key"}</span>
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* ONE-TIME API KEY DISPLAY */}
-      {issuedKey && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="w-full max-w-lg bg-slate-900 border border-cyan-500/30 rounded-2xl shadow-2xl p-6 space-y-4">
-            <div className="flex items-center space-x-2.5">
-              <KeyRound className="h-5 w-5 text-cyan-300" />
-              <h3 className="font-bold text-slate-100 text-sm">API key for {issuedKey.username}</h3>
-            </div>
-            <p className="text-[11px] text-amber-400 font-semibold">
-              Copy it now. Only a hash is stored, so it cannot be shown again; rotate the key if it is lost.
-            </p>
-            <div className="flex items-center gap-2">
-              <code className="flex-1 p-3 rounded-lg bg-slate-950 border border-slate-800 text-xs font-mono text-cyan-200 break-all select-all">
-                {issuedKey.apiKey}
-              </code>
-              <button
-                type="button"
-                onClick={() => {
-                  navigator.clipboard.writeText(issuedKey.apiKey);
-                  setKeyCopied(true);
-                }}
-                className="p-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700"
-                title="Copy API key"
-              >
-                {keyCopied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
-              </button>
-            </div>
-            <p className="text-[11px] text-slate-400">
-              The agent sends it as the <code className="font-mono text-slate-200">X-Phantom-Agent-Key</code> header on agent API requests.
-            </p>
-            <div className="flex justify-end">
-              <button
-                type="button"
-                onClick={() => setIssuedKey(null)}
-                className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition"
-              >
-                I have stored the key
-              </button>
+                  ) : (
+                    filtered.map((u) => (
+                      <UserRow
+                        key={u.user_id}
+                        user={u}
+                        isSelf={u.user_id === me?.user_id}
+                        busy={busyId === u.user_id}
+                        onReset={() => void resetPassword(u)}
+                        onFlag={() => void flagCompromised(u)}
+                        onToggle={() => void toggleActive(u)}
+                        onDelete={() => void removeUser(u)}
+                        onRotate={() => void rotateKey(u)}
+                        onPolicy={() => setPolicyFor(u)}
+                      />
+                    ))
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
-        </div>
+        </>
       )}
+
+      {/* Webhook ingest tokens */}
+      <section aria-labelledby="tokens-heading" className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+        <div className="p-4 border-b border-slate-800 flex items-center justify-between gap-3">
+          <div>
+            <h2 id="tokens-heading" className="text-sm font-bold text-slate-100">Webhook ingest tokens</h2>
+            <p className="text-[11px] text-slate-500 mt-0.5">Credentials for Wazuh or other senders posting alerts to the ingest webhook. A token is shown once, when created.</p>
+          </div>
+          <button type="button" onClick={() => setShowToken(true)} className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-300">
+            <Plus className="h-3.5 w-3.5" aria-hidden="true" /> New token
+          </button>
+        </div>
+        {tokens.error && !tokens.data ? (
+          <div className="p-4"><ErrorState compact title="Could not load ingest tokens" message={tokens.error} onRetry={() => void tokens.reload()} /></div>
+        ) : tokens.loading && !tokens.data ? (
+          <LoadingState label="Loading ingest tokens..." />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <caption className="sr-only">Webhook ingest tokens</caption>
+              <thead className="bg-slate-950/60 text-slate-400 font-semibold uppercase tracking-wider border-b border-slate-800">
+                <tr>
+                  <th scope="col" className="py-3 px-4">Name</th>
+                  <th scope="col" className="py-3 px-4">Token</th>
+                  <th scope="col" className="py-3 px-4">Status</th>
+                  <th scope="col" className="py-3 px-4">Expires</th>
+                  <th scope="col" className="py-3 px-4">Last used</th>
+                  <th scope="col" className="py-3 px-4 text-right"><span className="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60">
+                {(tokens.data ?? []).length === 0 ? (
+                  <tr><td colSpan={6}><EmptyState icon={KeyRound} title="No ingest tokens">The webhook falls back to the shared secret from the environment, if one is set.</EmptyState></td></tr>
+                ) : (
+                  (tokens.data ?? []).map((t) => (
+                    <tr key={t.id} className="hover:bg-slate-800/40">
+                      <td className="py-3 px-4 font-semibold text-slate-200">{t.name}</td>
+                      <td className="py-3 px-4 font-mono text-slate-400">{t.token_prefix}…</td>
+                      <td className="py-3 px-4">
+                        <span className={`px-2 py-0.5 rounded-full text-[11px] font-semibold border ${t.status === "active" ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" : "bg-slate-700/30 text-slate-400 border-slate-600/40"}`}>{t.status}</span>
+                      </td>
+                      <td className="py-3 px-4 text-slate-400 font-mono text-[11px]">{t.expires_at ? formatDate(t.expires_at) : "never"}</td>
+                      <td className="py-3 px-4 text-slate-400 font-mono text-[11px]">{t.last_used_at ? formatDateTime(t.last_used_at) : "never"}</td>
+                      <td className="py-3 px-4 text-right">
+                        {t.status === "active" && (
+                          <button type="button" onClick={() => void revokeToken(t)} className="px-3 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 text-[11px] font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-400">
+                            Revoke
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <CreateOperatorDialog
+        open={showCreate}
+        onClose={() => setShowCreate(false)}
+        onCreated={(created) => {
+          setShowCreate(false);
+          void users.reload();
+          if (created.temporary_password) {
+            setSecret({
+              title: `One-time password for ${created.username}`,
+              value: created.temporary_password,
+              note: "Shown once. Share it over a trusted channel. The operator must change it at first sign-in.",
+            });
+          } else {
+            toast.success(`Operator ${created.username} was created.`);
+          }
+        }}
+      />
+      <CreateServiceDialog
+        open={showService}
+        onClose={() => setShowService(false)}
+        onCreated={(res) => {
+          setShowService(false);
+          void users.reload();
+          setSecret({
+            title: `API key for ${res.username}`,
+            value: res.api_key,
+            note: "Shown once; only a digest is stored. The agent sends it as the X-Phantom-Agent-Key header.",
+          });
+        }}
+      />
+      <PolicyDialog
+        target={policyFor}
+        onClose={() => setPolicyFor(null)}
+        onSaved={(name) => {
+          setPolicyFor(null);
+          void users.reload();
+          toast.success(`Access policy for ${name} was updated.`);
+        }}
+      />
+      <CreateTokenDialog
+        open={showToken}
+        onClose={() => setShowToken(false)}
+        onCreated={(res) => {
+          setShowToken(false);
+          void tokens.reload();
+          setSecret({
+            title: `Ingest token "${res.name}"`,
+            value: res.token,
+            note: "Shown once. Configure it as the webhook credential in the sender.",
+          });
+        }}
+      />
+      <SecretOnceDialog secret={secret} onDone={() => setSecret(null)} />
     </div>
   );
 }
+
+function Stat({ label, value, sub, icon, tone = "text-white" }: { label: string; value: number; sub: string; icon: React.ReactNode; tone?: string }) {
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
+      <div className="flex items-center justify-between text-slate-400 text-xs mb-1"><span>{label}</span>{icon}</div>
+      <div className={`text-2xl font-black ${tone}`}>{value}</div>
+      <span className="text-[11px] text-slate-500 font-medium">{sub}</span>
+    </div>
+  );
+}
+
+function UserRow({
+  user, isSelf, busy, onReset, onFlag, onToggle, onDelete, onRotate, onPolicy,
+}: {
+  user: User;
+  isSelf: boolean;
+  busy: boolean;
+  onReset: () => void;
+  onFlag: () => void;
+  onToggle: () => void;
+  onDelete: () => void;
+  onRotate: () => void;
+  onPolicy: () => void;
+}) {
+  const isBootstrap = Boolean(user.is_bootstrap_admin);
+  const isActive = user.is_active !== false;
+  const isService = Boolean(user.is_service_account);
+  const level = roleLevel(user);
+  const protectedReason = isBootstrap ? "The bootstrap administrator cannot be changed this way" : isSelf ? "You cannot do this to your own account" : "";
+  const roleClass =
+    level === "admin" ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
+    : level === "security_engineer" ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
+    : level === "analyst" ? "bg-blue-500/10 text-blue-400 border-blue-500/20"
+    : level === "service" ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20"
+    : "bg-slate-700/30 text-slate-300 border-slate-600/40";
+
+  return (
+    <tr className="hover:bg-slate-800/40 transition">
+      <td className="py-3.5 px-4">
+        <div className="flex items-center gap-3">
+          <div aria-hidden="true" className={`h-8 w-8 rounded-lg flex items-center justify-center font-bold text-xs ${isBootstrap ? "bg-purple-600/20 text-purple-400 border border-purple-500/30" : "bg-blue-600/20 text-blue-400 border border-blue-500/30"}`}>
+            {user.username.charAt(0).toUpperCase()}
+          </div>
+          <div>
+            <div className="font-bold text-slate-200 flex flex-wrap items-center gap-1.5">
+              {user.username}
+              {isSelf && <span className="text-[10px] bg-slate-700/60 text-slate-300 px-1.5 rounded border border-slate-600/50 font-semibold">you</span>}
+              {isBootstrap && <span className="text-[10px] bg-purple-500/20 text-purple-300 px-1.5 rounded border border-purple-500/30 font-semibold">Bootstrap admin</span>}
+              {isService && (
+                <span className="inline-flex items-center gap-1 text-[10px] bg-cyan-500/15 text-cyan-300 px-1.5 rounded border border-cyan-500/30 font-semibold" title="Non-human account for the agent API. Authenticates with an API key and cannot sign in to the console.">
+                  <Bot className="h-3 w-3" aria-hidden="true" /> Service account
+                </span>
+              )}
+            </div>
+            <span className="text-[11px] text-slate-500 font-mono">ID #{user.user_id}</span>
+          </div>
+        </div>
+      </td>
+      <td className="py-3.5 px-4"><span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-semibold border ${roleClass}`}>{user.role}</span></td>
+      <td className="py-3.5 px-4 space-y-1">
+        {isService ? (
+          <>
+            <div className="text-cyan-300 font-semibold">API key{user.api_key_prefix ? ` ${user.api_key_prefix}…` : ""}</div>
+            <div className="text-[11px] text-slate-500">
+              {user.expires_at ? `expires ${formatDate(user.expires_at)}` : "no expiry"}
+              {user.ip_allowlist && user.ip_allowlist.length > 0 ? ` · ${user.ip_allowlist.length} allowed source${user.ip_allowlist.length === 1 ? "" : "s"}` : " · any source IP"}
+            </div>
+            {user.last_used_at && <div className="text-[11px] text-slate-500">last used {formatDateTime(user.last_used_at)}{user.last_used_ip ? ` from ${user.last_used_ip}` : ""}</div>}
+          </>
+        ) : (
+          <>
+            {user.must_change_password ? (
+              <span className="inline-flex px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/20">Password change pending</span>
+            ) : (
+              <span className="inline-flex px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Password set</span>
+            )}
+            <div className="text-[11px] text-slate-500">{user.mfa_enabled ? "MFA on" : "MFA off"}{user.compromised_reset_required ? " · flagged compromised" : ""}</div>
+          </>
+        )}
+      </td>
+      <td className="py-3.5 px-4">
+        <span className={`inline-flex items-center gap-1.5 font-medium ${isActive ? "text-emerald-400" : "text-slate-500"}`}>
+          <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${isActive ? "bg-emerald-400" : "bg-slate-500"}`} />
+          {isActive ? "Active" : "Disabled"}
+        </span>
+      </td>
+      <td className="py-3.5 px-4 text-slate-400 font-mono text-[11px]">{formatDate(user.created_at, "System init")}</td>
+      <td className="py-3.5 px-4 text-right">
+        <div className="flex items-center justify-end gap-1.5">
+          {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-slate-400" aria-label="Working" />}
+          {isService ? (
+            <>
+              <button type="button" disabled={busy} onClick={onPolicy} title="Edit expiry and allowed source IPs" aria-label={`Edit access policy of ${user.username}`} className={`${ICON_BTN} text-cyan-300`}>
+                <Settings2 className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+              <button type="button" disabled={busy} onClick={onRotate} title="Rotate API key (the current key stops working immediately)" aria-label={`Rotate API key of ${user.username}`} className={`${ICON_BTN} text-cyan-300`}>
+                <RotateCw className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            </>
+          ) : (
+            <>
+              <button type="button" disabled={busy} onClick={onReset} title="Reset password" aria-label={`Reset password of ${user.username}`} className={`${ICON_BTN} text-amber-400`}>
+                <KeyRound className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+              <button type="button" disabled={busy || isSelf} onClick={onFlag} title={isSelf ? protectedReason : "Flag as compromised (forces credential rotation)"} aria-label={`Flag ${user.username} as compromised`} className={`${ICON_BTN} text-rose-400`}>
+                <Shield className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            </>
+          )}
+          <button type="button" disabled={busy || isBootstrap || isSelf} onClick={onToggle} title={isBootstrap || isSelf ? protectedReason : isActive ? "Disable account" : "Enable account"} aria-label={`${isActive ? "Disable" : "Enable"} ${user.username}`} className={`${ICON_BTN} ${isActive ? "text-slate-400" : "text-emerald-400"}`}>
+            <Power className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+          {isBootstrap ? (
+            <span className="p-1.5 opacity-40" title="The bootstrap administrator cannot be deleted"><ShieldCheck className="h-3.5 w-3.5 text-slate-400" aria-label="Bootstrap administrator cannot be deleted" /></span>
+          ) : (
+            <button type="button" disabled={busy || isSelf} onClick={onDelete} title={isSelf ? protectedReason : "Delete account"} aria-label={`Delete ${user.username}`} className={`${ICON_BTN} text-slate-400 hover:text-rose-400`}>
+              <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function CreateOperatorDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (u: User & { temporary_password?: string }) => void }) {
+  const [username, setUsername] = useState("");
+  const [role, setRole] = useState(ROLE_SOC_ANALYST);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const firstRef = useRef<HTMLInputElement>(null);
+
+  const close = () => { setError(null); setUsername(""); setRole(ROLE_SOC_ANALYST); onClose(); };
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await api.createUser({ username: username.trim(), role });
+      setUsername("");
+      setRole(ROLE_SOC_ANALYST);
+      onCreated(created);
+    } catch (err) {
+      setError(describeError(err, "Could not create the account."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onClose={close} title="Create operator" description="The server issues a one-time password; the operator must change it at first sign-in." size="sm" initialFocusRef={firstRef}>
+      <form onSubmit={submit} className="space-y-4">
+        {error && <InlineNotice tone="error">{error}</InlineNotice>}
+        <div className="space-y-1.5">
+          <label htmlFor="new-username" className="text-xs font-semibold text-slate-300">Username</label>
+          <input ref={firstRef} id="new-username" required value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="off" placeholder="e.g. analyst_sarah" className={INPUT} />
+        </div>
+        <div className="space-y-1.5">
+          <label htmlFor="new-role" className="text-xs font-semibold text-slate-300">Role</label>
+          <select id="new-role" value={role} onChange={(e) => setRole(e.target.value)} className={INPUT}>
+            {ASSIGNABLE_ROLES.map((r) => <option key={r.role} value={r.role}>{r.role}</option>)}
+          </select>
+          <p className="text-[11px] text-slate-500">{ASSIGNABLE_ROLES.find((r) => r.role === role)?.description}</p>
+        </div>
+        <FormButtons busy={busy} onCancel={close} submitLabel="Create operator" disabled={!username.trim()} />
+      </form>
+    </Dialog>
+  );
+}
+
+function CreateServiceDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (res: { username: string; api_key: string }) => void }) {
+  const [username, setUsername] = useState("");
+  const [days, setDays] = useState("90");
+  const [ips, setIps] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const firstRef = useRef<HTMLInputElement>(null);
+
+  const close = () => { setError(null); onClose(); };
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    const parsed = parseDays(days);
+    if (parsed.error) { setError(parsed.error); return; }
+    setBusy(true);
+    try {
+      const allow = parseAllowlist(ips);
+      const res = await api.createServiceAccount({
+        username: username.trim(),
+        ...(parsed.value !== undefined ? { expires_in_days: parsed.value } : {}),
+        ...(allow.length ? { ip_allowlist: allow } : {}),
+      });
+      setUsername("");
+      setIps("");
+      onCreated(res);
+    } catch (err) {
+      setError(describeError(err, "Could not create the service account."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onClose={close} title="Create AI agent account" description="A non-human account that authenticates with an API key and may only use the agent API. It cannot sign in to this console." size="sm" initialFocusRef={firstRef} icon={<Bot className="h-5 w-5 text-cyan-300 mt-0.5" aria-hidden="true" />}>
+      <form onSubmit={submit} className="space-y-4">
+        {error && <InlineNotice tone="error">{error}</InlineNotice>}
+        <div className="space-y-1.5">
+          <label htmlFor="svc-username" className="text-xs font-semibold text-slate-300">Account name</label>
+          <input ref={firstRef} id="svc-username" required value={username} onChange={(e) => setUsername(e.target.value)} autoComplete="off" placeholder="e.g. triage-agent" className={INPUT} />
+        </div>
+        <div className="space-y-1.5">
+          <label htmlFor="svc-days" className="text-xs font-semibold text-slate-300">Key expires after (days)</label>
+          <input id="svc-days" inputMode="numeric" value={days} onChange={(e) => setDays(e.target.value)} placeholder="blank = backend default" className={INPUT} />
+        </div>
+        <div className="space-y-1.5">
+          <label htmlFor="svc-ips" className="text-xs font-semibold text-slate-300">Allowed source IPs / CIDRs (optional)</label>
+          <textarea id="svc-ips" rows={2} value={ips} onChange={(e) => setIps(e.target.value)} placeholder="10.0.0.5, 192.168.10.0/24" className={`${INPUT} font-mono`} />
+          <p className="text-[11px] text-slate-500">Separate entries with commas, spaces or new lines. Empty allows any source.</p>
+        </div>
+        <FormButtons busy={busy} onCancel={close} submitLabel="Create account and key" disabled={!username.trim()} />
+      </form>
+    </Dialog>
+  );
+}
+
+function PolicyDialog({ target, onClose, onSaved }: { target: User | null; onClose: () => void; onSaved: (name: string) => void }) {
+  return (
+    <Dialog open={target !== null} onClose={onClose} title={target ? `Access policy for ${target.username}` : ""} description="Changes apply to the existing key; it is not rotated." size="sm">
+      {target && <PolicyForm key={target.user_id} target={target} onClose={onClose} onSaved={onSaved} />}
+    </Dialog>
+  );
+}
+
+function PolicyForm({ target, onClose, onSaved }: { target: User; onClose: () => void; onSaved: (name: string) => void }) {
+  const [days, setDays] = useState("");
+  const [clearExpiry, setClearExpiry] = useState(false);
+  const [ips, setIps] = useState((target.ip_allowlist ?? []).join("\n"));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const confirm = useConfirm();
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    const parsed = parseDays(days);
+    if (parsed.error) { setError(parsed.error); return; }
+    const allow = parseAllowlist(ips);
+    const ok = await confirm({
+      title: `Update the access policy of ${target.username}?`,
+      message: "The key is checked against the new rules from the next request.",
+      items: [
+        clearExpiry ? "The key will no longer expire." : parsed.value !== undefined ? `The key will expire in ${parsed.value} days from now.` : "The expiry is unchanged.",
+        allow.length ? `Requests are accepted only from: ${allow.join(", ")}.` : "Any source IP will be accepted.",
+      ],
+      confirmLabel: "Save policy",
+      tone: "warning",
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      await api.updateServiceAccountPolicy(target.user_id, {
+        ...(clearExpiry ? { clear_expiry: true } : parsed.value !== undefined ? { expires_in_days: parsed.value } : {}),
+        ip_allowlist: allow,
+      });
+      onSaved(target.username);
+    } catch (err) {
+      setError(describeError(err, "Could not update the policy."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit} className="space-y-4">
+      {error && <InlineNotice tone="error">{error}</InlineNotice>}
+      <p className="text-[11px] text-slate-500">
+        Currently: {target.expires_at ? `expires ${formatDate(target.expires_at)}` : "no expiry"}.
+      </p>
+      <div className="space-y-1.5">
+        <label htmlFor="pol-days" className="text-xs font-semibold text-slate-300">New expiry, days from now</label>
+        <input id="pol-days" inputMode="numeric" value={days} disabled={clearExpiry} onChange={(e) => setDays(e.target.value)} placeholder="leave blank to keep" className={INPUT} />
+        <label className="flex items-center gap-2 text-[11px] text-slate-400">
+          <input type="checkbox" checked={clearExpiry} onChange={(e) => setClearExpiry(e.target.checked)} /> Remove the expiry
+        </label>
+      </div>
+      <div className="space-y-1.5">
+        <label htmlFor="pol-ips" className="text-xs font-semibold text-slate-300">Allowed source IPs / CIDRs</label>
+        <textarea id="pol-ips" rows={3} value={ips} onChange={(e) => setIps(e.target.value)} className={`${INPUT} font-mono`} />
+        <p className="text-[11px] text-slate-500">Empty removes the restriction.</p>
+      </div>
+      <FormButtons busy={busy} onCancel={onClose} submitLabel="Save policy" />
+    </form>
+  );
+}
+
+function CreateTokenDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (t: { name: string; token: string }) => void }) {
+  const [name, setName] = useState("");
+  const [days, setDays] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const firstRef = useRef<HTMLInputElement>(null);
+
+  const close = () => { setError(null); onClose(); };
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    const parsed = parseDays(days);
+    if (parsed.error) { setError(parsed.error); return; }
+    setBusy(true);
+    try {
+      const res = await api.createIngestToken({ name: name.trim(), ...(parsed.value !== undefined ? { expires_in_days: parsed.value } : {}) });
+      setName("");
+      setDays("");
+      onCreated(res);
+    } catch (err) {
+      setError(describeError(err, "Could not create the token."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onClose={close} title="New webhook ingest token" description="Name it after the sender so it can be revoked on its own." size="sm" initialFocusRef={firstRef}>
+      <form onSubmit={submit} className="space-y-4">
+        {error && <InlineNotice tone="error">{error}</InlineNotice>}
+        <div className="space-y-1.5">
+          <label htmlFor="tok-name" className="text-xs font-semibold text-slate-300">Name</label>
+          <input ref={firstRef} id="tok-name" required value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. wazuh-manager-prod" className={INPUT} />
+        </div>
+        <div className="space-y-1.5">
+          <label htmlFor="tok-days" className="text-xs font-semibold text-slate-300">Expires after (days, optional)</label>
+          <input id="tok-days" inputMode="numeric" value={days} onChange={(e) => setDays(e.target.value)} className={INPUT} />
+        </div>
+        <FormButtons busy={busy} onCancel={close} submitLabel="Create token" disabled={!name.trim()} />
+      </form>
+    </Dialog>
+  );
+}
+
+function FormButtons({ busy, onCancel, submitLabel, disabled }: { busy: boolean; onCancel: () => void; submitLabel: string; disabled?: boolean }) {
+  return (
+    <div className="flex justify-end gap-2 pt-2">
+      <button type="button" onClick={onCancel} className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500">Cancel</button>
+      <button type="submit" disabled={busy || disabled} className="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-300">
+        {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />}
+        {submitLabel}
+      </button>
+    </div>
+  );
+}
+

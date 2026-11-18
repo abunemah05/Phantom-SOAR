@@ -4,7 +4,8 @@ The report only shows what the platform recorded for the alert: telemetry,
 IOC verdicts and their evidence sources, the MITRE mapping from telemetry or
 the matched playbook, every response action with its target, connector and
 execution mode, and the real MTTR. When any action was simulated the report
-carries a prominent SIMULATED notice.
+carries a prominent SIMULATED notice; when no live containment action succeeded
+it states plainly that the incident is NOT contained.
 """
 import os
 from datetime import datetime, timezone
@@ -109,6 +110,12 @@ def generate_pdf_report(alert_data: Dict[str, Any], output_path: Optional[str] =
     iocs: List[Dict[str, Any]] = alert_data.get("ioc_artifacts") or []
     actions: List[Dict[str, Any]] = alert_data.get("containment_actions") or []
     simulated_actions = [a for a in actions if a.get("execution_mode") == "simulated" or a.get("status") == "Simulated"]
+    live_containment = [
+        a for a in actions
+        if a.get("status") == "Success" and a.get("execution_mode") != "simulated"
+        and a.get("connector") in ("edr", "firewall", "iam")
+    ]
+    simulation_only = bool(simulated_actions) and not live_containment
 
     story: List[Any] = []
     story.append(Paragraph(
@@ -128,8 +135,8 @@ def generate_pdf_report(alert_data: Dict[str, Any], output_path: Optional[str] =
     if simulated_actions:
         notice = Table([[Paragraph(
             f"SIMULATED: {len(simulated_actions)} of {len(actions)} response action(s) in this report were "
-            "simulated because the connector is not configured. No command was sent to any real system "
-            "for those actions.",
+            "simulated (rehearsal only). No command was sent to any real system for those actions."
+            + (" NO LIVE CONTAINMENT WAS PERFORMED: THIS INCIDENT IS NOT CONTAINED." if simulation_only else ""),
             notice_style,
         )]], colWidths=[530])
         notice.setStyle(TableStyle([
@@ -149,7 +156,9 @@ def generate_pdf_report(alert_data: Dict[str, Any], output_path: Optional[str] =
          Paragraph("<b>Severity:</b>", cell),
          Paragraph(f"<font color='{sev_color.hexval()}'><b>{escape(severity.upper())}</b></font>", cell_bold)],
         [Paragraph("<b>Source:</b>", cell), Paragraph(_text(alert_data.get("source")), cell),
-         Paragraph("<b>Status:</b>", cell), Paragraph(f"<b>{_text(alert_data.get('status')).upper()}</b>", cell_bold)],
+         Paragraph("<b>Status:</b>", cell), Paragraph(f"<b>{_text(alert_data.get('status')).upper()}</b>"
+                   + (" <font size=7>(NOT CONTAINED)</font>" if alert_data.get("status") == "Simulated" else ""),
+                   cell_bold)],
         [Paragraph("<b>Rule ID:</b>", cell), Paragraph(_text(alert_data.get("rule_id")), cell),
          Paragraph("<b>MTTR:</b>", cell), Paragraph(escape(_mttr_text(alert_data.get("mttr_seconds"))), cell_bold)],
         [Paragraph("<b>Detected:</b>", cell), Paragraph(_text(str(alert_data.get("created_at") or "")[:19]), cell),
@@ -243,7 +252,7 @@ def generate_pdf_report(alert_data: Dict[str, Any], output_path: Optional[str] =
         t_act.setStyle(_grid_style())
         story.append(t_act)
         story.append(Paragraph(
-            "Modes: live = command accepted by the real system; simulated = connector not configured, nothing sent; "
+            "Modes: live = command accepted by the real system; simulated = rehearsal only, nothing sent and not containment; "
             "skipped = not run; blocked = held or denied by policy; failed = the connector reported an error.",
             cell_small,
         ))
@@ -264,7 +273,10 @@ def generate_pdf_report(alert_data: Dict[str, Any], output_path: Optional[str] =
     if pending:
         next_steps.append(f"Review {len(pending)} action(s) that did not execute (failed, blocked, held for approval or skipped).")
     if simulated_actions:
-        next_steps.append("Configure the relevant connectors and repeat the simulated actions to contain the threat for real.")
+        next_steps.append(
+            "Simulated actions are not containment. Configure the relevant connectors, turn simulation mode off "
+            "and re-run the playbook so the actions are performed for real; they are not treated as done."
+        )
     unknown = [i for i in iocs if (i.get("verdict") or "Unknown") == "Unknown"]
     if unknown:
         next_steps.append(f"{len(unknown)} indicator(s) have no threat-intelligence verdict; investigate them manually.")

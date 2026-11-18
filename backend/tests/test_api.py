@@ -66,7 +66,7 @@ def test_protected_routes_require_token(client, path):
 
 
 @pytest.mark.parametrize("method,path", [("delete", "/api/alerts/purge"), ("post", "/api/demo/seed"),
-                                         ("post", "/api/configuration/hotl-toggle"), ("delete", "/api/logs"),
+                                         ("post", "/api/configuration/hotl-toggle"),
                                          ("post", "/api/configuration/test-connection")])
 def test_mutating_routes_require_token(client, method, path):
     assert getattr(client, method)(path).status_code == 401
@@ -114,7 +114,7 @@ def test_service_accounts_cannot_use_operator_api(client, admin_headers):
 
     assert client.get("/api/alerts", headers=bearer("svc_agent_probe")).status_code == 403
     login = client.post("/api/auth/login", json={"username": "svc_agent_probe", "password": created["temporary_password"]})
-    assert login.status_code == 403
+    assert login.status_code == 401  # same answer as an unknown account: sign-in does not reveal service accounts
 
 
 def test_inactive_user_is_rejected(client, admin_headers):
@@ -128,9 +128,12 @@ def test_brute_force_lockout_and_unlock(client, admin_headers):
     created = provision(client, admin_headers, "lockout_probe")
     for _ in range(4):
         assert client.post("/api/auth/login", json={"username": "lockout_probe", "password": "wrong-password-xyz"}).status_code == 401
-    assert client.post("/api/auth/login", json={"username": "lockout_probe", "password": "wrong-password-xyz"}).status_code == 403
+    # The lock is per (username, client address) and answers exactly like a wrong password (no lock oracle).
+    locked = client.post("/api/auth/login", json={"username": "lockout_probe", "password": "wrong-password-xyz"})
+    assert locked.status_code == 401
     good = {"username": "lockout_probe", "password": created["temporary_password"]}
-    assert client.post("/api/auth/login", json=good).status_code == 403  # locked even with the right password
+    still_locked = client.post("/api/auth/login", json=good)
+    assert still_locked.status_code == 401 and still_locked.json() == locked.json()  # locked even with the right password
 
     assert client.post(f"/api/users/{created['user_id']}/unlock", headers=admin_headers).status_code == 200
     assert client.post("/api/auth/login", json=good).status_code == 200
@@ -176,7 +179,7 @@ def test_configuration_categories_and_defaults(client, admin_headers):
     from backend.integration_config import INTEGRATION_KEYS
 
     data = client.get("/api/configuration", headers=admin_headers).json()
-    assert set(data) == {"TIP", "SIEM", "IAM", "ITSM", "ORCHESTRATION", "AGENT"}
+    assert set(data) == {"TIP", "SIEM", "IAM", "ITSM", "ORCHESTRATION", "AGENT", "AI"}  # AI added with the OpenRouter triage
     listed = {key for keys in data.values() for key in keys}
     assert listed == set(INTEGRATION_KEYS)
 
@@ -185,7 +188,8 @@ def test_configuration_categories_and_defaults(client, admin_headers):
     assert data["AGENT"]["agent_min_confidence"]["value"] == "0.85"
     assert data["SIEM"]["siem_manager_url"]["value"] == ""
     assert data["SIEM"]["siem_manager_url"]["is_set"] is False
-    for key in ("virustotal_api_key", "siem_password", "okta_api_token", "slack_webhook_url", "jira_webhook_url"):
+    for key in ("virustotal_api_key", "siem_password", "okta_api_token", "slack_webhook_url", "jira_webhook_url",
+                "openrouter_api_key"):
         assert data[INTEGRATION_KEYS[key][0]][key]["is_secret"] is True
     assert set(data["TIP"]["virustotal_api_key"]) >= {"value", "is_secret", "is_set", "preview", "updated_at"}
 
@@ -202,7 +206,8 @@ def test_configuration_secrets_are_masked_and_kept(client, admin_headers):
         raw = client.get("/api/configuration", headers=admin_headers)
         assert secret not in raw.text
         item = raw.json()["TIP"]["otx_api_key"]
-        assert (item["value"], item["is_secret"], item["is_set"], item["preview"]) == ("", True, True, "••••9f3c")
+        assert (item["value"], item["is_secret"], item["is_set"], item["preview"]) == ("", True, True, "••••••••")
+        assert "9f3c" not in raw.text  # no characters of a secret are ever returned
 
         # Saving the form with an empty secret keeps the stored value.
         res = client.post("/api/configuration", headers=admin_headers, json={"configs": [
@@ -210,7 +215,7 @@ def test_configuration_secrets_are_masked_and_kept(client, admin_headers):
         ]})
         assert res.status_code == 200
         assert "otx_api_key" in res.json()["unchanged"]
-        assert client.get("/api/configuration", headers=admin_headers).json()["TIP"]["otx_api_key"]["preview"] == "••••9f3c"
+        assert client.get("/api/configuration", headers=admin_headers).json()["TIP"]["otx_api_key"]["preview"] == "••••••••"
         assert client.get("/api/configuration/runtime-status", headers=admin_headers).json()["integrations"]["otx"] is True
     finally:
         res = client.post("/api/configuration", headers=admin_headers, json={"configs": [
@@ -241,20 +246,37 @@ def test_runtime_status_shape(client, admin_headers):
     data = res.json()
     assert data["simulation_mode"] is True
     assert isinstance(data["hotl_enabled"], bool)
-    assert set(data["integrations"]) == {"virustotal", "abuseipdb", "otx", "threatfox", "nvd", "wazuh", "okta", "jira", "slack"}
+    assert set(data["integrations"]) == {"virustotal", "abuseipdb", "otx", "threatfox", "nvd", "wazuh", "okta", "jira", "slack",
+                                         "ai"}
     assert all(isinstance(v, bool) for v in data["integrations"].values())
     assert not any(data["integrations"].values())  # tests run with no third-party credentials
+
+
+def _save_config(client, headers, **values):
+    categories = {"protected_hosts": "ORCHESTRATION", "protected_users": "ORCHESTRATION", "protected_ips": "ORCHESTRATION"}
+    return client.post("/api/configuration", headers=headers, json={"configs": [
+        {"category": categories[k], "key_name": k, "key_value": v, "clear": v == ""} for k, v in values.items()]})
 
 
 def test_hotl_status_and_toggle(client, admin_headers):
     initial = client.get("/api/configuration/hotl-status", headers=admin_headers).json()["hotl_enabled"]
     try:
-        res = client.post("/api/configuration/hotl-toggle", json={"enabled": not initial}, headers=admin_headers)
+        # Autonomous response cannot be switched on while no protected hosts / users are listed.
+        client.post("/api/configuration/hotl-toggle", json={"enabled": False}, headers=admin_headers)
+        _save_config(client, admin_headers, protected_hosts="", protected_users="", protected_ips="")
+        refused = client.post("/api/configuration/hotl-toggle", json={"enabled": True}, headers=admin_headers)
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["blockers"]
+        assert client.get("/api/configuration/hotl-status", headers=admin_headers).json()["hotl_enabled"] is False
+
+        assert _save_config(client, admin_headers, protected_hosts="dc01.corp.example", protected_users="breakglass").status_code == 200
+        res = client.post("/api/configuration/hotl-toggle", json={"enabled": True}, headers=admin_headers)
         assert res.status_code == 200
-        assert res.json()["hotl_enabled"] is (not initial)
-        assert client.get("/api/configuration/hotl-status", headers=admin_headers).json()["hotl_enabled"] is (not initial)
+        assert res.json()["hotl_enabled"] is True
+        assert client.get("/api/configuration/hotl-status", headers=admin_headers).json()["hotl_enabled"] is True
     finally:
         client.post("/api/configuration/hotl-toggle", json={"enabled": initial}, headers=admin_headers)
+        _save_config(client, admin_headers, protected_hosts="", protected_users="", protected_ips="")
 
 
 def test_test_connection_is_honest(client, admin_headers, monkeypatch):
@@ -280,6 +302,7 @@ def test_test_connection_is_honest(client, admin_headers, monkeypatch):
     def fake_client(handler):
         def factory(**kwargs):
             kwargs.pop("verify", None)
+            kwargs.pop("transport", None)  # the SSRF-guarded transport is used for overridden endpoints
             return real_client(transport=httpx.MockTransport(handler), **kwargs)
         return factory
 
@@ -300,6 +323,8 @@ def test_test_connection_is_honest(client, admin_headers, monkeypatch):
         raise httpx.ConnectError("connection refused", request=request)
 
     monkeypatch.setattr(config_router.httpx, "Client", fake_client(down_handler))
+    # An endpoint override must resolve to a public address (SSRF guard); pretend this documentation host does.
+    monkeypatch.setattr(config_router.netguard, "resolve_host", lambda host, port=443: ["93.184.216.34"])
     down = client.post("/api/configuration/test-connection", headers=admin_headers,
                        json={"service_name": "wazuh", "endpoint_url": "https://wazuh.invalid:55000",
                              "username": "wazuh", "api_key": "pw"}).json()
@@ -345,7 +370,7 @@ def test_user_management_and_password_lifecycle(client, admin_headers):
     assert client.get("/api/auth/me", headers=pending).status_code == 200
     assert client.get("/api/alerts", headers=pending).status_code == 403
 
-    change = client.post("/api/auth/change-password", json={
+    change = client.post("/api/auth/change-password", headers=pending, json={
         "username": "analyst_omar", "current_password": temp, "new_password": "SecuredAnalystPassword2026!"
     })
     assert change.status_code == 200
@@ -384,30 +409,29 @@ def test_roles_catalog(client, admin_headers):
 def test_logs_endpoints_and_filters(client, admin_headers):
     assert client.post("/api/logs/seed", headers=admin_headers).status_code in (404, 405)
 
-    for source in ("FIREWALL", "EDR"):
-        res = client.post("/api/logs", headers=admin_headers, json={
-            "source": source, "level": "ACTION", "message": f"Manual {source} note", "target": "198.51.100.22"
-        })
-        assert res.status_code == 201
-        assert res.json()["source"] == source
-        assert res.json()["details"]["recorded_by"] == ADMIN_USERNAME
+    # The audit log is append-only over the API: no arbitrary writes, no deletion, even for administrators.
+    assert client.post("/api/logs", headers=admin_headers, json={"source": "EDR", "message": "x"}).status_code == 405
+    assert client.delete("/api/logs", headers=admin_headers).status_code == 405
+    from backend.database import SessionLocal
+    from backend.routers.logs import record_log
+    with SessionLocal() as log_db:
+        for source in ("FIREWALL", "EDR"):
+            record_log(log_db, source, "ACTION", f"Manual {source} note", target="198.51.100.22")
 
     assert len(client.get("/api/logs", headers=admin_headers).json()) >= 2
     edr = client.get("/api/logs?source=EDR", headers=admin_headers).json()
     assert edr and all(entry["source"] == "EDR" for entry in edr)
     assert len(client.get("/api/logs?seconds=60", headers=admin_headers).json()) >= 2
-    assert client.post("/api/logs", headers=admin_headers, json={"source": "EDR", "level": "LOUD", "message": "x"}).status_code == 422
 
     provision(client, admin_headers, "logs_analyst_probe")
     analyst = bearer("logs_analyst_probe")
     assert client.get("/api/logs", headers=analyst).status_code == 200
-    assert client.post("/api/logs", headers=analyst, json={"source": "EDR", "message": "x"}).status_code == 403
-    assert client.delete("/api/logs", headers=analyst).status_code == 403
+    assert client.post("/api/logs", headers=analyst, json={"source": "EDR", "message": "x"}).status_code == 405
+    assert client.delete("/api/logs", headers=analyst).status_code == 405
 
-    res = client.delete("/api/logs", headers=admin_headers)
-    assert res.status_code == 200
-    remaining = client.get("/api/logs", headers=admin_headers).json()
-    assert len(remaining) == 1 and remaining[0]["source"] == "AUDIT"  # the purge itself is recorded
+    # Nobody can clear the audit trail over the API; the entries are still there.
+    assert client.delete("/api/logs", headers=admin_headers).status_code == 405
+    assert len(client.get("/api/logs", headers=admin_headers).json()) >= 2
 
 
 # --- Smoke tests over the authenticated alert / playbook API ------------------------

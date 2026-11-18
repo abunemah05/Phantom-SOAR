@@ -18,14 +18,16 @@ import {
   Lock
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { AdminReportData, User } from "@/lib/types";
-import { getStoredUser, subscribeToAuth } from "@/lib/auth";
-import { isAdmin } from "@/lib/roles";
+import { describeError } from "@/lib/errors";
+import { AdminReportData } from "@/lib/types";
+import { canAdminister } from "@/lib/roles";
+import { useAuth } from "@/components/AuthGate";
+import { AccessDenied, ErrorState, LoadingState, StaleBanner } from "@/components/StateViews";
 import { formatDateTime, formatDuration } from "@/lib/format";
 
 export default function AdminReportsPage() {
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [isAuthorized, setIsAuthorized] = useState<boolean>(true);
+  const { user: currentUser } = useAuth();
+  const isAuthorized = canAdminister(currentUser);
   
   // Filter States
   const [period, setPeriod] = useState<string>("month");
@@ -40,38 +42,16 @@ export default function AdminReportsPage() {
   const [error, setError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<boolean>(false);
 
-  const evaluateAuth = (user: User | null) => {
-    setCurrentUser(user);
-    if (!user) {
-      setIsAuthorized(false);
-      return false;
-    }
-    const authorized = isAdmin(user);
-    setIsAuthorized(authorized);
-    return authorized;
-  };
+  const [analystsError, setAnalystsError] = useState<string | null>(null);
 
-  useEffect(() => {
-    const user = getStoredUser();
-    evaluateAuth(user);
-
-    const unsubscribe = subscribeToAuth((updatedUser) => {
-      evaluateAuth(updatedUser);
-    });
-
-    return () => {
-      unsubscribe();
-    };
-  }, []);
-
-  const loadAnalysts = async () => {
+  const loadAnalysts = useCallback(async () => {
     try {
-      const list = await api.getAvailableAnalysts();
-      setAnalysts(list);
-    } catch {
-      // fallback
+      setAnalysts(await api.getAvailableAnalysts());
+      setAnalystsError(null);
+    } catch (err) {
+      setAnalystsError(describeError(err, "Could not load the analyst list."));
     }
-  };
+  }, []);
 
   const loadReport = useCallback(async () => {
     setLoading(true);
@@ -84,8 +64,8 @@ export default function AdminReportsPage() {
         end_date: period === "custom" ? endDate : undefined,
       });
       setReport(data);
-    } catch (err: any) {
-      setError(err.message || "Failed to load admin reporting analytics.");
+    } catch (err) {
+      setError(describeError(err, "Failed to load the reporting analytics."));
     } finally {
       setLoading(false);
     }
@@ -95,9 +75,9 @@ export default function AdminReportsPage() {
 
   useEffect(() => {
     if (!isAuthorized) return;
-    loadAnalysts();
-    loadReport();
-  }, [isAuthorized, loadReport]);
+    void loadAnalysts();
+    void loadReport();
+  }, [isAuthorized, loadReport, loadAnalysts]);
 
   const handleDownloadPdf = async () => {
     setDownloading(true);
@@ -109,8 +89,8 @@ export default function AdminReportsPage() {
         start_date: period === "custom" ? startDate : undefined,
         end_date: period === "custom" ? endDate : undefined,
       });
-    } catch (err: any) {
-      setError(`PDF export failed: ${err.message || "request failed"}`);
+    } catch (err) {
+      setError(`PDF export failed: ${describeError(err)}`);
     } finally {
       setDownloading(false);
     }
@@ -123,15 +103,9 @@ export default function AdminReportsPage() {
 
   if (!isAuthorized) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-[70vh] text-center px-4">
-        <div className="h-16 w-16 rounded-2xl bg-rose-500/10 border border-rose-500/20 flex items-center justify-center text-rose-400 mb-4">
-          <Lock className="h-8 w-8" />
-        </div>
-        <h2 className="text-xl font-bold text-white mb-2">Access Restricted (Admin Only)</h2>
-        <p className="text-sm text-slate-400 max-w-md">
-          The Reporting & Audit Engine is restricted to SOC Administrators. Your operator role is <b>{currentUser?.role || "SOC Analyst"}</b>.
-        </p>
-      </div>
+      <AccessDenied title="Access restricted (administrators only)">
+        The reporting and audit engine is limited to administrators. Your role is <b>{currentUser?.role || "unknown"}</b>.
+      </AccessDenied>
     );
   }
 
@@ -251,13 +225,13 @@ export default function AdminReportsPage() {
         )}
       </div>
 
-      {error && (
-        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs flex items-center space-x-2">
-          <AlertTriangle className="h-4 w-4 flex-shrink-0" />
-          <span>{error}</span>
-        </div>
-      )}
+      {analystsError && <StaleBanner message={analystsError} onRetry={() => void loadAnalysts()} />}
+      {error && !report && <ErrorState title="The report could not be loaded" message={error} onRetry={() => void loadReport()} />}
+      {error && report && <StaleBanner message={error} onRetry={() => void loadReport()} />}
+      {loading && !report && !error && <LoadingState label="Building the report..." />}
 
+      {report && (
+      <>
       {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
@@ -428,6 +402,8 @@ export default function AdminReportsPage() {
           </table>
         </div>
       </div>
+      </>
+      )}
     </div>
   );
 }

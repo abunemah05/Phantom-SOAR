@@ -120,7 +120,8 @@ def test_virustotal_errors_are_reported(code, needle):
     tip = _tip(lambda req: httpx.Response(code))
     res = tip.enrich_ioc("Domain", "example.org", settings=TipSettings(virustotal_api_key="secret-key"))
     vt = res["providers"]["virustotal"]
-    assert vt["status"] == "error" and needle in vt["error"]
+    # HTTP 429 is now the distinct "rate_limited" status (never cached, never Clean).
+    assert vt["status"] == ("rate_limited" if code == 429 else "error") and needle in vt["error"]
     assert "secret-key" not in json.dumps(res)
     assert res["verdict"] == "Unknown" and res["enrichment_status"] == "unavailable"
 
@@ -154,7 +155,7 @@ def test_threatfox_request_and_results():
     assert hit["providers"]["threatfox"]["status"] == "live"
     assert hit["threat_score"] == 100 and hit["verdict"] == "Malicious" and hit["severity"] == "Critical"
     assert hit["providers"]["threatfox"]["summary"]["malware_families"] == ["Cobalt Strike"]
-    assert bodies[0] == ("tf-key", {"query": "search_ioc", "search_term": "c2.example.net"})
+    assert bodies[0] == ("tf-key", {"query": "search_ioc", "search_term": "c2.example.net", "exact_match": True})
 
     miss = tip.enrich_ioc("Domain", "nothing.example.net", settings=keys)
     assert miss["providers"]["threatfox"]["status"] == "not_found" and miss["verdict"] == "Unknown"

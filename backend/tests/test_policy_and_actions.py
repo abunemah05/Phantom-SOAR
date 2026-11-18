@@ -38,8 +38,8 @@ def settings(monkeypatch):
         return original(key_name, db=db, default=default)
 
     monkeypatch.setattr(integration_config, "get_setting", fake_get_setting)
-    overrides.update({"hotl_enabled": "true", "simulation_mode": "true", "protected_hosts": "",
-                      "protected_users": "", "protected_ips": "", "agent_autonomy": "recommend_only",
+    overrides.update({"hotl_enabled": "true", "simulation_mode": "true", "protected_hosts": "unrelated-protected-host.example",
+                      "protected_users": "unrelated-breakglass-user", "protected_ips": "", "agent_autonomy": "recommend_only",
                       "agent_min_confidence": "0.85"})
     return overrides
 
@@ -227,6 +227,7 @@ def test_execute_action_skipped_when_simulation_off(settings, db, alert):
 
 
 def test_execute_action_live_uses_alert_agent_id(settings, db, alert, monkeypatch):
+    settings["simulation_mode"] = "false"  # live execution only happens with simulation mode off
     settings.update({"siem_manager_url": "https://wazuh.test:55000", "siem_user": "u", "siem_password": "p"})
     calls = []
 
@@ -250,6 +251,8 @@ def test_execute_action_live_uses_alert_agent_id(settings, db, alert, monkeypatc
 
 
 def test_execute_action_never_raises_on_connector_error(settings, db, alert, monkeypatch):
+    settings["simulation_mode"] = "false"  # the connector is only reached with simulation mode off
+
     def boom(*args, **kwargs):
         raise RuntimeError("driver exploded")
 
@@ -287,3 +290,30 @@ def test_playbook_api_rejects_unknown_actions(client, admin_headers):
     catalog = client.get("/api/playbooks/actions", headers=admin_headers)
     assert catalog.status_code == 200
     assert {a["name"] for a in catalog.json()["actions"]} >= {"block_ip", "isolate_endpoint"}
+
+
+@pytest.mark.parametrize("action,target", [
+    ("isolate_endpoint", "srv-prod-db01"), ("block_ip", "198.51.100.45"), ("disable_account", "jdoe@corp.test"),
+    ("create_ticket", None), ("send_notification", None),
+])
+def test_simulation_mode_never_contacts_a_configured_connector(settings, db, alert, monkeypatch, action, target):
+    """Simulation mode is a hard stop: saved credentials must not turn a rehearsal into a real action."""
+    settings.update({
+        "simulation_mode": "true",
+        "siem_manager_url": "https://wazuh.test:55000", "siem_user": "u", "siem_password": "p",
+        "okta_domain": "corp.okta.test", "okta_api_token": "tok",
+        "jira_base_url": "https://corp.atlassian.test", "jira_email": "a@corp.test", "jira_api_token": "tok",
+        "slack_webhook_url": "https://hooks.slack.test/T/B/x",
+    })
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, json={})
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(connector_base, "http_client", lambda verify=True: httpx.Client(transport=transport))
+    record = execute_action(db, alert, action, target)
+    assert record.status == "Simulated" and record.execution_mode == "simulated"
+    assert calls == []
+    assert "simulation mode is ON" in json.dumps(record.details)

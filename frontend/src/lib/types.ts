@@ -1,6 +1,25 @@
+// Shapes of the Phantom SOAR API (backend/routers/*, backend/schemas.py, AI_API_CONTRACT.md).
+// Response parsing in the UI stays defensive: optional fields may be missing on older backends.
+
 export type Severity = 'Critical' | 'High' | 'Medium' | 'Low';
-export type AlertStatus = 'New' | 'Triaged' | 'Contained' | 'Resolved' | 'Closed' | 'Monitoring';
+/**
+ * Processing = ingest/playbook run in flight.
+ * Simulated  = response actions were only rehearsed (simulation mode): NOT contained.
+ */
+export type AlertStatus =
+  | 'New'
+  | 'Processing'
+  | 'Triaged'
+  | 'Contained'
+  | 'Simulated'
+  | 'Resolved'
+  | 'Closed'
+  | 'Monitoring';
 export type ExecutionMode = 'HOTL' | 'HITL';
+
+export type JsonObject = Record<string, unknown>;
+
+// --- Users & authentication -------------------------------------------------
 
 export interface User {
   user_id: number;
@@ -9,18 +28,95 @@ export interface User {
   must_change_password?: boolean;
   is_active?: boolean;
   mfa_enabled?: boolean;
+  /** Policy require_mfa_for_admin is on and this administrator has not enrolled MFA yet. */
+  mfa_enrollment_required?: boolean;
   compromised_reset_required?: boolean;
   is_service_account?: boolean;
+  /** The account created at first start; cannot be deleted or disabled. */
+  is_bootstrap_admin?: boolean;
   api_key_prefix?: string | null;
-  password_changed_at?: string;
-  created_at?: string;
+  /** Service accounts: API key expiry, source allow-list and last use. */
+  expires_at?: string | null;
+  ip_allowlist?: string[] | null;
+  last_used_at?: string | null;
+  last_used_ip?: string | null;
+  password_changed_at?: string | null;
+  created_at?: string | null;
 }
 
 export interface LoginResponse {
+  /** Empty string while mfa_required is true. */
   access_token: string;
   token_type: string;
   mfa_required?: boolean;
+  mfa_enrollment_required?: boolean;
   user: User;
+}
+
+export interface ChangePasswordRequest {
+  /** Accepted only for older clients; must equal the signed-in user. */
+  username?: string;
+  /** Optional only for a forced first-login or compromised-reset change. */
+  current_password?: string;
+  new_password: string;
+  /** Required with current_password when MFA is enabled. */
+  mfa_code?: string;
+}
+
+export interface ChangePasswordResponse {
+  status?: string;
+  message?: string;
+  access_token?: string;
+  token_type?: string;
+  user?: User;
+}
+
+export interface MfaSetupResponse {
+  secret: string;
+  provisioning_uri: string;
+  issuer: string;
+  account: string;
+  message: string;
+}
+
+export interface MfaStatusResponse {
+  mfa_enabled: boolean;
+  status: string;
+  message: string;
+}
+
+export interface CreatedUser extends User {
+  /** Shown once; the operator must change it at first sign-in. */
+  temporary_password?: string;
+}
+
+export interface ServiceAccountKey extends User {
+  /** Shown once; only a digest is stored. */
+  api_key: string;
+}
+
+export interface ServiceAccountPolicyChange {
+  expires_in_days?: number;
+  clear_expiry?: boolean;
+  /** [] removes the restriction; omitted leaves it unchanged. */
+  ip_allowlist?: string[];
+}
+
+export interface IngestTokenInfo {
+  id: number;
+  name: string;
+  token_prefix: string;
+  created_by?: string | null;
+  created_at?: string | null;
+  last_used_at?: string | null;
+  expires_at?: string | null;
+  revoked_at?: string | null;
+  status: 'active' | 'revoked' | 'expired' | string;
+}
+
+export interface IngestTokenCreated extends IngestTokenInfo {
+  /** Shown once. */
+  token: string;
 }
 
 export interface TestConnectionResult {
@@ -41,15 +137,24 @@ export interface TestConnectionResult {
 
 export type IocVerdict = 'Malicious' | 'Suspicious' | 'Clean' | 'Unknown';
 export type EnrichmentStatus = 'enriched' | 'partial' | 'unavailable' | 'not_configured' | 'pending';
-export type ProviderStatus = 'live' | 'not_found' | 'not_configured' | 'error' | 'lab_fixture' | 'skipped';
+export type ProviderStatus =
+  | 'live'
+  | 'not_found'
+  | 'not_configured'
+  | 'error'
+  | 'rate_limited'
+  | 'lab_fixture'
+  | 'skipped';
 
 export interface TipProviderResult {
   provider: string;
   status: ProviderStatus | string;
   threat_score: number | null;
   verdict: string | null;
-  summary?: Record<string, unknown> | null;
+  summary?: JsonObject | null;
   error?: string | null;
+  /** Set when status is rate_limited. */
+  retry_after_seconds?: number | null;
   queried_at?: string | null;
 }
 
@@ -61,8 +166,11 @@ export interface TipResults {
   verdict?: IocVerdict;
   severity?: Severity | null;
   enrichment_status?: EnrichmentStatus;
+  simulated?: boolean;
+  incomplete?: boolean;
+  retry_after_seconds?: number | null;
   providers?: Record<string, TipProviderResult>;
-  consensus?: Record<string, unknown>;
+  consensus?: JsonObject;
   [legacyKey: string]: unknown;
 }
 
@@ -112,24 +220,34 @@ export interface IncidentReport {
   generated_at: string;
 }
 
+/** Per-CVE and overall NVD lookup states (backend/integrations/nvd.py). */
+export type NvdCveStatus = 'live' | 'not_found' | 'not_configured' | 'unavailable' | 'rate_limited' | 'pending';
+export type NvdLookupStatus = 'pending' | 'partial' | 'live' | 'no_cves' | 'unavailable' | 'rate_limited' | 'not_configured';
+
 export interface VulnerabilityDetail {
   cve_id: string;
   title?: string;
   cvss_score?: number | null;
+  cvss_version?: string | null;
   severity?: string | null;
   attack_vector?: string | null;
   cwe?: string | null;
   description?: string | null;
+  known_exploited?: boolean | null;
   hitl_remediation?: string[];
   hotl_action?: string;
   hotl_action_description?: string;
   patches?: string[];
-  status?: string;
+  nvd_url?: string;
+  status?: NvdCveStatus | string;
+  error?: string | null;
+  retry_after_seconds?: number | null;
   queried_at?: string;
 }
 
 export interface VulnerabilityIntel {
   cves_detected: string[];
+  cves_truncated?: number;
   max_cvss_score?: number | null;
   vulnerabilities: VulnerabilityDetail[];
   hitl_remediation_steps?: string[];
@@ -139,10 +257,21 @@ export interface VulnerabilityIntel {
     justification?: string;
     action_description?: string;
   };
-  /** "live" | "partial" | "not_configured" | "unavailable" | "no_cves" */
-  lookup_status?: string;
+  lookup_status?: NvdLookupStatus | string;
+  incomplete?: boolean;
+  pending_cves?: string[];
+  retry_after_seconds?: number | null;
+  /** Older/unavailable shape: {status: "unavailable", error}. */
   status?: string;
+  error?: string;
   message?: string;
+}
+
+export interface RawPayload {
+  rule?: { description?: string; level?: number | string; id?: string | number; [k: string]: unknown };
+  agent?: { name?: string; ip?: string; id?: string; [k: string]: unknown };
+  full_log?: string;
+  [k: string]: unknown;
 }
 
 export interface Alert {
@@ -151,14 +280,15 @@ export interface Alert {
   source: string;
   severity: Severity;
   status: AlertStatus;
-  analyst_decision?: string;
-  assigned_analyst?: string;
-  resolved_by?: string;
-  resolved_at?: string;
-  raw_payload?: any;
+  analyst_decision?: string | null;
+  assigned_analyst?: string | null;
+  resolved_by?: string | null;
+  resolved_at?: string | null;
+  raw_payload?: RawPayload | null;
   created_at: string;
   ioc_count?: number;
   max_threat_score?: number;
+  malicious_ioc_count?: number;
 }
 
 export interface MitreAttack {
@@ -186,23 +316,92 @@ export interface AlertRouting {
   evidence: string[];
 }
 
+// --- AI agent (AI_API_CONTRACT.md) -------------------------------------------
+
+export type AgentVerdict = 'malicious' | 'suspicious' | 'benign' | 'unknown';
+export type ProposalStatus =
+  | 'pending_approval'
+  | 'auto_executed'
+  | 'partially_executed'
+  | 'approved'
+  | 'rejected'
+  | 'blocked'
+  | 'no_action';
+export type AgentAutonomy = 'recommend_only' | 'low_impact' | 'policy';
+
+export interface ProposedAction {
+  action: string;
+  target?: string | null;
+  params?: JsonObject;
+}
+
+/** policy_evaluation[i] lines up with proposed_actions[i]. */
+export interface PolicyEvaluation {
+  action?: string;
+  target?: string | null;
+  allowed?: boolean;
+  requires_approval?: boolean;
+  reasons?: string[];
+  [extra: string]: unknown;
+}
+
+/** execution_results[i]: a ContainmentAction.to_dict() or {skipped: reason}. */
+export interface ExecutionResult {
+  action_id?: number;
+  action_type?: string;
+  status?: string;
+  execution_mode?: ActionExecutionMode | string | null;
+  target?: string | null;
+  executed_by?: string;
+  details?: unknown;
+  skipped?: string;
+  [extra: string]: unknown;
+}
+
 export interface AgentProposal {
   proposal_id: number;
   alert_id: number;
   agent_name: string;
-  verdict: string;
+  verdict: AgentVerdict | string;
   confidence: number;
   summary?: string | null;
   reasoning?: string | null;
-  proposed_actions: Array<{ action: string; target?: string | null; params?: Record<string, unknown> }>;
-  policy_evaluation: Array<Record<string, any>>;
-  execution_results: Array<Record<string, any>>;
-  /** pending_approval | auto_executed | partially_executed | approved | rejected | blocked | no_action */
-  status: string;
+  proposed_actions: ProposedAction[];
+  policy_evaluation: PolicyEvaluation[];
+  execution_results: ExecutionResult[];
+  status: ProposalStatus | string;
   decided_by?: string | null;
   decided_at?: string | null;
   decision_notes?: string | null;
   created_at: string;
+}
+
+export interface AgentStatus {
+  enabled: boolean;
+  configured: boolean;
+  auto_triage?: boolean;
+  model?: string | null;
+  autonomy: AgentAutonomy | string;
+  min_confidence?: number;
+  simulation_mode?: boolean;
+  hotl_enabled?: boolean;
+  send_raw_payload?: boolean;
+  max_alerts_per_minute?: number;
+  pending_proposals: number;
+  /** "database" | "environment" | null. Never the key itself. */
+  key_source?: 'database' | 'environment' | null;
+}
+
+export interface ProposalList {
+  items: AgentProposal[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ProposalApprovalResult {
+  proposal: AgentProposal;
+  results?: ExecutionResult[];
 }
 
 export interface AlertDetail extends Alert {
@@ -226,7 +425,15 @@ export interface PlaybookStep {
   step?: number;
   action: string;
   connector?: string;
-  params?: Record<string, unknown>;
+  params?: JsonObject;
+  [extra: string]: unknown;
+}
+
+export interface WorkflowLogic {
+  mitre_id?: string;
+  picerl_phase?: string;
+  keywords?: string[];
+  steps?: PlaybookStep[];
   [extra: string]: unknown;
 }
 
@@ -235,7 +442,8 @@ export interface Playbook {
   name: string;
   target_threat: string;
   execution_mode: ExecutionMode;
-  workflow_logic: any;
+  /** Object, or a JSON string on legacy rows. */
+  workflow_logic: WorkflowLogic | string;
   is_active: boolean;
   created_at: string;
 }
@@ -245,11 +453,21 @@ export interface DashboardMetrics {
   new_alerts: number;
   triaged_alerts: number;
   contained_alerts: number;
+  /** Rehearsed only (simulation mode): not contained, not resolved. */
+  simulated_alerts?: number;
   resolved_alerts: number;
   unresolved_alerts?: number;
   review_gates_count?: number;
+  /** Actions that ran live or simulated; live_actions / simulated_actions split them. */
   automated_actions: number;
-  avg_mttr_seconds: number;
+  live_actions?: number;
+  simulated_actions?: number;
+  blocked_actions?: number;
+  failed_actions?: number;
+  skipped_actions?: number;
+  /** null when no playbook run has completed yet. */
+  avg_mttr_seconds: number | null;
+  mttr_sample_size?: number;
   critical_count: number;
   high_count: number;
   medium_count: number;
@@ -258,15 +476,17 @@ export interface DashboardMetrics {
 
 // --- Configuration ---------------------------------------------------------
 
+export type ConfigSource = 'database' | 'environment' | 'default' | null;
+
 export interface ConfigEntry {
   /** Effective value; always "" for secrets. */
   value: string;
   is_secret: boolean;
   is_set: boolean;
-  /** "••••" + last 4 chars for a set secret, else null. */
+  /** Constant mask for a set secret, else null. Never contains characters of the secret. */
   preview: string | null;
   /** Where the effective value comes from. */
-  source?: 'database' | 'environment' | 'default' | null;
+  source?: ConfigSource;
   env_var?: string;
   updated_at: string | null;
 }
@@ -282,22 +502,20 @@ export interface ConfigUpdateItem {
   clear?: boolean;
 }
 
+export interface ConfigUpdateResult {
+  status?: string;
+  message?: string;
+  updated?: string[];
+  unchanged?: string[];
+}
+
 export interface RuntimeStatus {
   simulation_mode: boolean;
   hotl_enabled: boolean;
-  integrations: {
-    virustotal: boolean;
-    abuseipdb: boolean;
-    otx: boolean;
-    threatfox: boolean;
-    nvd: boolean;
-    wazuh: boolean;
-    okta: boolean;
-    jira: boolean;
-    slack: boolean;
-    [name: string]: boolean;
-  };
-  agent_autonomy?: 'recommend_only' | 'low_impact' | 'policy' | string;
+  /** ai = an OpenRouter key exists (not that AI triage is enabled; see ai_enabled). */
+  integrations: Record<string, boolean>;
+  ai_enabled?: boolean;
+  agent_autonomy?: AgentAutonomy | string;
   agent_min_confidence?: number;
 }
 
@@ -313,8 +531,8 @@ export interface SystemLog {
   source: string;
   level: string;
   message: string;
-  target?: string;
-  details?: any;
+  target?: string | null;
+  details?: JsonObject | null;
   created_at: string;
 }
 
@@ -330,6 +548,16 @@ export interface AnalystMetrics {
   avg_mttr_seconds: number;
 }
 
+export interface ReportCase {
+  alert_id: number;
+  rule_id: string;
+  severity: string;
+  status: string;
+  resolved_by?: string | null;
+  analyst_decision?: string | null;
+  created_at: string;
+}
+
 export interface AdminReportData {
   period: string;
   start_date: string;
@@ -337,8 +565,18 @@ export interface AdminReportData {
   filtered_analyst?: string | null;
   total_cases_reviewed: number;
   total_containment_actions: number;
+  /** live / simulated / skipped / blocked / failed */
+  containment_by_mode?: Record<string, number>;
   average_mttr_seconds: number;
+  mttr_sample_size?: number;
   analyst_breakdown: AnalystMetrics[];
-  cases: any[];
-  action_logs: any[];
+  cases: ReportCase[];
+  action_logs: JsonObject[];
+}
+
+export interface AnalystOption {
+  user_id: number;
+  username: string;
+  role: string;
+  is_active: boolean;
 }

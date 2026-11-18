@@ -9,6 +9,15 @@ whether it needs analyst approval first. Actors:
 
 Automated actors (playbook, agent) can never touch protected hosts, users or
 IPs; an analyst can, and the decision notes it.
+
+The protected lists enforced are the EFFECTIVE lists: the configured
+protected_hosts / protected_users / protected_ips plus automatic entries (the
+Wazuh manager parsed from siem_manager_url, loopback, this server's hostname
+and addresses, and the default gateway; see integration_config.effective_protected).
+Matching is case-insensitive; IP entries may be single addresses or CIDR networks.
+Isolating or blocking/rate-limiting the AUTOMATIC entries (Wazuh manager, this
+server, loopback, gateway) is denied for every actor, analysts included, because
+it would cut the platform off from its own telemetry or from its operators.
 """
 import fnmatch
 import ipaddress
@@ -36,6 +45,12 @@ AUTONOMY_LEVELS = {"recommend_only", "low_impact", "policy"}
 
 # Actions that restrict traffic: never aimed at addresses that make no sense to block.
 IP_RESTRICTING_ACTIONS = {"block_ip", "apply_rate_limit"}
+# Actions that cut an asset off the network; denied against the automatic protected entries for everyone.
+CUTOFF_ACTIONS = {"isolate_endpoint", "block_ip", "apply_rate_limit"}
+WAZUH_MANAGER_AGENT_ID = "000"
+# Actions that UNDO a containment step (lift an isolation, remove a block). Their catalog impact is "low", but a
+# reversal can re-expose an asset a human chose to contain, so an AI agent never runs one on its own: always approval.
+REVERSAL_ACTIONS = {"unisolate_endpoint", "unblock_ip"}
 
 # "Private" for policy purposes: internal address space. Documentation ranges
 # (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) are not included: they are not
@@ -205,18 +220,50 @@ def _autonomy(db: Optional[Session]) -> str:
     return value if value in AUTONOMY_LEVELS else "recommend_only"
 
 
+def _name_variants(value: str) -> List[str]:
+    """The value plus its short forms (host.domain -> host, DOMAIN\\user and user@domain -> user)."""
+    lowered = value.strip().lower()
+    variants = {lowered, lowered.split("\\")[-1], lowered.split("@")[0]}
+    if not _valid_ip(lowered):
+        variants.add(lowered.split(".")[0])
+    return [v for v in variants if v]
+
+
+_GLOB_CHARS = ("*", "?", "[")
+
+
 def _matches_pattern(value: str, patterns: List[str]) -> bool:
-    lowered = value.lower()
-    return any(fnmatch.fnmatchcase(lowered, p.lower()) for p in patterns)
+    """Case-insensitive match of a host or user name against the protected entries, by short name in BOTH directions.
+
+    An entry 'dc01.corp.local' protects 'dc01' (what Wazuh reports as agent.name) and 'CORP\\svc-backup' protects
+    'svc-backup'; a target 'dc01.corp.local' is protected by an entry 'dc01'. Entries that contain wildcards are
+    used exactly as written (splitting '*.corp.local' would produce a bare '*'). Over-matching is the safe error
+    here: it can only protect more, never less.
+    """
+    variants = _name_variants(value)
+    for pattern in patterns:
+        cleaned = (pattern or "").strip().lower()
+        if not cleaned:
+            continue
+        forms = [cleaned] if any(ch in cleaned for ch in _GLOB_CHARS) else _name_variants(cleaned)
+        if cleaned in variants or any(fnmatch.fnmatchcase(v, f) for v in variants for f in forms):
+            return True
+    return False
 
 
 def _ip_in_list(ip: IPAddress, entries: List[str]) -> bool:
+    """True when the IP equals an entry or lies in an entry's network (IPv4-mapped IPv6 handled)."""
+    candidates = [ip]
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        candidates.append(mapped)
     for entry in entries:
         try:
-            if ip in ipaddress.ip_network(entry, strict=False):
-                return True
+            network = ipaddress.ip_network(str(entry).strip(), strict=False)
         except ValueError:
             continue
+        if any(c.version == network.version and c in network for c in candidates):
+            return True
     return False
 
 
@@ -236,6 +283,12 @@ def _never_block_reason(ip: IPAddress) -> Optional[str]:
     if ip.is_reserved:
         return "reserved"
     return None
+
+
+def alert_agent_id(alert: Any) -> Optional[str]:
+    raw = (alert.get("raw_payload") if isinstance(alert, dict) else getattr(alert, "raw_payload", None)) or {}
+    agent_id = _dict(raw.get("agent")).get("id")
+    return str(agent_id) if agent_id is not None else None
 
 
 def _alert_host(alert: Any) -> Optional[str]:
@@ -272,6 +325,16 @@ def evaluate_action(
     if param_errors:
         return PolicyDecision(False, False, param_errors)
 
+    # Automated actors may only act through the Wazuh agent the alert came from. An `agent_id` naming any other
+    # agent would aim the action (and bypass the protected-host check, which looks at the alert's own host) at a
+    # machine nobody reviewed. Analysts can still name another agent on purpose.
+    if automated:
+        supplied_agent = str((params or {}).get("agent_id") or "").strip()
+        if supplied_agent and supplied_agent != (alert_agent_id(alert) or ""):
+            return PolicyDecision(False, False, [
+                f"Denied: agent_id '{supplied_agent}' is not the agent that raised alert "
+                f"#{getattr(alert, 'alert_id', '?')}; automation may only act through the alert's own agent."])
+
     target = str(target).strip() if target is not None else None
     if target_type != "none" and not target:
         return PolicyDecision(False, False, [f"{canonical} needs a {target_type} target."])
@@ -300,16 +363,39 @@ def evaluate_action(
                 "agents may only act on the alert's own entities."
             ])
 
-    # Protected assets.
+    # Protected assets: configured lists plus automatic entries (Wazuh manager, this server, loopback, gateway).
+    effective = integration_config.effective_protected(db)
     protected_hit = None
+    never_cut_off = None
+    host = None
     if target_type == "host" or spec["connector"] == "edr":
         host = target if target_type == "host" else _alert_host(alert)
-        if host and _matches_pattern(host, integration_config.get_list("protected_hosts", db=db)):
-            protected_hit = f"host '{host}' is on the protected hosts list"
-    if target_type == "user" and _matches_pattern(target, integration_config.get_list("protected_users", db=db)):
+        if host:
+            host_ip = _valid_ip(host)
+            if host_ip:
+                host_obj = ipaddress.ip_address(host_ip)
+                if _ip_in_list(host_obj, effective["ips"]):
+                    protected_hit = f"host {host} is on the protected IPs list"
+                if _ip_in_list(host_obj, effective["auto_ips"]):
+                    never_cut_off = f"host {host} is the Wazuh manager, loopback, this server or the default gateway"
+            if _matches_pattern(host, effective["hosts"]):
+                protected_hit = f"host '{host}' is on the protected hosts list"
+            if _matches_pattern(host, effective["auto_hosts"]):
+                never_cut_off = f"host '{host}' is the Wazuh manager or this server"
+        if spec["connector"] == "edr":
+            agent_id = str((params or {}).get("agent_id") or alert_agent_id(alert) or "").strip()
+            if agent_id == WAZUH_MANAGER_AGENT_ID:
+                never_cut_off = "agent 000 is the Wazuh manager itself"
+                protected_hit = protected_hit or "agent 000 (the Wazuh manager) is protected"
+    if target_type == "user" and _matches_pattern(target, effective["users"]):
         protected_hit = f"user '{target}' is on the protected users list"
-    if ip_obj is not None and _ip_in_list(ip_obj, integration_config.get_list("protected_ips", db=db)):
-        protected_hit = f"IP {target} is on the protected IPs list"
+    if ip_obj is not None:
+        if _ip_in_list(ip_obj, effective["ips"]) or _matches_pattern(target, effective["hosts"]):
+            protected_hit = f"IP {target} is on the protected IPs list"
+        if _ip_in_list(ip_obj, effective["auto_ips"]):
+            never_cut_off = f"{target} is the Wazuh manager, loopback, this server or the default gateway"
+    if never_cut_off and canonical in CUTOFF_ACTIONS:
+        return PolicyDecision(False, False, [f"Denied: {never_cut_off}; it is never blocked, isolated or rate limited."])
     if protected_hit:
         if automated:
             return PolicyDecision(False, False, [f"Denied: {protected_hit}; automation may not act on it."])
@@ -328,7 +414,7 @@ def evaluate_action(
             else:
                 reasons.append(f"Note: {target} is an internal (private-range) address.")
 
-    if automated and not integration_config.get_bool("hotl_enabled", db=db):
+    if automated and not integration_config.hotl_effective(db):
         requires_approval = True
         reasons.append("Autonomous response (HOTL) is disabled; automated actions need analyst approval.")
 
@@ -342,6 +428,9 @@ def evaluate_action(
         elif impact == "high":
             requires_approval = True
             reasons.append(f"{canonical} is a high-impact action; agent requests always need analyst approval.")
+        elif canonical in REVERSAL_ACTIONS:
+            requires_approval = True
+            reasons.append(f"{canonical} reverses a containment step; agent requests always need analyst approval.")
         elif confidence is None:
             requires_approval = True
             reasons.append("Agent did not report a confidence; analyst approval required.")

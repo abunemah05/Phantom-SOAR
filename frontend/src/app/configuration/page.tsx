@@ -2,259 +2,173 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Sliders,
-  Radio,
-  Database,
-  KeyRound,
-  Bell,
-  ShieldCheck,
-  Bot,
-  CheckCircle2,
-  AlertCircle,
-  AlertTriangle,
-  Save,
-  Eye,
-  EyeOff,
-  Activity,
-  XCircle,
-  Lock,
-  Trash2,
-  Undo2,
-  FlaskConical
+  Activity, Bot, CheckCircle2, Database, Eye, EyeOff, FlaskConical, KeyRound, Lock, Radio, Save, ShieldCheck, Sliders, Trash2, Undo2,
+  AlertTriangle, XCircle, Bell,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { isAdmin, isSecEngOrAdmin } from "@/lib/roles";
+import { ApiError, describeError, errorBlockers } from "@/lib/errors";
+import {
+  FIELD_META, SERVICE_TESTS, categoryMeta, fieldLabel, inferFieldKind, normalizeBool, sortedCategories, validateConfigValue, FieldKind,
+} from "@/lib/configRules";
+import { canAdminister, canViewConfig } from "@/lib/roles";
 import { ConfigEntry, ConfigUpdateItem, SystemConfigGroup, TestConnectionResult } from "@/lib/types";
+import { useResource } from "@/hooks/useResource";
 import { useAuth } from "@/components/AuthGate";
+import { useConfirm } from "@/components/ConfirmDialog";
 import { useRuntimeStatus } from "@/components/RuntimeStatusProvider";
+import { AccessDenied, ErrorState, InlineNotice, LoadingState } from "@/components/StateViews";
+import { useToast } from "@/components/Toast";
 
-// Categories and keys follow backend integration_config.INTEGRATION_KEYS / DEFAULT_CONFIGS.
+const CATEGORY_ICONS: Record<string, React.ElementType> = {
+  TIP: Radio, SIEM: Database, IAM: KeyRound, ITSM: Bell, ORCHESTRATION: ShieldCheck, AGENT: Bot, AI: Bot,
+};
 
-type FieldKind = "secret" | "text" | "url" | "bool" | "list" | "number" | "select";
-
-interface FieldDef {
-  key: string;
-  label: string;
-  kind: FieldKind;
-  placeholder?: string;
-  help?: string;
-  options?: Array<{ value: string; label: string; help: string }>;
-  defaultValue?: string;
-}
-
-type ServiceId = "virustotal" | "abuseipdb" | "otx" | "threatfox" | "nvd" | "wazuh" | "okta" | "jira" | "slack";
-
-interface ServiceDef {
-  id: ServiceId;
-  label: string;
-  /** Which form fields are sent as test overrides when they hold unsaved values. */
-  overrides: { api_key?: string; endpoint_url?: string; username?: string };
-}
-
-interface SectionDef {
-  category: string;
-  title: string;
-  description: string;
-  icon: React.ElementType;
-  fields: FieldDef[];
-  services: ServiceDef[];
-}
-
-const AGENT_AUTONOMY_OPTIONS = [
-  { value: "recommend_only", label: "Recommend only", help: "Every agent proposal waits for an analyst decision." },
-  { value: "low_impact", label: "Low impact", help: "Low-impact actions run automatically when confidence meets the minimum; everything else waits for approval." },
-  { value: "policy", label: "Policy", help: "Low- and medium-impact actions run automatically when confidence meets the minimum. High-impact actions always need approval." },
-];
-
-const SECTIONS: SectionDef[] = [
-  {
-    category: "TIP",
-    title: "Threat Intelligence Providers",
-    description: "IOC reputation lookups. Providers without a key report \"not configured\"; no score is ever invented for them.",
-    icon: Radio,
-    fields: [
-      { key: "virustotal_api_key", label: "VirusTotal API key", kind: "secret" },
-      { key: "abuseipdb_api_key", label: "AbuseIPDB API key", kind: "secret" },
-      { key: "otx_api_key", label: "AlienVault OTX API key", kind: "secret" },
-      { key: "threatfox_api_key", label: "ThreatFox Auth-Key", kind: "secret" },
-      { key: "nvd_api_key", label: "NIST NVD API key", kind: "secret", help: "Optional: NVD works without a key at a lower rate limit." },
-    ],
-    services: [
-      { id: "virustotal", label: "VirusTotal", overrides: { api_key: "virustotal_api_key" } },
-      { id: "abuseipdb", label: "AbuseIPDB", overrides: { api_key: "abuseipdb_api_key" } },
-      { id: "otx", label: "OTX", overrides: { api_key: "otx_api_key" } },
-      { id: "threatfox", label: "ThreatFox", overrides: { api_key: "threatfox_api_key" } },
-      { id: "nvd", label: "NVD", overrides: { api_key: "nvd_api_key" } },
-    ],
-  },
-  {
-    category: "SIEM",
-    title: "SIEM (Wazuh Manager API)",
-    description: "Wazuh manager REST API used for read-only checks and active response. Alerts themselves arrive through the authenticated webhook.",
-    icon: Database,
-    fields: [
-      { key: "siem_manager_url", label: "Wazuh Manager API URL", kind: "url", placeholder: "https://wazuh-manager.example.org:55000" },
-      { key: "siem_user", label: "API username", kind: "text" },
-      { key: "siem_password", label: "API password", kind: "secret" },
-      { key: "siem_verify_tls", label: "Verify TLS certificate", kind: "bool", defaultValue: "true", help: "Turn off only for lab managers with self-signed certificates." },
-    ],
-    services: [
-      { id: "wazuh", label: "Wazuh", overrides: { endpoint_url: "siem_manager_url", username: "siem_user", api_key: "siem_password" } },
-    ],
-  },
-  {
-    category: "IAM",
-    title: "Identity Provider (Okta)",
-    description: "Used by disable_account, revoke_user_sessions and force_password_reset.",
-    icon: KeyRound,
-    fields: [
-      { key: "okta_domain", label: "Okta domain", kind: "text", placeholder: "your-org.okta.com" },
-      { key: "okta_api_token", label: "Okta API token", kind: "secret" },
-    ],
-    services: [
-      { id: "okta", label: "Okta", overrides: { endpoint_url: "okta_domain", api_key: "okta_api_token" } },
-    ],
-  },
-  {
-    category: "ITSM",
-    title: "Ticketing & Notifications",
-    description: "Jira tickets (REST API or an automation webhook) and Slack notifications for create_ticket / send_notification.",
-    icon: Bell,
-    fields: [
-      { key: "jira_base_url", label: "Jira base URL", kind: "url", placeholder: "https://your-org.atlassian.net" },
-      { key: "jira_email", label: "Jira account email", kind: "text" },
-      { key: "jira_api_token", label: "Jira API token", kind: "secret" },
-      { key: "jira_project_key", label: "Jira project key", kind: "text", placeholder: "SEC" },
-      { key: "jira_webhook_url", label: "Jira automation webhook URL (alternative to the REST API)", kind: "secret" },
-      { key: "slack_webhook_url", label: "Slack incoming webhook URL", kind: "secret" },
-    ],
-    services: [
-      { id: "jira", label: "Jira", overrides: { endpoint_url: "jira_base_url", username: "jira_email", api_key: "jira_api_token" } },
-      { id: "slack", label: "Slack", overrides: { endpoint_url: "slack_webhook_url" } },
-    ],
-  },
-  {
-    category: "ORCHESTRATION",
-    title: "Orchestration & Safety Guards",
-    description: "Global switches and assets that automated actors (playbooks, AI agent) must never act on.",
-    icon: ShieldCheck,
-    fields: [
-      {
-        key: "simulation_mode",
-        label: "Simulation mode",
-        kind: "bool",
-        defaultValue: "true",
-        help: "On: actions on connectors that are not configured are recorded as SIMULATED (nothing changes on real systems) and lab threat-intel fixtures answer for documentation IPs and demo IOCs. Off: unconfigured actions are SKIPPED. Turn off in production.",
-      },
-      {
-        key: "hotl_enabled",
-        label: "HOTL autonomous containment",
-        kind: "bool",
-        defaultValue: "true",
-        help: "On: HOTL playbooks may contain automatically when there is real evidence and policy allows it. Off: every action waits for analyst approval.",
-      },
-      { key: "protected_hosts", label: "Protected hosts", kind: "list", placeholder: "dc01\nprod-db-01", help: "One per line (or comma separated). Automated actors are denied; analysts are warned." },
-      { key: "protected_users", label: "Protected users", kind: "list", placeholder: "abunemah\nbreakglass-admin" },
-      { key: "protected_ips", label: "Protected IPs / CIDR ranges", kind: "list", placeholder: "10.0.0.1\n192.168.10.0/24" },
-    ],
-    services: [],
-  },
-  {
-    category: "AGENT",
-    title: "AI Agent Policy",
-    description: "Limits for the external AI triage agent. The policy engine checks every proposed action against these settings.",
-    icon: Bot,
-    fields: [
-      { key: "agent_autonomy", label: "Agent autonomy", kind: "select", defaultValue: "recommend_only", options: AGENT_AUTONOMY_OPTIONS },
-      { key: "agent_min_confidence", label: "Minimum confidence for automatic execution (0 – 1)", kind: "number", defaultValue: "0.85" },
-    ],
-    services: [],
-  },
-];
+/** Settings whose change alters what automation may do: confirmed in plain language before saving. */
+const HIGH_IMPACT: Record<string, (next: string) => string | null> = {
+  simulation_mode: (n) =>
+    n === "false"
+      ? "Simulation mode OFF: every connector that has credentials will act on real systems, and connectors without credentials record SKIPPED instead of SIMULATED."
+      : "Simulation mode ON: actions are only rehearsed and recorded as SIMULATED. Nothing is contained.",
+  hotl_enabled: (n) =>
+    n === "true"
+      ? "HOTL ON: HOTL playbooks may contain automatically when there is real evidence and policy allows it."
+      : "HOTL OFF: every containment action waits for an analyst.",
+  agent_autonomy: (n) => `AI agent autonomy becomes "${n}": ${n === "recommend_only" ? "every proposal waits for an analyst." : "some AI actions may run without a human decision."}`,
+  agent_min_confidence: (n) => `Minimum confidence for automatic AI execution becomes ${n || "the default"}.`,
+  ai_enabled: (n) => (n === "true" ? "Built-in AI triage ON: alert summaries are sent to the configured model provider." : "Built-in AI triage OFF: no alert data is sent to a model."),
+  ai_send_raw_payload: (n) =>
+    n === "true"
+      ? "The FULL raw alert payload (possible usernames, hostnames, credentials) will be sent to a third-party model provider."
+      : "Only a redacted summary of each alert will be sent to the model provider.",
+  require_mfa_for_admin: (n) => (n === "true" ? "Administrators without MFA must enrol before using the console." : "Administrators will no longer be forced to use MFA."),
+  simulation_confirmed_in_production: (n) => (n === "true" ? "You acknowledge that simulation mode is intended although real connectors are configured (the API would otherwise refuse to start in production)." : null),
+};
 
 const fieldId = (category: string, key: string) => `${category}.${key}`;
 
-/** Stored value of a non-secret field; an empty stored value falls back to the backend default. */
-function savedValue(config: SystemConfigGroup | null, category: string, field: FieldDef): string {
-  const entry = config?.[category]?.[field.key];
-  if (entry && !entry.is_secret && typeof entry.value === "string" && (entry.value !== "" || !field.defaultValue)) {
-    return entry.value;
-  }
-  return field.defaultValue ?? "";
+function entryValue(entry: ConfigEntry | undefined, kind: FieldKind): string {
+  if (!entry || entry.is_secret) return "";
+  const v = typeof entry.value === "string" ? entry.value : "";
+  if (kind === "bool") return normalizeBool(v) ?? (v === "" ? "false" : v);
+  return v;
 }
 
-function testStatusStyle(result: TestConnectionResult): { className: string; icon: React.ElementType } {
+function SourceBadge({ entry }: { entry: ConfigEntry | undefined }) {
+  if (!entry) return null;
+  const source = entry.source;
+  if (source === "environment") {
+    return (
+      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-indigo-500/10 text-indigo-300 border-indigo-500/30" title="The value comes from a server environment variable. A value saved here would take precedence.">
+        set via environment{entry.env_var ? ` (${entry.env_var})` : ""}
+      </span>
+    );
+  }
+  if (source === "database") {
+    return <span className="text-[10px] px-1.5 py-0.5 rounded border bg-blue-500/10 text-blue-300 border-blue-500/30">saved in settings</span>;
+  }
+  if (source === "default") {
+    return <span className="text-[10px] px-1.5 py-0.5 rounded border bg-slate-800 text-slate-400 border-slate-700">default</span>;
+  }
+  return null;
+}
+
+function testStyle(result: TestConnectionResult): { className: string; icon: React.ElementType } {
   const s = (result.status || "").toLowerCase();
   if (result.is_connected || s === "connected") return { className: "bg-emerald-500/10 border-emerald-500/20 text-emerald-400", icon: CheckCircle2 };
   if (s.startsWith("not configured")) return { className: "bg-slate-800/60 border-slate-700 text-slate-400", icon: Sliders };
   if (s.startsWith("configured")) return { className: "bg-blue-500/10 border-blue-500/20 text-blue-300", icon: CheckCircle2 };
-  if (s === "unreachable") return { className: "bg-amber-500/10 border-amber-500/20 text-amber-400", icon: AlertTriangle };
+  if (s === "unreachable" || s.includes("rate")) return { className: "bg-amber-500/10 border-amber-500/20 text-amber-400", icon: AlertTriangle };
   return { className: "bg-rose-500/10 border-rose-500/20 text-rose-400", icon: XCircle };
 }
 
 export default function ConfigurationPage() {
   const { user } = useAuth();
   const { status: runtime, refresh: refreshRuntime } = useRuntimeStatus();
-  const canView = isSecEngOrAdmin(user);
-  const canEdit = isAdmin(user);
+  const toast = useToast();
+  const confirm = useConfirm();
+  const canView = canViewConfig(user);
+  const canEdit = canAdminister(user);
 
-  const [config, setConfig] = useState<SystemConfigGroup | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const fetcher = useCallback(() => api.getConfigurations(), []);
+  const resource = useResource<SystemConfigGroup>(fetcher, { enabled: canView });
+  const config = resource.data;
+
   const [values, setValues] = useState<Record<string, string>>({});
   const [clears, setClears] = useState<Record<string, boolean>>({});
-  const [visibleSecrets, setVisibleSecrets] = useState<Record<string, boolean>>({});
-  const [testResults, setTestResults] = useState<Partial<Record<ServiceId, TestConnectionResult>>>({});
-  const [testingId, setTestingId] = useState<ServiceId | null>(null);
-  const [saving, setSaving] = useState<boolean>(false);
-  const [saveMsg, setSaveMsg] = useState<string | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
+  const [shown, setShown] = useState<Record<string, boolean>>({});
+  const [tests, setTests] = useState<Record<string, TestConnectionResult>>({});
+  const [testing, setTesting] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<{ message: string; blockers: string[] } | null>(null);
 
-  const resetForm = useCallback((data: SystemConfigGroup | null) => {
+  // Reset the form whenever fresh data arrives (initial load, after a save).
+  useEffect(() => {
+    if (!config) return;
     const initial: Record<string, string> = {};
-    SECTIONS.forEach((section) =>
-      section.fields.forEach((field) => {
-        initial[fieldId(section.category, field.key)] = field.kind === "secret" ? "" : savedValue(data, section.category, field);
+    Object.entries(config).forEach(([category, entries]) =>
+      Object.entries(entries).forEach(([key, entry]) => {
+        const kind = FIELD_META[key]?.kind ?? inferFieldKind(key, entry);
+        initial[fieldId(category, key)] = entryValue(entry, kind);
       })
     );
     setValues(initial);
     setClears({});
-  }, []);
+  }, [config]);
 
-  const loadConfig = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await api.getConfigurations();
-      setConfig(data);
-      resetForm(data);
-      setLoadError(null);
-    } catch (err: any) {
-      setLoadError(err.message || "Could not load configuration.");
-    } finally {
-      setLoading(false);
-    }
-  }, [resetForm]);
+  const categories = useMemo(() => (config ? sortedCategories(Object.keys(config)) : []), [config]);
 
-  useEffect(() => {
-    if (canView) loadConfig();
-    else setLoading(false);
-  }, [canView, loadConfig]);
-
-  const entryOf = (category: string, key: string): ConfigEntry | undefined => config?.[category]?.[key];
+  const kindOf = useCallback(
+    (key: string, entry: ConfigEntry | undefined): FieldKind => FIELD_META[key]?.kind ?? inferFieldKind(key, entry),
+    []
+  );
 
   const isDirty = useCallback(
-    (category: string, field: FieldDef): boolean => {
-      const id = fieldId(category, field.key);
-      if (field.kind === "secret") return Boolean(values[id]) || Boolean(clears[id]);
-      return (values[id] ?? "") !== savedValue(config, category, field);
+    (category: string, key: string): boolean => {
+      const entry = config?.[category]?.[key];
+      const id = fieldId(category, key);
+      const kind = kindOf(key, entry);
+      if (kind === "secret") return Boolean(values[id]) || Boolean(clears[id]);
+      const current = values[id] ?? "";
+      const saved = entryValue(entry, kind);
+      return current.trim() !== saved.trim();
     },
-    [values, clears, config]
+    [config, values, clears, kindOf]
   );
 
-  const dirtyCount = useMemo(
-    () => SECTIONS.reduce((n, s) => n + s.fields.filter((f) => isDirty(s.category, f)).length, 0),
-    [isDirty]
-  );
+  const errors = useMemo(() => {
+    const out: Record<string, string> = {};
+    if (!config) return out;
+    Object.entries(config).forEach(([category, entries]) =>
+      Object.entries(entries).forEach(([key, entry]) => {
+        if (entry.is_secret || !isDirty(category, key)) return;
+        const message = validateConfigValue(key, values[fieldId(category, key)] ?? "");
+        if (message) out[fieldId(category, key)] = message;
+      })
+    );
+    return out;
+  }, [config, values, isDirty]);
+
+  const dirtyIds = useMemo(() => {
+    const ids: Array<{ category: string; key: string }> = [];
+    if (!config) return ids;
+    Object.entries(config).forEach(([category, entries]) =>
+      Object.keys(entries).forEach((key) => {
+        if (isDirty(category, key)) ids.push({ category, key });
+      })
+    );
+    return ids;
+  }, [config, isDirty]);
+
+  // Warn before leaving with unsaved edits.
+  useEffect(() => {
+    if (dirtyIds.length === 0) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [dirtyIds.length]);
 
   const setValue = (category: string, key: string, value: string) => {
     const id = fieldId(category, key);
@@ -268,143 +182,147 @@ export default function ConfigurationPage() {
     setValues((prev) => ({ ...prev, [id]: "" }));
   };
 
-  const validate = (): string | null => {
-    const conf = values[fieldId("AGENT", "agent_min_confidence")];
-    if (conf !== undefined && conf !== "") {
-      const n = Number(conf);
-      if (!Number.isFinite(n) || n < 0 || n > 1) return "Minimum confidence must be a number between 0 and 1.";
-    }
-    return null;
+  const buildItems = (): ConfigUpdateItem[] => {
+    const items: ConfigUpdateItem[] = [];
+    dirtyIds.forEach(({ category, key }) => {
+      const entry = config?.[category]?.[key];
+      const kind = kindOf(key, entry);
+      const id = fieldId(category, key);
+      const isSecret = Boolean(entry?.is_secret) || kind === "secret";
+      let value = values[id] ?? "";
+      if (kind === "bool") value = normalizeBool(value) ?? value;
+      items.push({
+        category,
+        key_name: key,
+        key_value: isSecret ? value : value.trim(),
+        is_secret: isSecret,
+        ...(isSecret && clears[id] ? { clear: true } : {}),
+      });
+    });
+    return items;
   };
 
-  const handleSave = async () => {
-    setSaveMsg(null);
+  const save = async () => {
     setSaveError(null);
-    const validationError = validate();
-    if (validationError) {
-      setSaveError(validationError);
+    if (Object.keys(errors).length > 0) {
+      setSaveError({ message: "Fix the highlighted fields before saving.", blockers: [] });
       return;
     }
-
-    const items: ConfigUpdateItem[] = [];
-    SECTIONS.forEach((section) =>
-      section.fields.forEach((field) => {
-        if (!isDirty(section.category, field)) return;
-        const id = fieldId(section.category, field.key);
-        const isSecret = field.kind === "secret";
-        items.push({
-          category: section.category,
-          key_name: field.key,
-          key_value: values[id] ?? "",
-          is_secret: isSecret,
-          ...(isSecret && clears[id] ? { clear: true } : {}),
-        });
-      })
-    );
-
+    const items = buildItems();
     if (items.length === 0) {
-      setSaveMsg("No changes to save.");
+      toast.info("No changes to save.");
       return;
     }
+    const consequences: string[] = [];
+    items.forEach((item) => {
+      const rule = HIGH_IMPACT[item.key_name];
+      const text = rule?.(item.key_value);
+      if (text) consequences.push(text);
+      if (item.is_secret) consequences.push(item.clear ? `${fieldLabel(item.key_name)} will be removed.` : `${fieldLabel(item.key_name)} will be replaced (the new value is never shown again).`);
+    });
+    const ok = await confirm({
+      title: `Save ${items.length} setting${items.length === 1 ? "" : "s"}?`,
+      message: consequences.length ? "Review what changes before you apply it:" : "The listed settings are saved and apply to new work immediately.",
+      items: consequences.length ? consequences : items.map((i) => fieldLabel(i.key_name)),
+      confirmLabel: "Save changes",
+      tone: consequences.some((c) => !c.endsWith("never shown again).")) ? "warning" : "default",
+    });
+    if (!ok) return;
 
     setSaving(true);
     try {
       await api.updateConfigurations(items);
-      setSaveMsg(`Saved ${items.length} setting${items.length === 1 ? "" : "s"}. Secrets are stored server-side and never sent back to the browser.`);
-      setTestResults({});
-      await loadConfig();
+      toast.success(`Saved ${items.length} setting${items.length === 1 ? "" : "s"}. Secrets stay on the server and are never sent back.`);
+      setTests({});
+      await resource.reload();
       await refreshRuntime();
-    } catch (err: any) {
-      setSaveError(`Save failed: ${err.message || "request failed"}`);
+    } catch (err) {
+      const blockers = errorBlockers(err);
+      const message = describeError(err, "Could not save the settings.");
+      setSaveError({ message: `Save failed: ${message}`, blockers });
+      if (err instanceof ApiError && err.status === 409 && blockers.length) {
+        await confirm({
+          title: "This change was refused",
+          message,
+          items: blockers,
+          confirmLabel: "Understood",
+          hideCancel: true,
+          tone: "warning",
+        });
+      }
     } finally {
       setSaving(false);
     }
   };
 
-  const handleTest = async (section: SectionDef, service: ServiceDef) => {
-    setTestingId(service.id);
-    const overrides: { api_key?: string; endpoint_url?: string; username?: string } = {};
-    (Object.keys(service.overrides) as Array<keyof ServiceDef["overrides"]>).forEach((param) => {
-      const key = service.overrides[param];
+  const runTest = async (category: string, serviceId: string, label: string, overrides: { api_key?: string; endpoint_url?: string; username?: string }) => {
+    setTesting(serviceId);
+    const send: { api_key?: string; endpoint_url?: string; username?: string } = {};
+    (Object.keys(overrides) as Array<keyof typeof overrides>).forEach((param) => {
+      const key = overrides[param];
       if (!key) return;
-      const field = section.fields.find((f) => f.key === key);
-      if (field && isDirty(section.category, field) && values[fieldId(section.category, key)]) {
-        overrides[param] = values[fieldId(section.category, key)];
-      }
+      const id = fieldId(category, key);
+      if (isDirty(category, key) && values[id]) send[param] = values[id];
     });
     try {
-      const res = await api.testConnection(section.category, service.id, Object.keys(overrides).length ? overrides : undefined);
-      setTestResults((prev) => ({ ...prev, [service.id]: res }));
-    } catch (err: any) {
-      setTestResults((prev) => ({
+      const res = await api.testConnection(category, serviceId, Object.keys(send).length ? send : undefined);
+      setTests((prev) => ({ ...prev, [serviceId]: res }));
+    } catch (err) {
+      setTests((prev) => ({
         ...prev,
-        [service.id]: {
-          status: "Error",
-          is_connected: false,
-          service_name: service.label,
-          category: section.category,
-          message: err.message || "The connection test request failed.",
-        },
+        [serviceId]: { status: "Error", is_connected: false, service_name: label, category, message: describeError(err, "The connection test failed.") },
       }));
     } finally {
-      setTestingId(null);
+      setTesting(null);
     }
   };
 
   if (!canView) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-[70vh] text-center px-4">
-        <div className="h-16 w-16 rounded-2xl bg-rose-500/10 border border-rose-500/20 flex items-center justify-center text-rose-400 mb-4">
-          <Lock className="h-8 w-8" />
-        </div>
-        <h2 className="text-xl font-bold text-white mb-2">Access Restricted</h2>
-        <p className="text-sm text-slate-400 max-w-md">
-          Integration settings are available to administrators and security engineers. Your role is <b>{user?.role || "unknown"}</b>.
-        </p>
-      </div>
+      <AccessDenied title="Access restricted">
+        Integration settings are available to administrators and security engineers. Your role is <b>{user?.role || "unknown"}</b>.
+      </AccessDenied>
     );
   }
 
-  const renderField = (section: SectionDef, field: FieldDef) => {
-    const id = fieldId(section.category, field.key);
-    const value = values[id] ?? "";
-    const entry = entryOf(section.category, field.key);
-    const dirty = isDirty(section.category, field);
-    const disabled = !canEdit;
-    const inputClass =
-      "w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:border-blue-500 disabled:opacity-60";
+  const inputClass =
+    "w-full bg-slate-900 border rounded-lg px-3 py-2 text-xs font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-60";
 
-    const label = (
-      <label className="text-[11px] font-semibold text-slate-300 flex items-center gap-2" htmlFor={id}>
-        <span>{field.label}</span>
-        {dirty && <span className="text-[10px] text-amber-400 font-bold">unsaved</span>}
-      </label>
+  const renderField = (category: string, key: string, entry: ConfigEntry) => {
+    const id = fieldId(category, key);
+    const kind = kindOf(key, entry);
+    const meta = FIELD_META[key];
+    const value = values[id] ?? "";
+    const dirty = isDirty(category, key);
+    const error = errors[id];
+    const disabled = !canEdit;
+    const describedBy = [meta?.help ? `${id}-help` : "", error ? `${id}-error` : ""].filter(Boolean).join(" ") || undefined;
+    const borderClass = error ? "border-rose-500" : "border-slate-800";
+
+    const head = (
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <label className="text-[11px] font-semibold text-slate-300 flex items-center gap-2" htmlFor={id}>
+          <span>{fieldLabel(key)}</span>
+          {dirty && <span className="text-[10px] text-amber-400 font-bold">unsaved</span>}
+        </label>
+        <SourceBadge entry={entry} />
+      </div>
+    );
+    const foot = (
+      <>
+        {meta?.help && <p id={`${id}-help`} className="text-[10px] text-slate-500 leading-relaxed">{meta.help}</p>}
+        {error && <p id={`${id}-error`} role="alert" className="text-[11px] text-rose-400">{error}</p>}
+      </>
     );
 
-    if (field.kind === "secret") {
-      const isSet = Boolean(entry?.is_set);
-      const fromEnv = entry?.source === "environment";
-      const storedInDb = isSet && !fromEnv;
+    if (kind === "secret") {
+      const isSet = Boolean(entry.is_set);
+      const fromEnv = entry.source === "environment";
       const willClear = Boolean(clears[id]);
-      const visible = Boolean(visibleSecrets[id]);
+      const visible = Boolean(shown[id]);
       return (
-        <div key={field.key} className="space-y-1">
-          <div className="flex items-center justify-between gap-2">
-            {label}
-            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
-              willClear
-                ? "bg-rose-500/10 text-rose-400 border-rose-500/30"
-                : isSet
-                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/30"
-                : "bg-slate-800 text-slate-500 border-slate-700"
-            }`}>
-              {willClear
-                ? "Will be cleared"
-                : isSet
-                ? `Set${fromEnv ? " via env" : ""} (${entry?.preview || "••••"})`
-                : "Not set"}
-            </span>
-          </div>
+        <div key={key} className="space-y-1">
+          {head}
           <div className="flex items-center gap-2">
             <div className="relative flex-1">
               <input
@@ -413,226 +331,203 @@ export default function ConfigurationPage() {
                 autoComplete="off"
                 value={value}
                 disabled={disabled || willClear}
-                onChange={(e) => setValue(section.category, field.key, e.target.value)}
-                placeholder={isSet ? "Leave blank to keep the stored value" : "Not set — enter a value"}
-                className={inputClass + " pr-8"}
+                onChange={(e) => setValue(category, key, e.target.value)}
+                placeholder={willClear ? "Will be cleared on save" : isSet ? "Set. Leave blank to keep it" : "Not set. Enter a value"}
+                aria-describedby={describedBy}
+                className={`${inputClass} ${borderClass} pr-8`}
               />
               <button
                 type="button"
-                onClick={() => setVisibleSecrets((prev) => ({ ...prev, [id]: !prev[id] }))}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
-                title={visible ? "Hide" : "Show what you typed"}
+                onClick={() => setShown((prev) => ({ ...prev, [id]: !prev[id] }))}
+                aria-label={visible ? `Hide what you typed for ${fieldLabel(key)}` : `Show what you typed for ${fieldLabel(key)}`}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
               >
-                {visible ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                {visible ? <EyeOff className="h-3.5 w-3.5" aria-hidden="true" /> : <Eye className="h-3.5 w-3.5" aria-hidden="true" />}
               </button>
             </div>
-            {canEdit && (storedInDb || willClear) && (
+            {canEdit && isSet && !fromEnv && (
               <button
                 type="button"
-                onClick={() => toggleClear(section.category, field.key)}
-                className={`flex items-center gap-1 px-2 py-2 rounded-lg border text-[11px] font-semibold transition ${
-                  willClear
-                    ? "bg-slate-800 border-slate-700 text-slate-300 hover:text-white"
-                    : "bg-slate-900 border-slate-800 text-rose-400 hover:bg-rose-500/10"
+                onClick={() => toggleClear(category, key)}
+                className={`flex items-center gap-1 px-2 py-2 rounded-lg border text-[11px] font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+                  willClear ? "bg-slate-800 border-slate-700 text-slate-300" : "bg-slate-900 border-slate-800 text-rose-400 hover:bg-rose-500/10"
                 }`}
-                title={willClear ? "Keep the stored value" : "Remove the stored value on save"}
               >
-                {willClear ? <Undo2 className="h-3.5 w-3.5" /> : <Trash2 className="h-3.5 w-3.5" />}
+                {willClear ? <Undo2 className="h-3.5 w-3.5" aria-hidden="true" /> : <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />}
                 <span>{willClear ? "Undo" : "Clear"}</span>
               </button>
             )}
           </div>
-          {fromEnv && !willClear && (
-            <p className="text-[10px] text-slate-500">
-              Comes from the {entry?.env_var || "server"} environment variable; a value saved here takes precedence.
-            </p>
-          )}
-          {field.help && <p className="text-[10px] text-slate-500">{field.help}</p>}
+          <p className="text-[10px] text-slate-500">
+            {willClear ? "The stored value will be removed." : isSet ? `Currently set${entry.preview ? ` (${entry.preview})` : ""}; the value is never shown.` : "Not set."}
+            {fromEnv && !willClear ? " A value saved here would override the environment variable." : ""}
+          </p>
+          {foot}
         </div>
       );
     }
 
-    if (field.kind === "bool") {
-      const on = value === "true";
+    if (kind === "bool") {
+      const on = normalizeBool(value) === "true";
       return (
-        <div key={field.key} className="space-y-1">
+        <div key={key} className="space-y-1">
           <div className="flex items-center justify-between gap-3">
-            {label}
+            <div className="flex-1 min-w-0">{head}</div>
             <button
               id={id}
               type="button"
               role="switch"
               aria-checked={on}
+              aria-describedby={describedBy}
               disabled={disabled}
-              onClick={() => setValue(section.category, field.key, on ? "false" : "true")}
-              className={`relative inline-flex h-5 w-10 flex-shrink-0 rounded-full border-2 border-transparent transition-colors duration-200 ${
-                on ? "bg-emerald-500" : "bg-slate-700"
-              } ${disabled ? "opacity-60 cursor-not-allowed" : "cursor-pointer"}`}
+              onClick={() => setValue(category, key, on ? "false" : "true")}
+              className={`relative inline-flex h-5 w-10 flex-shrink-0 rounded-full border-2 border-transparent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${on ? "bg-emerald-500" : "bg-slate-700"} ${disabled ? "opacity-60 cursor-not-allowed" : "cursor-pointer"}`}
             >
-              <span className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow transition duration-200 ${on ? "translate-x-5" : "translate-x-0"}`} />
+              <span className="sr-only">{on ? "On" : "Off"}</span>
+              <span aria-hidden="true" className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow transition ${on ? "translate-x-5" : "translate-x-0"}`} />
             </button>
           </div>
-          {field.help && <p className="text-[10px] text-slate-500 leading-relaxed">{field.help}</p>}
+          {foot}
         </div>
       );
     }
 
-    if (field.kind === "list") {
+    if (kind === "list") {
       return (
-        <div key={field.key} className="space-y-1">
-          {label}
-          <textarea
-            id={id}
-            rows={3}
-            value={value}
-            disabled={disabled}
-            onChange={(e) => setValue(section.category, field.key, e.target.value)}
-            placeholder={field.placeholder}
-            className={inputClass + " resize-y"}
-          />
-          {field.help && <p className="text-[10px] text-slate-500">{field.help}</p>}
+        <div key={key} className="space-y-1">
+          {head}
+          <textarea id={id} rows={3} value={value} disabled={disabled} aria-invalid={Boolean(error)} aria-describedby={describedBy} onChange={(e) => setValue(category, key, e.target.value)} placeholder={meta?.placeholder} className={`${inputClass} ${borderClass} resize-y`} />
+          {foot}
         </div>
       );
     }
 
-    if (field.kind === "select") {
-      const selected = field.options?.find((o) => o.value === value);
+    if (kind === "select") {
+      const options = meta?.options ?? [];
+      const selected = options.find((o) => o.value === value);
       return (
-        <div key={field.key} className="space-y-1">
-          {label}
-          <select
-            id={id}
-            value={value}
-            disabled={disabled}
-            onChange={(e) => setValue(section.category, field.key, e.target.value)}
-            className={inputClass}
-          >
-            {field.options?.map((o) => (
-              <option key={o.value} value={o.value}>{o.label} ({o.value})</option>
-            ))}
+        <div key={key} className="space-y-1">
+          {head}
+          <select id={id} value={value} disabled={disabled} aria-describedby={describedBy} onChange={(e) => setValue(category, key, e.target.value)} className={`${inputClass} ${borderClass}`}>
+            {!selected && value !== "" && <option value={value}>{value}</option>}
+            {options.map((o) => <option key={o.value} value={o.value}>{o.label} ({o.value})</option>)}
           </select>
-          {selected && <p className="text-[10px] text-slate-500">{selected.help}</p>}
+          {selected?.help && <p className="text-[10px] text-slate-500">{selected.help}</p>}
+          {foot}
         </div>
       );
     }
 
     return (
-      <div key={field.key} className="space-y-1">
-        {label}
+      <div key={key} className="space-y-1">
+        {head}
         <input
           id={id}
-          type={field.kind === "number" ? "number" : field.kind === "url" ? "url" : "text"}
-          step={field.kind === "number" ? "0.01" : undefined}
-          min={field.kind === "number" ? 0 : undefined}
-          max={field.kind === "number" ? 1 : undefined}
+          type="text"
+          inputMode={kind === "number" ? "decimal" : kind === "url" ? "url" : undefined}
           value={value}
           disabled={disabled}
-          onChange={(e) => setValue(section.category, field.key, e.target.value)}
-          placeholder={field.placeholder || "Not set"}
-          className={inputClass}
+          aria-invalid={Boolean(error)}
+          aria-describedby={describedBy}
+          onChange={(e) => setValue(category, key, e.target.value)}
+          placeholder={meta?.placeholder || (entry.source === "default" ? "default" : "Not set")}
+          className={`${inputClass} ${borderClass}`}
         />
-        {field.help && <p className="text-[10px] text-slate-500">{field.help}</p>}
+        {foot}
       </div>
     );
   };
 
   return (
     <div className="space-y-8 max-w-7xl mx-auto pb-16">
-      {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-slate-800 pb-6">
         <div>
-          <div className="flex items-center space-x-3 mb-1">
+          <div className="flex items-center gap-3 mb-1 flex-wrap">
             <h1 className="text-2xl font-black tracking-tight text-white flex items-center gap-2.5">
-              <Sliders className="h-6 w-6 text-blue-500" />
-              Integrations & Platform Settings
+              <Sliders className="h-6 w-6 text-blue-500" aria-hidden="true" />
+              Integrations &amp; platform settings
             </h1>
             {runtime?.simulation_mode && (
               <span className="text-xs px-2 py-0.5 rounded-full bg-fuchsia-500/20 text-fuchsia-300 font-bold border border-fuchsia-500/30 flex items-center gap-1">
-                <FlaskConical className="h-3 w-3" />
-                SIMULATION MODE
+                <FlaskConical className="h-3 w-3" aria-hidden="true" /> SIMULATION MODE
               </span>
             )}
           </div>
           <p className="text-xs text-slate-400 max-w-3xl leading-relaxed">
-            Values saved here override environment variables. Secrets are write-only: the server only returns whether a secret is set and its last four characters.
-            Connection tests make a real, read-only request with the stored settings (or the values you typed but have not saved yet).
+            Values saved here override environment variables. Secrets are write-only: the server only reports whether one is set. Connection tests make a real, read-only request with the stored settings, or with values you typed but have not saved yet.
           </p>
         </div>
-
         {canEdit ? (
           <button
-            onClick={handleSave}
-            disabled={saving || loading}
-            className="flex items-center justify-center space-x-2 px-6 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shadow-xl shadow-blue-600/30 transition disabled:opacity-50"
+            type="button"
+            onClick={() => void save()}
+            disabled={saving || resource.loading || !config}
+            className="flex items-center justify-center gap-2 px-6 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shadow-xl shadow-blue-600/30 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-300"
           >
-            <Save className="h-4 w-4" />
-            <span>{saving ? "Saving..." : dirtyCount ? `Save ${dirtyCount} change${dirtyCount === 1 ? "" : "s"}` : "Save changes"}</span>
+            <Save className="h-4 w-4" aria-hidden="true" />
+            <span>{saving ? "Saving..." : dirtyIds.length ? `Save ${dirtyIds.length} change${dirtyIds.length === 1 ? "" : "s"}` : "Save changes"}</span>
           </button>
         ) : (
-          <div className="flex items-center space-x-1.5 px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs font-medium text-slate-400">
-            <Lock className="h-3.5 w-3.5 text-amber-400" />
+          <div className="flex items-center gap-1.5 px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs font-medium text-slate-400">
+            <Lock className="h-3.5 w-3.5 text-amber-400" aria-hidden="true" />
             <span>Read-only: only administrators can change settings or run tests</span>
           </div>
         )}
       </div>
 
-      {loadError && (
-        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs flex items-center space-x-2">
-          <AlertCircle className="h-4 w-4 flex-shrink-0" />
-          <span>{loadError}</span>
-        </div>
-      )}
       {saveError && (
-        <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-400 text-xs flex items-center space-x-2">
-          <AlertCircle className="h-4 w-4 flex-shrink-0" />
-          <span>{saveError}</span>
-        </div>
-      )}
-      {saveMsg && (
-        <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-xs flex items-center space-x-2">
-          <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
-          <span>{saveMsg}</span>
-        </div>
+        <InlineNotice tone="error" onDismiss={() => setSaveError(null)}>
+          <p>{saveError.message}</p>
+          {saveError.blockers.length > 0 && (
+            <ul className="list-disc pl-5 mt-1.5 space-y-0.5">
+              {saveError.blockers.map((b) => <li key={b}>{b}</li>)}
+            </ul>
+          )}
+        </InlineNotice>
       )}
 
-      {loading && !config ? (
-        <div className="flex flex-col items-center justify-center py-20 space-y-3">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500" />
-          <p className="text-sm text-slate-400">Loading configuration...</p>
-        </div>
-      ) : (
+      {resource.error && !config ? (
+        <ErrorState title="Could not load the configuration" message={resource.error} onRetry={() => void resource.reload()} />
+      ) : resource.loading && !config ? (
+        <LoadingState label="Loading configuration..." />
+      ) : config ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {SECTIONS.map((section) => {
-            const Icon = section.icon;
+          {resource.error && <div className="lg:col-span-2"><InlineNotice tone="warning">Could not refresh: {resource.error}</InlineNotice></div>}
+          {categories.map((category) => {
+            const meta = categoryMeta(category);
+            const Icon = CATEGORY_ICONS[category] ?? Sliders;
+            const entries = config[category] ?? {};
+            const services = SERVICE_TESTS[category] ?? [];
             return (
-              <div
-                key={section.category}
-                className="bg-slate-900 border border-slate-800 rounded-2xl p-6 flex flex-col shadow-lg hover:border-slate-700/80 transition space-y-5"
-              >
+              <section key={category} aria-labelledby={`cat-${category}`} className="bg-slate-900 border border-slate-800 rounded-2xl p-6 flex flex-col shadow-lg space-y-5">
                 <div className="space-y-2">
-                  <div className="flex items-center space-x-3">
+                  <div className="flex items-center gap-3">
                     <div className="h-10 w-10 rounded-xl bg-blue-600/20 border border-blue-500/30 flex items-center justify-center flex-shrink-0">
-                      <Icon className="h-5 w-5 text-blue-400" />
+                      <Icon className="h-5 w-5 text-blue-400" aria-hidden="true" />
                     </div>
                     <div>
-                      <h3 className="font-bold text-base text-white tracking-wide">{section.title}</h3>
-                      <span className="text-[10px] font-mono text-slate-500">Category: {section.category}</span>
+                      <h2 id={`cat-${category}`} className="font-bold text-base text-white tracking-wide">{meta.title}</h2>
+                      <span className="text-[10px] font-mono text-slate-500">Category: {category}</span>
                     </div>
                   </div>
-                  <p className="text-xs text-slate-400 leading-relaxed">{section.description}</p>
+                  <p className="text-xs text-slate-400 leading-relaxed">{meta.description}</p>
                 </div>
 
                 <div className="space-y-3.5 bg-slate-950/60 p-4 rounded-xl border border-slate-800/80">
-                  {section.fields.map((field) => renderField(section, field))}
+                  {Object.entries(entries).length === 0 ? (
+                    <p className="text-xs text-slate-500">No settings reported for this category.</p>
+                  ) : (
+                    Object.entries(entries).map(([key, entry]) => renderField(category, key, entry))
+                  )}
                 </div>
 
-                {section.services.length > 0 && (
+                {services.length > 0 && (
                   <div className="pt-2 border-t border-slate-800/80 space-y-2">
                     <span className="text-[11px] text-slate-500 block">Connection tests</span>
-                    {section.services.map((service) => {
-                      const result = testResults[service.id];
-                      const configured = runtime?.integrations?.[service.id];
-                      const style = result ? testStatusStyle(result) : null;
+                    {services.map((service) => {
+                      const result = tests[service.id];
+                      const configured = runtime?.integrations?.[service.integrationKey ?? service.id];
+                      const style = result ? testStyle(result) : null;
                       const ResultIcon = style?.icon;
                       return (
                         <div key={service.id} className="space-y-1.5">
@@ -640,37 +535,31 @@ export default function ConfigurationPage() {
                             <div className="flex items-center gap-2 text-xs">
                               <span className="font-semibold text-slate-200">{service.label}</span>
                               {configured !== undefined && (
-                                <span className={`text-[10px] px-1.5 py-0.5 rounded border ${
-                                  configured ? "bg-blue-500/10 text-blue-300 border-blue-500/20" : "bg-slate-800 text-slate-500 border-slate-700"
-                                }`}>
+                                <span className={`text-[10px] px-1.5 py-0.5 rounded border ${configured ? "bg-blue-500/10 text-blue-300 border-blue-500/20" : "bg-slate-800 text-slate-500 border-slate-700"}`}>
                                   {configured ? "Configured" : "Not configured"}
                                 </span>
                               )}
                             </div>
                             <button
                               type="button"
-                              onClick={() => handleTest(section, service)}
-                              disabled={!canEdit || testingId !== null}
+                              onClick={() => void runTest(category, service.id, service.label, service.overrides)}
+                              disabled={!canEdit || testing !== null}
                               title={canEdit ? `Run a read-only authentication check against ${service.label}` : "Administrators only"}
-                              className="flex items-center space-x-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold transition disabled:opacity-50"
+                              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                             >
-                              <Activity className={`h-3.5 w-3.5 text-blue-400 ${testingId === service.id ? "animate-spin" : ""}`} />
-                              <span>{testingId === service.id ? "Testing..." : "Test"}</span>
+                              <Activity className={`h-3.5 w-3.5 text-blue-400 ${testing === service.id ? "animate-spin" : ""}`} aria-hidden="true" />
+                              <span>{testing === service.id ? "Testing..." : "Test"}</span>
                             </button>
                           </div>
                           {result && style && ResultIcon && (
-                            <div className={`p-2.5 rounded-lg border text-xs ${style.className}`}>
-                              <div className="flex items-start space-x-2">
-                                <ResultIcon className="h-4 w-4 flex-shrink-0 mt-0.5" />
+                            <div role="status" className={`p-2.5 rounded-lg border text-xs ${style.className}`}>
+                              <div className="flex items-start gap-2">
+                                <ResultIcon className="h-4 w-4 flex-shrink-0 mt-0.5" aria-hidden="true" />
                                 <div className="space-y-0.5">
                                   <div className="font-bold flex items-center gap-2">
                                     <span>{result.status}</span>
-                                    {result.health && result.health !== result.status && (
-                                      <span className="font-normal opacity-80">· {result.health}</span>
-                                    )}
-                                    {typeof result.latency_ms === "number" && result.latency_ms > 0 && (
-                                      <span className="font-mono text-[10px] opacity-75">({result.latency_ms}ms)</span>
-                                    )}
+                                    {result.health && result.health !== result.status && <span className="font-normal opacity-80">&middot; {result.health}</span>}
+                                    {typeof result.latency_ms === "number" && result.latency_ms > 0 && <span className="font-mono text-[10px] opacity-75">({result.latency_ms}ms)</span>}
                                   </div>
                                   <p className="text-[11px] opacity-90 leading-tight">{result.message}</p>
                                 </div>
@@ -682,11 +571,11 @@ export default function ConfigurationPage() {
                     })}
                   </div>
                 )}
-              </div>
+              </section>
             );
           })}
         </div>
-      )}
+      ) : null}
     </div>
   );
 }

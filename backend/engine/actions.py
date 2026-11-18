@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from backend import integration_config
 from backend.crud import create_containment_action
 from backend.integrations import connector_base
 from backend.integrations.edr import edr_client
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 _AGENT_ID_PARAM = {
     "type": "string",
-    "description": "Wazuh agent id to run on; defaults to the alert's agent.id",
+    "description": "Wazuh agent id to run on; defaults to the alert's agent.id. Analyst-only: automation (AI agent, playbooks) is denied any other agent id.",
 }
 
 ACTION_CATALOG: Dict[str, Dict[str, Any]] = {
@@ -70,7 +71,7 @@ ACTION_CATALOG: Dict[str, Dict[str, Any]] = {
         "target_type": "ip",
         "impact": "medium",
         "reversible": True,
-        "description": "Drop traffic from an IP with the Wazuh firewall-drop active response.",
+        "description": "Block an IP on the endpoint(s) with the Wazuh phantom-block-ip active response (temporary, default duration set by wazuh_default_block_hours).",
         "params": {
             "agent_id": _AGENT_ID_PARAM,
             "duration_hours": {"type": "integer", "minimum": 1, "maximum": 720},
@@ -94,6 +95,7 @@ ACTION_CATALOG: Dict[str, Dict[str, Any]] = {
         "params": {
             "agent_id": _AGENT_ID_PARAM,
             "rate": {"type": "string", "description": "e.g. '10/minute' or '5/second'"},
+            "duration_hours": {"type": "integer", "minimum": 1, "maximum": 720},
         },
     },
     "disable_account": {
@@ -178,7 +180,18 @@ TARGET_ENTITY_KEYS: Dict[str, str] = {
 }
 
 CONTAINMENT_CONNECTORS = {"edr", "firewall", "iam"}
-EXECUTED_STATUSES = {"Success", "Simulated"}
+# Only a LIVE Success means a command really reached the target system. A "Simulated"
+# result is a rehearsal: it never counts as done, as containment, or as a reason to skip
+# the action when the run is repeated after the connector has been configured.
+LIVE_STATUSES = {"Success"}
+EXECUTED_STATUSES = LIVE_STATUSES  # "really executed": Simulated is deliberately NOT included
+RAN_STATUSES = {"Success", "Simulated"}  # the action ran, live or as a rehearsal (for display only)
+
+
+def is_live_success(status: Optional[str], execution_mode: Optional[str] = None) -> bool:
+    """True for a record whose command was really executed (never a simulated one)."""
+    return status in LIVE_STATUSES and (execution_mode or "live") != "simulated"
+
 
 _LOG_SOURCE = {"edr": "EDR", "firewall": "FIREWALL", "iam": "IAM", "itsm": "ITSM"}
 _LOG_LEVEL = {"Success": "ACTION", "Simulated": "INFO", "Skipped": "WARNING", "Failed": "ERROR"}
@@ -329,7 +342,23 @@ def _default_ticket_text(alert: Alert) -> Dict[str, str]:
     return {"summary": f"[Phantom SOAR #{alert.alert_id}] {title}", "description": "\n".join(lines)}
 
 
+_SIMULATION_PROVIDER = {"edr": "Wazuh EDR", "firewall": "Wazuh firewall", "iam": "Okta", "itsm": "Jira / Slack"}
+
+
 def _dispatch(alert: Alert, action: str, target: Optional[str], params: Dict[str, Any]) -> Dict[str, Any]:
+    # Simulation mode is a hard stop for every response action: nothing is sent to any real system, even when
+    # credentials are saved. (Read-only threat-intel lookups are unaffected.) Turn simulation_mode OFF to act for real.
+    if integration_config.is_simulation_mode():
+        connector = (ACTION_CATALOG.get(action) or {}).get("connector", "")
+        provider = _SIMULATION_PROVIDER.get(connector, connector or "connector")
+        return connector_base.make_result(
+            action, target, provider, "simulated",
+            {
+                "simulated": True,
+                "message": f"SIMULATED: simulation mode is ON, so {provider} was not contacted and nothing was changed. "
+                           "Turn simulation_mode off in Configuration to run actions for real.",
+            },
+        )
     context = _alert_context(alert)
     agent_id = _agent_id_for(alert, action, target, params)
 
@@ -350,7 +379,8 @@ def _dispatch(alert: Alert, action: str, target: Optional[str], params: Dict[str
         return firewall_client.unblock_ip(target, agent_id=agent_id, alert_context=context)
     if action == "apply_rate_limit":
         return firewall_client.apply_rate_limit(
-            target, rate=params.get("rate") or "10/minute", agent_id=agent_id, alert_context=context
+            target, rate=params.get("rate") or "10/minute", agent_id=agent_id, alert_context=context,
+            duration_hours=params.get("duration_hours"),
         )
     if action == "disable_account":
         return iam_client.disable_account(target, reason=params.get("reason"))

@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -20,7 +20,10 @@ from backend.crud import (
     get_ioc_artifacts_by_alert,
 )
 from backend.database import SessionLocal, get_db
+from backend.security import consume_confirmation_token, issue_confirmation_token, mask_sensitive
 from backend.dependencies import (
+    get_token_payload,
+    role_level,
     get_current_user,
     require_admin,
     require_analyst_or_admin,
@@ -30,6 +33,7 @@ from backend.engine import runner
 from backend.engine.actions import (
     ACTION_CATALOG,
     EXECUTED_STATUSES,
+    RAN_STATUSES,
     TARGET_ENTITY_KEYS,
     execute_action,
     record_policy_block,
@@ -64,6 +68,17 @@ def require_responder(
     return current_user
 
 
+def is_read_only(user: User) -> bool:
+    return role_level(user.role) == "read_only"
+
+
+def mask_for(user: User, value: Any) -> Any:
+    """The read-only auditor role sees credentials, tokens and e-mail addresses masked in everything that echoes
+    alert content (raw payload, IOC values and evidence, entity strings, action targets, proposal free text). The
+    shape and the field names are unchanged, so the console renders the same fields."""
+    return mask_sensitive(value) if is_read_only(user) else value
+
+
 def _get_alert_or_404(db: Session, alert_id: int) -> Alert:
     alert = get_alert(db, alert_id)
     if not alert:
@@ -93,6 +108,8 @@ def _run_status(result: Dict[str, Any]) -> str:
 def _approve(db: Session, alert_id: int, username: str, playbook_id: Optional[int]) -> Dict[str, Any]:
     try:
         return runner.approve_and_contain_alert(db, alert_id, approved_by=username, playbook_id=playbook_id)
+    except runner.AlertBusyError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except runner.NoPlaybookError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except ValueError as exc:
@@ -136,9 +153,44 @@ def get_metrics(db: Session = Depends(get_db), current_user: User = Depends(get_
     return get_dashboard_metrics(db)
 
 
+PURGE_CONFIRM_TTL_SECONDS = 120
+
+
+@router.get("/purge/confirm")
+def issue_purge_confirmation(
+    current_user: User = Depends(require_admin),
+    token_payload: Dict[str, Any] = Depends(get_token_payload),
+):
+    """[Admin Only] Step 1 of a purge: returns a one-time token (valid 2 minutes, bound to this admin session).
+    Send it as the `X-Confirm-Token` header of DELETE /alerts/purge."""
+    token = issue_confirmation_token("alerts_purge", current_user.username, token_payload.get("jti", ""),
+                                     PURGE_CONFIRM_TTL_SECONDS)
+    return {"confirm_token": token, "expires_in_seconds": PURGE_CONFIRM_TTL_SECONDS,
+            "message": "Send this value as the X-Confirm-Token header of DELETE /alerts/purge. It works once."}
+
+
 @router.delete("/purge")
-def purge_all_alerts(db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
-    """Delete every alert and its artifacts, executions, actions, proposals and reports (admin only)."""
+def purge_all_alerts(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+    token_payload: Dict[str, Any] = Depends(get_token_payload),
+    confirm_token: Optional[str] = Header(default=None, alias="X-Confirm-Token"),
+):
+    """Delete every alert and its artifacts, executions, actions, proposals and reports (admin only).
+
+    Requires the one-time `X-Confirm-Token` from GET /alerts/purge/confirm, issued to this same session.
+    The purge is audit-logged before and after it runs.
+    """
+    if not confirm_token or not consume_confirmation_token(
+        confirm_token, "alerts_purge", current_user.username, token_payload.get("jti", "")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail="Confirmation required: call GET /alerts/purge/confirm and send the token as X-Confirm-Token.",
+        )
+    from backend.routers.logs import record_log as _audit
+    _audit(db, "RBAC", "WARNING", f"{current_user.username} confirmed and started a purge of ALL alerts.",
+           current_user.username, {"by": current_user.username, "phase": "start"})
     report_paths = [r.pdf_path for r in db.query(IncidentReport).all()]
     for model in (AgentProposal, AnalystActionLog, IncidentReport, ContainmentAction, PlaybookExecution, IocArtifact):
         db.query(model).delete(synchronize_session=False)
@@ -157,9 +209,9 @@ def purge_all_alerts(db: Session = Depends(get_db), current_user: User = Depends
     try:
         from backend.routers.logs import record_log
         record_log(db, "RBAC", "WARNING", f"{current_user.username} purged {deleted_count} alert(s) and their records.",
-                   current_user.username, {"deleted_alerts": deleted_count})
+                   current_user.username, {"deleted_alerts": deleted_count, "by": current_user.username, "phase": "done"})
     except Exception as exc:
-        logger.debug(f"Could not record purge log: {exc}")
+        logger.error(f"Could not record purge audit entry: {exc}")
 
     return {
         "status": "success",
@@ -183,6 +235,9 @@ def list_alerts(
     for alert in alerts:
         iocs = get_ioc_artifacts_by_alert(db, alert.alert_id)
         data = alert.to_dict()
+        if is_read_only(current_user):
+            data["raw_payload"] = mask_sensitive(data.get("raw_payload"))
+            data["rule_id"] = mask_sensitive(data.get("rule_id"))
         data["ioc_count"] = len(iocs)
         data["max_threat_score"] = max([i.threat_score for i in iocs], default=0)
         data["malicious_ioc_count"] = sum(1 for i in iocs if i.verdict == "Malicious")
@@ -191,7 +246,12 @@ def list_alerts(
 
 
 @router.get("/{alert_id}")
-def get_alert_detail(alert_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_alert_detail(
+    alert_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Alert detail: IOCs with evidence, matched playbook, routing, actions, reports and an honest triage summary."""
     alert = _get_alert_or_404(db, alert_id)
 
@@ -201,15 +261,18 @@ def get_alert_detail(alert_id: int, db: Session = Depends(get_db), current_user:
     report = get_incident_report_by_alert(db, alert_id)
     playbook = runner.playbook_for_alert(db, alert)
 
+    # Opening an alert must stay fast: use cached CVE data only and fetch missing CVEs from NVD in the background.
     try:
-        vulnerability_intel = nvd_client.analyze_alert_vulnerabilities(alert.to_dict())
+        vulnerability_intel = nvd_client.analyze_alert_vulnerabilities(alert.to_dict(), db, allow_live=False)
+        if vulnerability_intel.get("status") in ("pending", "partial"):
+            background_tasks.add_task(nvd_client.refresh_alert_vulnerabilities, alert_id)
     except Exception as exc:
-        logger.warning(f"NVD analysis failed for Alert #{alert_id}: {exc}")
-        vulnerability_intel = {"status": "unavailable", "error": str(exc)}
+        logger.warning(f"NVD analysis failed for Alert #{alert_id}: {type(exc).__name__}")
+        vulnerability_intel = {"status": "unavailable", "error": "Vulnerability lookup failed."}
 
     return {
         "alert_id": alert.alert_id,
-        "rule_id": alert.rule_id,
+        "rule_id": mask_for(current_user, alert.rule_id),
         "source": alert.source,
         "severity": alert.severity,
         "status": alert.status,
@@ -218,17 +281,18 @@ def get_alert_detail(alert_id: int, db: Session = Depends(get_db), current_user:
         "resolved_by": alert.resolved_by,
         "resolved_at": alert.resolved_at.isoformat() if alert.resolved_at else None,
         "created_at": alert.created_at.isoformat() if alert.created_at else None,
-        "raw_payload": alert.raw_payload,
-        "ioc_artifacts": [i.to_dict() for i in iocs],
+        # The read-only auditor role sees credentials, tokens and e-mail addresses masked.
+        "raw_payload": mask_for(current_user, alert.raw_payload),
+        "ioc_artifacts": mask_for(current_user, [i.to_dict() for i in iocs]),
         "playbook_executions": [e.to_dict() for e in executions],
-        "containment_actions": [a.to_dict() for a in actions],
-        "agent_proposals": [p.to_dict() for p in (alert.agent_proposals or [])],
+        "containment_actions": mask_for(current_user, [a.to_dict() for a in actions]),
+        "agent_proposals": mask_for(current_user, [p.to_dict() for p in (alert.agent_proposals or [])]),
         "incident_report": report.to_dict() if report else None,
         "playbook": playbook.to_dict() if playbook else None,
         "routing": runner.evaluate_execution_mode(db, alert, iocs, playbook),
-        "entities": get_alert_entities(alert, iocs),
+        "entities": mask_for(current_user, get_alert_entities(alert, iocs)),
         "mitre_attack": runner.extract_mitre(alert, playbook),
-        "triage_summary": runner.build_triage_summary(db, alert, iocs, playbook),
+        "triage_summary": mask_for(current_user, runner.build_triage_summary(db, alert, iocs, playbook)),
         "simulation_mode": integration_config.is_simulation_mode(db),
         "hotl_enabled": runner.is_hotl_globally_enabled(db),
         "max_threat_score": max([i.threat_score for i in iocs], default=0),
@@ -237,10 +301,19 @@ def get_alert_detail(alert_id: int, db: Session = Depends(get_db), current_user:
 
 
 @router.get("/{alert_id}/vulnerabilities")
-def get_alert_vulnerabilities(alert_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """CVE context for the alert from the National Vulnerability Database."""
+def get_alert_vulnerabilities(
+    alert_id: int,
+    background_tasks: BackgroundTasks,
+    refresh: bool = Query(False, description="Fetch missing or stale CVEs from NVD now (background) instead of using the cache only"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """CVE context for the alert from the National Vulnerability Database (cached; missing CVEs load in the background)."""
     alert = _get_alert_or_404(db, alert_id)
-    return nvd_client.analyze_alert_vulnerabilities(alert.to_dict())
+    analysis = nvd_client.analyze_alert_vulnerabilities(alert.to_dict(), db, allow_live=False)
+    if refresh or analysis.get("status") in ("pending", "partial"):
+        background_tasks.add_task(nvd_client.refresh_alert_vulnerabilities, alert_id)
+    return analysis
 
 
 @router.post("/{alert_id}/vulnerabilities/execute-hotl")
@@ -284,12 +357,13 @@ def execute_cve_hotl_action(
         records.append(record)
         results.append({"policy": decision.to_dict(), "action": record.to_dict()})
 
-    executed = [r for r in records if r.status in EXECUTED_STATUSES]
-    simulated = any(r.status == "Simulated" for r in executed)
+    live = [r for r in records if r.status in EXECUTED_STATUSES]
+    executed = [r for r in records if r.status in RAN_STATUSES]
+    simulated = bool(executed) and not live  # rehearsal only: nothing real changed, so it is never "Contained"
     cves = analysis.get("cves_detected") or []
     now = datetime.now(timezone.utc)
     if executed and alert.status in ("New", "Triaged", "Monitoring"):
-        alert.status = "Contained"
+        alert.status = "Simulated" if simulated else "Contained"
         alert.analyst_decision = f"NVD-recommended {action}" + (f" ({cves[0]})" if cves else "")
         alert.resolved_by = current_user.username
         alert.resolved_at = now

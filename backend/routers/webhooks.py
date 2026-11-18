@@ -5,6 +5,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
+from backend import ratelimit
 from backend.database import get_db
 from backend.dependencies import require_ingest_token
 from backend.engine.ingest import IngestResult, ingest_alert_with_details
@@ -14,7 +15,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(
     prefix="/webhooks",
     tags=["Webhooks & Ingestion"],
-    dependencies=[Depends(require_ingest_token)],
+    # Per-address request cap first, then the sender credential (bad tokens are throttled inside it).
+    dependencies=[Depends(ratelimit.ip_rate_limit("webhooks")), Depends(require_ingest_token)],
 )
 
 MAX_WEBHOOK_BODY_BYTES = 1024 * 1024

@@ -57,8 +57,8 @@ export function parseParams(text: string): { params: Record<string, unknown>; er
       const parsed = JSON.parse(trimmed);
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return { params: parsed, error: null };
       return { params: {}, error: "Params JSON must be an object." };
-    } catch (e: any) {
-      return { params: {}, error: `Invalid params JSON: ${e.message}` };
+    } catch (e) {
+      return { params: {}, error: `Invalid params JSON: ${e instanceof Error ? e.message : "could not parse"}` };
     }
   }
   const params: Record<string, unknown> = {};

@@ -1,7 +1,8 @@
 """Integration settings, runtime status and honest connection tests.
 
-Secrets are write-only through the API: reads return a masked preview, and an empty
-value for a secret in an update keeps what is stored unless `clear` is set.
+Secrets are write-only through the API: reads only say whether one is set and where it comes
+from (no characters of the value are ever returned), and an empty value for a secret in an update
+keeps what is stored unless `clear` is set. Secret values are encrypted at rest (backend/crypto.py).
 """
 import ipaddress
 import logging
@@ -17,6 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from backend import netguard, ratelimit
+from backend.crypto import DecryptionError, decrypt_value, is_encrypted, seal_secret
 from backend.database import get_db
 from backend.dependencies import (
     ADMIN_ROLES,
@@ -25,11 +28,14 @@ from backend.dependencies import (
     require_admin,
     require_roles,
 )
+from backend.integrations import llm
 from backend.integration_config import (
     DEFAULTS,
     INTEGRATION_KEYS,
     get_bool,
     get_setting,
+    hotl_effective,
+    hotl_enable_blockers,
     is_configured,
     is_simulation_mode,
 )
@@ -41,8 +47,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/configuration", tags=["Configuration & Integrations"])
 
-CATEGORIES = ("TIP", "SIEM", "IAM", "ITSM", "ORCHESTRATION", "AGENT")
-REMOVED_CATEGORIES = {"AI", "EDR", "XDR", "FIREWALL"}
+CATEGORIES = ("TIP", "SIEM", "IAM", "ITSM", "ORCHESTRATION", "AGENT", "AI")
+REMOVED_CATEGORIES = {"EDR", "XDR", "FIREWALL"}  # "AI" is a live category again (OpenRouter triage)
 
 SECRET_KEYS = frozenset(
     key for key in INTEGRATION_KEYS
@@ -75,8 +81,28 @@ KNOWN_DUMMY_VALUES = {
     "wazuh-api-admin",
 }
 
-BOOL_KEYS = {"hotl_enabled", "simulation_mode", "siem_verify_tls"}
+BOOL_KEYS = {"hotl_enabled", "simulation_mode", "siem_verify_tls", "require_mfa_for_admin",
+             "ai_enabled", "ai_auto_triage", "ai_send_raw_payload"}
 URL_KEYS = {"siem_manager_url", "jira_base_url", "jira_webhook_url", "slack_webhook_url"}
+# key -> (minimum, maximum, integer?). Out-of-range values are rejected instead of silently ignored.
+NUMERIC_KEYS: Dict[str, Tuple[float, float, bool]] = {
+    "vt_requests_per_minute": (0, 100000, True),
+    "vt_requests_per_day": (0, 10_000_000, True),
+    "abuseipdb_daily_limit": (0, 10_000_000, True),
+    "nvd_requests_per_30s": (1, 100000, True),
+    "tip_max_wait_seconds": (0, 600, False),
+    "vt_malicious_weight": (0, 10, False),
+    "vt_suspicious_weight": (0, 10, False),
+    "vt_malicious_threshold": (0.001, 1, False),
+    "vt_min_detections": (0, 1000, False),
+    "tip_malicious_threshold": (1, 100, True),
+    "tip_suspicious_threshold": (1, 100, True),
+    "tip_critical_threshold": (1, 100, True),
+    "wazuh_default_block_hours": (0, 720, True),
+    "wazuh_default_rate_limit_hours": (0, 720, True),
+    "ai_max_alerts_per_minute": (1, 600, True),
+}
+JIRA_API_VERSIONS = ("2", "3")
 AGENT_AUTONOMY_LEVELS = ("recommend_only", "low_impact", "policy")
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}
@@ -93,11 +119,14 @@ def _now() -> datetime:
 
 
 def _seed_value(key: str) -> str:
-    """Initial stored value: an explicit environment value for non-secret keys, else the default."""
-    if key not in DEFAULTS:
-        return ""
-    env_value = os.getenv(INTEGRATION_KEYS[key][1], "").strip()
-    return env_value or DEFAULTS[key]
+    """Initial stored value: always empty.
+
+    The database holds only what an administrator saved in the console. Environment variables and the built-in
+    defaults are resolved at read time (integration_config.get_setting: database, then environment, then default),
+    so changing an environment variable and restarting always takes effect. Freezing them into the database on
+    first boot made later environment changes silently ignored.
+    """
+    return ""
 
 
 def ensure_default_configurations(db: Session) -> None:
@@ -126,6 +155,9 @@ def ensure_default_configurations(db: Session) -> None:
         if (row.key_value or "") in KNOWN_DUMMY_VALUES:
             row.key_value = ""
             changed = True
+        if secret and row.key_value and not is_encrypted(row.key_value):
+            row.key_value = seal_secret(row.key_value, True)
+            changed = True
 
     for key, (category, _env_var) in INTEGRATION_KEYS.items():
         if key in seen:
@@ -143,13 +175,20 @@ def ensure_default_configurations(db: Session) -> None:
         db.commit()
 
 
-def _mask(value: str) -> str:
-    return "••••" + (value[-4:] if len(value) >= 8 else "")
+SECRET_PLACEHOLDER = "••••••••"  # constant: reveals nothing about the value, not even its length or last characters
+
+
+def _stored_plaintext(row: Optional[SystemConfig]) -> str:
+    try:
+        return (decrypt_value(row.key_value) or "").strip() if row else ""
+    except DecryptionError:
+        logger.error(f"Setting {row.key_name} cannot be decrypted with the configured encryption key(s).")
+        return ""
 
 
 def _describe(key: str, row: Optional[SystemConfig]) -> Dict[str, Any]:
     category, env_var = INTEGRATION_KEYS[key]
-    stored = (row.key_value or "").strip() if row else ""
+    stored = _stored_plaintext(row)
     env_value = os.getenv(env_var, "").strip()
     if stored:
         source, effective = "database", stored
@@ -164,7 +203,7 @@ def _describe(key: str, row: Optional[SystemConfig]) -> Dict[str, Any]:
         "value": "" if secret else effective,
         "is_secret": secret,
         "is_set": bool(effective),
-        "preview": _mask(effective) if secret and effective else None,
+        "preview": SECRET_PLACEHOLDER if secret and effective else None,
         "source": source,
         "env_var": env_var,
         "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
@@ -195,6 +234,20 @@ def _validate_value(key: str, value: str) -> Tuple[str, Optional[str]]:
         if lowered in _FALSE:
             return "false", None
         return value, f"{key}: expected true or false."
+    if key in NUMERIC_KEYS:
+        low, high, integer = NUMERIC_KEYS[key]
+        try:
+            number = float(value)
+        except ValueError:
+            return value, f"{key}: expected a number between {low:g} and {high:g}."
+        if number != number or not low <= number <= high or (integer and number != int(number)):
+            kind = "whole number" if integer else "number"
+            return value, f"{key}: expected a {kind} between {low:g} and {high:g}."
+        return str(int(number)) if integer else str(number), None
+    if key == "jira_api_version":
+        if value not in JIRA_API_VERSIONS:
+            return value, f"{key}: expected 2 or 3."
+        return value, None
     if key == "agent_min_confidence":
         try:
             number = float(value)
@@ -203,6 +256,10 @@ def _validate_value(key: str, value: str) -> Tuple[str, Optional[str]]:
         if not 0.0 <= number <= 1.0:
             return value, f"{key}: expected a number between 0 and 1."
         return str(number), None
+    if key == "openrouter_model":
+        if not llm.is_valid_model_slug(value):
+            return value, f"{key}: expected a model slug such as vendor/model (see https://openrouter.ai/models)."
+        return value, None
     if key == "agent_autonomy":
         if value not in AGENT_AUTONOMY_LEVELS:
             return value, f"{key}: expected one of {', '.join(AGENT_AUTONOMY_LEVELS)}."
@@ -226,6 +283,18 @@ def _validate_value(key: str, value: str) -> Tuple[str, Optional[str]]:
                 return value, f"{key}: '{item}' is not an IP address or CIDR range."
         return ", ".join(items), None
     return value, None
+
+
+def _invalidate_integration_caches(updated_keys: List[str]) -> None:
+    """Threat-intel verdict caches must not outlive a changed key, threshold or simulation switch."""
+    if not updated_keys:
+        return
+    try:
+        from backend.integrations import nvd, tip
+        tip.clear_cache()
+        nvd.clear_cache()
+    except Exception as exc:  # never fail a save because a cache could not be cleared
+        logger.warning(f"Could not clear threat-intel caches: {exc}")
 
 
 @router.post("")
@@ -273,10 +342,10 @@ def update_configurations(
         if row is None:
             row = SystemConfig(category=INTEGRATION_KEYS[key][0], key_name=key, key_value="", is_secret=key in SECRET_KEYS)
             db.add(row)
-        if (row.key_value or "") == value:
+        if _stored_plaintext(row) == value:
             unchanged.append(key)
             continue
-        row.key_value = value
+        row.key_value = seal_secret(value, key in SECRET_KEYS)
         row.is_secret = key in SECRET_KEYS
         row.updated_at = _now()
         updated.append(key)
@@ -284,7 +353,16 @@ def update_configurations(
             audit[key] = "cleared" if value == "" else "updated"
         else:
             audit[key] = value
+    # Autonomous response can only be switched on while protected assets are listed (same rule as /hotl-toggle).
+    # Evaluated with this request's own changes applied, so protected lists and the switch can be saved together.
+    if "hotl_enabled" in updated and get_bool("hotl_enabled", db=db):
+        blockers = hotl_enable_blockers(db)
+        if blockers:
+            db.rollback()
+            raise HTTPException(status_code=409, detail={"message": "Autonomous response (HOTL) cannot be enabled yet. "
+                                                         "Nothing was saved.", "blockers": blockers})
     db.commit()
+    _invalidate_integration_caches(updated)
 
     if updated:
         record_log(db, "CONFIG", "ACTION", f"Admin '{admin.username}' updated settings: {', '.join(updated)}.",
@@ -307,7 +385,7 @@ def get_runtime_status(db: Session = Depends(get_db), user: User = Depends(get_c
         min_confidence = float(DEFAULTS["agent_min_confidence"])
     return {
         "simulation_mode": is_simulation_mode(db=db),
-        "hotl_enabled": get_bool("hotl_enabled", db=db),
+        "hotl_enabled": hotl_effective(db),  # as applied, not the raw switch
         "integrations": {
             "virustotal": is_configured("virustotal_api_key", db=db),
             "abuseipdb": is_configured("abuseipdb_api_key", db=db),
@@ -319,9 +397,11 @@ def get_runtime_status(db: Session = Depends(get_db), user: User = Depends(get_c
             "jira": is_configured("jira_base_url", "jira_email", "jira_api_token", "jira_project_key", db=db)
             or is_configured("jira_webhook_url", db=db),
             "slack": is_configured("slack_webhook_url", db=db),
+            "ai": is_configured("openrouter_api_key", db=db),  # a key exists (does not say AI triage is enabled)
         },
         "agent_autonomy": get_setting("agent_autonomy", db=db),
         "agent_min_confidence": min_confidence,
+        "ai_enabled": get_bool("ai_enabled", db=db),
     }
 
 
@@ -336,11 +416,12 @@ SERVICES: Dict[str, Tuple[str, str]] = {
     "okta": ("IAM", "Okta"),
     "jira": ("ITSM", "Jira"),
     "slack": ("ITSM", "Slack"),
+    "openrouter": ("AI", "OpenRouter"),
 }
 _SERVICE_HINTS = (
     ("abuseipdb", "abuseipdb"), ("threatfox", "threatfox"), ("virustotal", "virustotal"),
     ("alienvault", "otx"), ("otx", "otx"), ("nvd", "nvd"), ("wazuh", "wazuh"), ("siem", "wazuh"),
-    ("okta", "okta"), ("jira", "jira"), ("slack", "slack"),
+    ("okta", "okta"), ("jira", "jira"), ("slack", "slack"), ("openrouter", "openrouter"),
 )
 TEST_TIMEOUT = httpx.Timeout(6.0, connect=4.0)
 
@@ -393,13 +474,24 @@ def _result(service: str, status: str, health: str, message: str,
 
 
 def _probe(service: str, method: str, url: str, ok: Optional[Callable[[httpx.Response], Optional[bool]]] = None,
-           verify: bool = True, **kwargs) -> Dict[str, Any]:
-    """Make one read-only request and classify the outcome without guessing."""
+           verify: bool = True, guarded: bool = False, **kwargs) -> Dict[str, Any]:
+    """Make one read-only request and classify the outcome without guessing.
+
+    `guarded` (used for any URL that did not come from the stored settings) connects only to public
+    addresses, re-checked at connect time (backend/netguard.py).
+    """
     display = SERVICES[service][1]
     start = time.monotonic()
     try:
-        with httpx.Client(timeout=TEST_TIMEOUT, verify=verify, follow_redirects=False) as client:
+        if guarded:
+            client_ctx = httpx.Client(timeout=TEST_TIMEOUT, transport=netguard.guarded_transport(verify=verify),
+                                      follow_redirects=False, trust_env=False)
+        else:
+            client_ctx = httpx.Client(timeout=TEST_TIMEOUT, verify=verify, follow_redirects=False)
+        with client_ctx as client:
             response = client.request(method, url, **kwargs)
+    except netguard.UnsafeURLError as exc:  # the host resolved to a non-public address when connecting
+        return _result(service, ERROR, "Blocked", f"Connection refused by the SSRF guard: {exc}")
     except httpx.TimeoutException:
         latency = int((time.monotonic() - start) * 1000)
         return _result(service, UNREACHABLE, "Timed out", f"{display} did not answer within {TEST_TIMEOUT.read:.0f}s.", latency)
@@ -431,6 +523,41 @@ def _threatfox_ok(response: httpx.Response) -> Optional[bool]:
     return False if "auth" in query_status.lower() else None
 
 
+def _openrouter_ok(response: httpx.Response) -> Optional[bool]:
+    if response.status_code != 200:
+        return None
+    try:
+        return isinstance(response.json().get("data"), dict)
+    except (ValueError, AttributeError):
+        return None
+
+
+class _EndpointOverride(Exception):
+    """The test request cannot be run as asked (reported to the admin as HTTP 400)."""
+
+
+def _resolve_endpoint(stored: str, override: str, normalise: Callable[[str], str], to_url: Callable[[str], str]) -> Tuple[str, bool]:
+    """Pick the URL to test. Returns (value, overridden).
+
+    No override, or an override naming the stored host: the stored value is used. A different host is
+    accepted only if it resolves exclusively to public addresses (SSRF guard); the caller must then
+    use only credentials supplied in the request, never the stored ones.
+    """
+    stored_norm = normalise(stored)
+    if not override:
+        return stored_norm, False
+    candidate = normalise(override)
+    if not candidate:
+        raise _EndpointOverride("endpoint_url is not a valid address for this service.")
+    if stored_norm and netguard.same_origin_host(to_url(candidate), to_url(stored_norm)):
+        return stored_norm, False
+    try:
+        netguard.assert_public_url(to_url(candidate))
+    except netguard.UnsafeURLError as exc:
+        raise _EndpointOverride(f"endpoint_url refused: {exc}")
+    return candidate, True
+
+
 def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict[str, Any]:
     display = SERVICES[service][1]
     override_key = (req.api_key or "").strip()
@@ -442,6 +569,16 @@ def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict
 
     def not_configured(what: str) -> Dict[str, Any]:
         return _result(service, NOT_CONFIGURED, "Missing credentials", f"{display} is not configured: set {what}.")
+
+    def endpoint(stored_key: str, normalise: Callable[[str], str], to_url: Callable[[str], str]) -> Tuple[str, bool]:
+        return _resolve_endpoint(get_setting(stored_key, db=db), override_url, normalise, to_url)
+
+    def require_own_credentials(*supplied: str) -> None:
+        if not all(supplied):
+            raise _EndpointOverride(
+                "To test a different endpoint, supply the credentials to use for it in the request; "
+                "stored credentials are never sent to a host other than the stored one."
+            )
 
     if service == "virustotal":
         key = setting("virustotal_api_key", override_key)
@@ -481,32 +618,55 @@ def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict
                           message="NVD returned HTTP 404 for a known CVE, which is how it rejects an invalid API key.")
         return result
 
+    if service == "openrouter":
+        # One read-only call (GET /api/v1/key, https://openrouter.ai/docs/api-reference/limits): it checks the key and
+        # spends no credits. No alert data is sent and the key only ever goes to the vendor's fixed host.
+        key = setting("openrouter_api_key", override_key)
+        if not key:
+            return not_configured("openrouter_api_key")
+        result = _probe(service, "GET", f"{llm.OPENROUTER_BASE_URL}{llm.KEY_INFO_PATH}", ok=_openrouter_ok,
+                        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
+        if result["http_status"] == 402:
+            result["message"] = "OpenRouter reports insufficient credits for this key (HTTP 402); add credits."
+        return result
+
     if service == "wazuh":
-        base = _http_url(setting("siem_manager_url", override_url))
-        user = setting("siem_user", override_user)
-        password = setting("siem_password", override_key)
+        base, overridden = endpoint("siem_manager_url", lambda v: _http_url(v) or "", lambda v: v)
+        if overridden:
+            require_own_credentials(override_user, override_key)
+            user, password = override_user, override_key
+        else:
+            user, password = setting("siem_user", override_user), setting("siem_password", override_key)
         if not (base and user and password):
             return not_configured("siem_manager_url (http/https), siem_user and siem_password")
         verify = get_bool("siem_verify_tls", db=db)
-        return _probe(service, "POST", f"{base}/security/user/authenticate", auth=(user, password), verify=verify)
+        return _probe(service, "POST", f"{base}/security/user/authenticate", auth=(user, password), verify=verify,
+                      guarded=overridden)
 
     if service == "okta":
-        host = _host_only(setting("okta_domain", override_url))
-        token = setting("okta_api_token", override_key)
+        host, overridden = endpoint("okta_domain", _host_only, lambda v: f"https://{v}")
+        if overridden:
+            require_own_credentials(override_key)
+            token = override_key
+        else:
+            token = setting("okta_api_token", override_key)
         if not (host and token):
             return not_configured("okta_domain and okta_api_token")
         if not _HOSTNAME_RE.match(host):
             return _result(service, ERROR, "Invalid domain", f"'{host}' is not a valid Okta domain.")
         return _probe(service, "GET", f"https://{host}/api/v1/users/me",
-                      headers={"Authorization": f"SSWS {token}", "Accept": "application/json"})
+                      headers={"Authorization": f"SSWS {token}", "Accept": "application/json"}, guarded=overridden)
 
     if service == "jira":
-        base = _http_url(setting("jira_base_url", override_url))
-        email = setting("jira_email", override_user)
-        token = setting("jira_api_token", override_key)
+        base, overridden = endpoint("jira_base_url", lambda v: _http_url(v) or "", lambda v: v)
+        if overridden:
+            require_own_credentials(override_user, override_key)
+            email, token = override_user, override_key
+        else:
+            email, token = setting("jira_email", override_user), setting("jira_api_token", override_key)
         if base and email and token:
             return _probe(service, "GET", f"{base}/rest/api/2/myself", auth=(email, token),
-                          headers={"Accept": "application/json"})
+                          headers={"Accept": "application/json"}, guarded=overridden)
         if get_setting("jira_webhook_url", db=db):
             return _result(service, NOT_TESTED, "Webhook configured",
                            "A Jira automation webhook is configured. It is not called by this test because every call creates an issue.")
@@ -531,7 +691,10 @@ def test_integration_connection(
     [Admin Only] Perform a real, read-only authentication check against one integration and report
     exactly what happened: Not Configured / Connected / Auth failed / Unreachable / Error, or
     "Configured (not tested to avoid posting)" for webhooks that cannot be called without side effects.
-    Stored settings are used unless api_key / endpoint_url / username overrides are supplied.
+    Stored URLs and secrets are used by default. An `api_key` / `username` override is sent only to the
+    stored host (or the vendor's fixed API). An `endpoint_url` naming a different host is allowed only if
+    it resolves to public addresses, and then the request must carry its own credentials: a stored secret
+    is never sent to a host other than the stored one. Rate limited per administrator.
     """
     service = _resolve_service(req.service_name)
     if not service:
@@ -539,7 +702,13 @@ def test_integration_connection(
             status_code=400,
             detail=f"Unknown service '{req.service_name}'. Supported: {', '.join(SERVICES)}.",
         )
-    result = _test_service(service, req, db)
+    ratelimit.enforce("test_connection", f"user:{admin.user_id}")
+    try:
+        result = _test_service(service, req, db)
+    except _EndpointOverride as exc:
+        record_log(db, "CONFIG", "WARNING", f"Connection test for {service} refused: {exc}", target=service,
+                   details={"by": admin.username, "endpoint_override": True})
+        raise HTTPException(status_code=400, detail=str(exc))
     record_log(db, "CONFIG", "INFO" if result["is_connected"] else "WARNING",
                f"Connection test for {result['service_name']}: {result['status']}.",
                target=service, details={"by": admin.username, "health": result["health"], "http_status": result["http_status"]})
@@ -562,7 +731,7 @@ def _hotl_payload(enabled: bool) -> Dict[str, Any]:
 @router.get("/hotl-status")
 def get_hotl_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Current state of the autonomous containment (HOTL) kill switch."""
-    return _hotl_payload(get_bool("hotl_enabled", db=db))
+    return _hotl_payload(hotl_effective(db))
 
 
 @router.post("/hotl-toggle")
@@ -575,7 +744,7 @@ def toggle_hotl_status(
     [Admin Only] Toggle or set the HOTL engine. While paused, every alert waits for analyst approval.
     """
     ensure_default_configurations(db)
-    current = get_bool("hotl_enabled", db=db)
+    current = hotl_effective(db)  # what is actually applied: a switch set in the environment without protected assets is not "on"
     new_value = (not current) if (payload is None or payload.enabled is None) else bool(payload.enabled)
 
     row = db.query(SystemConfig).filter(
@@ -585,6 +754,11 @@ def toggle_hotl_status(
     if row is None:
         row = SystemConfig(category="ORCHESTRATION", key_name="hotl_enabled", is_secret=False)
         db.add(row)
+    if new_value and not current:
+        blockers = hotl_enable_blockers(db)
+        if blockers:
+            raise HTTPException(status_code=409, detail={
+                "message": "Autonomous response (HOTL) cannot be enabled yet.", "blockers": blockers})
     row.key_value = "true" if new_value else "false"
     row.updated_at = _now()
     db.commit()

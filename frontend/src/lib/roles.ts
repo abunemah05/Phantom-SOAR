@@ -83,3 +83,54 @@ export function roleLevel(user?: Pick<User, "role" | "is_service_account"> | nul
 export function needsPasswordChange(user?: User | null): boolean {
   return Boolean(user && (user.must_change_password || user.compromised_reset_required));
 }
+
+export function needsMfaEnrollment(user?: User | null): boolean {
+  return Boolean(user && user.mfa_enrollment_required && !user.mfa_enabled);
+}
+
+/**
+ * Operators who may act on alerts: analysts, security engineers and administrators
+ * (backend require_analyst_or_admin / require_responder). Auditors, service and unknown roles may not.
+ */
+export function canRespond(user?: Pick<User, "role" | "is_service_account"> | null): boolean {
+  const level = roleLevel(user);
+  return level === "admin" || level === "security_engineer" || level === "analyst";
+}
+
+/** Approve, reject or trigger AI proposals: analyst or above (backend require_responder); read-only auditors only read. */
+export function canDecideProposals(user?: Pick<User, "role" | "is_service_account"> | null): boolean {
+  return canRespond(user);
+}
+
+/** Create, edit, toggle and delete playbooks (backend require_sec_eng_or_admin). */
+export function canEditPlaybooks(user?: Pick<User, "role"> | null): boolean {
+  return isSecEngOrAdmin(user);
+}
+
+/** Read the integration settings page (backend require_config_viewer). */
+export function canViewConfig(user?: Pick<User, "role"> | null): boolean {
+  return isSecEngOrAdmin(user);
+}
+
+/** Change settings, run connection tests, toggle HOTL, purge cases, manage accounts (backend require_admin). */
+export function canAdminister(user?: Pick<User, "role"> | null): boolean {
+  return isAdmin(user);
+}
+
+/** Short label for the sidebar: what the signed-in role can do. */
+export function accessLabel(user?: Pick<User, "role" | "is_service_account"> | null): string {
+  switch (roleLevel(user)) {
+    case "admin":
+      return "Admin";
+    case "security_engineer":
+      return "Sec Eng";
+    case "analyst":
+      return "Analyst";
+    case "read_only":
+      return "Read-only";
+    case "service":
+      return "Service";
+    default:
+      return "Unknown role";
+  }
+}
