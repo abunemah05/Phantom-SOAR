@@ -34,6 +34,14 @@ ADMIN_PASSWORD = os.environ["PHANTOM_BOOTSTRAP_ADMIN_PASSWORD"]
 INGEST_HEADERS = {"X-Phantom-Ingest-Token": os.environ["PHANTOM_INGEST_TOKEN"]}
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _bootstrap_database():
+    """Importing backend.main no longer touches the database; create the schema and seed defaults once per session."""
+    from backend.main import bootstrap_database
+
+    bootstrap_database()
+
+
 @pytest.fixture(scope="session")
 def client():
     from fastapi.testclient import TestClient

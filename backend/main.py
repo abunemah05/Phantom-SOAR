@@ -1,4 +1,6 @@
 import logging
+import os
+import threading
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +15,8 @@ logging.basicConfig(
 )
 
 from backend.config import settings
-from backend.database import engine, Base, SessionLocal
+from backend.database import engine, SessionLocal
+from backend.db_migrate import prepare_database
 from backend.routers import (
     webhooks_router, 
     alerts_router, 
@@ -33,90 +36,9 @@ from backend.crud import create_playbook
 from backend.engine.playbooks_catalog import PRECONFIGURED_PLAYBOOKS
 
 logger = logging.getLogger("phantom_soar")
-
-def ensure_sqlite_migrations():
-    """Ensure newly introduced columns are dynamically added in SQLite."""
-    try:
-        with engine.connect() as conn:
-            if "sqlite" in str(engine.url):
-                # 1. Alerts table migrations
-                res = conn.execute(text("PRAGMA table_info(alerts)")).fetchall()
-                col_names = [r[1] for r in res]
-                if col_names:
-                    if "analyst_decision" not in col_names:
-                        conn.execute(text("ALTER TABLE alerts ADD COLUMN analyst_decision VARCHAR(100)"))
-                    if "assigned_analyst" not in col_names:
-                        conn.execute(text("ALTER TABLE alerts ADD COLUMN assigned_analyst VARCHAR(50)"))
-                    if "resolved_by" not in col_names:
-                        conn.execute(text("ALTER TABLE alerts ADD COLUMN resolved_by VARCHAR(50)"))
-                    if "resolved_at" not in col_names:
-                        conn.execute(text("ALTER TABLE alerts ADD COLUMN resolved_at DATETIME"))
-                    conn.commit()
-
-                # 2. Users table migrations
-                user_res = conn.execute(text("PRAGMA table_info(users)")).fetchall()
-                user_cols = [r[1] for r in user_res]
-                if user_cols:
-                    if "must_change_password" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN must_change_password BOOLEAN DEFAULT 0"))
-                    if "is_active" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN is_active BOOLEAN DEFAULT 1"))
-                    if "mfa_enabled" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN mfa_enabled BOOLEAN DEFAULT 0"))
-                    if "mfa_secret" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN mfa_secret VARCHAR(64)"))
-                    if "password_changed_at" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN password_changed_at DATETIME"))
-                    if "compromised_reset_required" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN compromised_reset_required BOOLEAN DEFAULT 0"))
-                    if "failed_login_attempts" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0"))
-                    if "locked_until" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN locked_until DATETIME"))
-                    if "is_service_account" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN is_service_account BOOLEAN DEFAULT 0"))
-                    if "api_key_hash" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN api_key_hash VARCHAR(255)"))
-                    if "api_key_prefix" not in user_cols:
-                        conn.execute(text("ALTER TABLE users ADD COLUMN api_key_prefix VARCHAR(16)"))
-                    conn.commit()
-
-                # IoC artifacts: per-provider TIP evidence
-                ioc_res = conn.execute(text("PRAGMA table_info(ioc_artifacts)")).fetchall()
-                ioc_cols = [r[1] for r in ioc_res]
-                if ioc_cols:
-                    if "verdict" not in ioc_cols:
-                        conn.execute(text("ALTER TABLE ioc_artifacts ADD COLUMN verdict VARCHAR(20) DEFAULT 'Unknown'"))
-                    if "enrichment_status" not in ioc_cols:
-                        conn.execute(text("ALTER TABLE ioc_artifacts ADD COLUMN enrichment_status VARCHAR(30) DEFAULT 'pending'"))
-                    if "tip_results" not in ioc_cols:
-                        conn.execute(text("ALTER TABLE ioc_artifacts ADD COLUMN tip_results JSON"))
-                    conn.commit()
-
-                # 3. Containment actions migrations
-                ca_res = conn.execute(text("PRAGMA table_info(containment_actions)")).fetchall()
-                ca_cols = [r[1] for r in ca_res]
-                if ca_cols:
-                    if "executed_by" not in ca_cols:
-                        conn.execute(text("ALTER TABLE containment_actions ADD COLUMN executed_by VARCHAR(50) DEFAULT 'System'"))
-                    for col, ddl in (
-                        ("target", "VARCHAR(255)"),
-                        ("connector", "VARCHAR(50)"),
-                        ("execution_mode", "VARCHAR(20)"),
-                        ("details", "JSON"),
-                    ):
-                        if col not in ca_cols:
-                            conn.execute(text(f"ALTER TABLE containment_actions ADD COLUMN {col} {ddl}"))
-                    conn.commit()
-    except Exception as e:
-        logger.debug(f"SQLite migration check: {e}")
-
-# Ensure database tables exist
-Base.metadata.create_all(bind=engine)
-ensure_sqlite_migrations()
+_TRUE = {"1", "true", "yes", "on"}
 
 def init_system_defaults():
-    ensure_sqlite_migrations()
     db = SessionLocal()
     try:
         # 1. Bootstrap administrator (password from PHANTOM_BOOTSTRAP_ADMIN_PASSWORD)
@@ -137,21 +59,65 @@ def init_system_defaults():
     finally:
         db.close()
 
-# Auto-seed on startup
-init_system_defaults()
+_bootstrap_lock = threading.Lock()
+_bootstrapped = False
+
+
+def bootstrap_database() -> None:
+    """Migrate the schema and seed defaults, once per process (importing this module has no database side effects)."""
+    global _bootstrapped
+    with _bootstrap_lock:
+        if _bootstrapped:
+            return
+        prepare_database(engine)  # Alembic upgrade; fast create_all when PHANTOM_ENV=test
+
+        # LEAD HOOK (after the schema exists, before seeding): encrypt secrets stored in clear text
+        #   from backend import crypto
+        #   with SessionLocal() as db:
+        #       crypto.encrypt_existing_secrets(db)
+
+        init_system_defaults()
+        _bootstrapped = True
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    init_system_defaults()
+    # LEAD HOOK (first thing, before touching the database): fail fast on unsafe production configuration
+    #   from backend import integration_config, security
+    #   errors = integration_config.production_safety_errors() + security.validate_security_config()
+    #   if errors: raise RuntimeError("; ".join(errors))
+    bootstrap_database()
     yield
     logger.info("Shutting down Phantom SOAR platform.")
+
+
+def _truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in _TRUE
+
+
+def docs_enabled() -> bool:
+    """/docs, /redoc and /openapi.json are served unless running in production.
+
+    PHANTOM_ENABLE_DOCS=true turns them on in production; PHANTOM_ENABLE_DOCS=false turns them off elsewhere.
+    """
+    explicit = os.getenv("PHANTOM_ENABLE_DOCS", "").strip().lower()
+    if explicit in _TRUE:
+        return True
+    if explicit in {"0", "false", "no", "off"}:
+        return False
+    return settings.PHANTOM_ENV.strip().lower() != "production"
+
+
+_DOCS = docs_enabled()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.PROJECT_VERSION,
     description="Enterprise Security Orchestration, Automation, and Response Platform",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/docs" if _DOCS else None,
+    redoc_url="/redoc" if _DOCS else None,
+    openapi_url="/openapi.json" if _DOCS else None,
 )
 
 # CORS: explicit origins only (PHANTOM_CORS_ORIGINS). The console sends Bearer tokens, not cookies.
@@ -170,6 +136,9 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if _truthy("PHANTOM_BEHIND_TLS"):
+        # Only when a TLS-terminating proxy fronts the API; HSTS over plain HTTP is ignored by browsers.
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     if request.url.path.startswith(settings.API_V1_STR):
         response.headers.setdefault("Cache-Control", "no-store")
     return response
@@ -188,6 +157,8 @@ app.include_router(alerts_router, prefix=settings.API_V1_STR, dependencies=_user
 app.include_router(playbooks_router, prefix=settings.API_V1_STR, dependencies=_user_session)
 app.include_router(demo_router, prefix=settings.API_V1_STR, dependencies=_user_session)
 app.include_router(logs_router, prefix=settings.API_V1_STR)
+# LEAD HOOK: include the new routers here (agents, AI settings, ...), with the same
+# prefix=settings.API_V1_STR and the appropriate dependencies.
 
 @app.get("/")
 def root():
@@ -195,7 +166,7 @@ def root():
         "platform": settings.PROJECT_NAME,
         "version": settings.PROJECT_VERSION,
         "status": "Operational",
-        "docs_url": "/docs"
+        "docs_url": "/docs" if _DOCS else None
     }
 
 @app.get("/api/health")

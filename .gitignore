@@ -52,3 +52,4 @@ Thumbs.db
 backend/reports/*
 !backend/reports/.gitkeep
 *.tsbuildinfo
+*.migrate.lock
