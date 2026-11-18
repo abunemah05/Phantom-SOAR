@@ -437,6 +437,17 @@ def hotl_effective(db: Optional[Session] = None) -> bool:
         return False
     blockers = hotl_enable_blockers(db)
     if blockers:
-        logger.warning("HOTL is switched on but ignored until these are fixed: %s", "; ".join(blockers))
+        _warn_hotl_ignored(tuple(blockers))
         return False
     return True
+
+
+_last_hotl_warning: Tuple[str, ...] = ()
+
+
+def _warn_hotl_ignored(blockers: Tuple[str, ...]) -> None:
+    """Log the reasons once per change, not on every policy evaluation."""
+    global _last_hotl_warning
+    if blockers != _last_hotl_warning:
+        _last_hotl_warning = blockers
+        logger.warning("HOTL is switched on but ignored until these are fixed: %s", "; ".join(blockers))

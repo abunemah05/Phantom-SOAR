@@ -246,7 +246,7 @@ def _matches_pattern(value: str, patterns: List[str]) -> bool:
         if not cleaned:
             continue
         forms = [cleaned] if any(ch in cleaned for ch in _GLOB_CHARS) else _name_variants(cleaned)
-        if any(fnmatch.fnmatchcase(v, f) for v in variants for f in forms):
+        if cleaned in variants or any(fnmatch.fnmatchcase(v, f) for v in variants for f in forms):
             return True
     return False
 

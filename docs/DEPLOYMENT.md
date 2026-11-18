@@ -205,3 +205,12 @@ and set `WAZUH_CA_BUNDLE=/app/certs/wazuh-ca.pem` in `.env`.
 * Backend exits with `PHANTOM_ENV=production with simulation mode ON while real connectors are configured`: real credentials or threat-intelligence keys are saved while simulation mode is on. Environment variables are read at start-up, so restart after changing `.env`. Either set `PHANTOM_SIMULATION_MODE=false` after completing `LIVE_CHECKLIST.md` (this has no effect when the console holds its own saved `simulation_mode` value, because the console wins), or set `PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION=true` if simulation really is what you want. With simulation on, no response action is sent anywhere even though credentials are saved; to act for real you must turn simulation off.
 * Port 80 or 443 is in use: stop the other service, or set `PHANTOM_HTTP_PORT`/`PHANTOM_HTTPS_PORT` for a local test (the HTTP-to-HTTPS redirect then points at the wrong port; use the HTTPS URL directly).
 * `docker compose logs backend celery_worker proxy` shows the start-up messages. The one-time admin password path is logged, the password itself never is.
+
+## Upgrading a database created before environment variables applied after first boot
+
+Earlier releases wrote the default (or the environment value present at first start) of about eleven settings into
+the database on first boot, where it then overrode the environment forever. A fresh database no longer does this, but an
+existing one still holds those rows, so changing e.g. `PHANTOM_SIMULATION_MODE` or `PHANTOM_AI_ENABLED` can appear to do
+nothing. Clear them once, then restart: the exact `UPDATE system_configs ...` statement and the list of keys are in the
+README section "Upgrading an existing database". Text fields can also be emptied in the console; on/off switches cannot,
+so use the SQL.

@@ -34,6 +34,7 @@ from backend.integration_config import (
     INTEGRATION_KEYS,
     get_bool,
     get_setting,
+    hotl_effective,
     hotl_enable_blockers,
     is_configured,
     is_simulation_mode,
@@ -384,7 +385,7 @@ def get_runtime_status(db: Session = Depends(get_db), user: User = Depends(get_c
         min_confidence = float(DEFAULTS["agent_min_confidence"])
     return {
         "simulation_mode": is_simulation_mode(db=db),
-        "hotl_enabled": get_bool("hotl_enabled", db=db),
+        "hotl_enabled": hotl_effective(db),  # as applied, not the raw switch
         "integrations": {
             "virustotal": is_configured("virustotal_api_key", db=db),
             "abuseipdb": is_configured("abuseipdb_api_key", db=db),
@@ -730,7 +731,7 @@ def _hotl_payload(enabled: bool) -> Dict[str, Any]:
 @router.get("/hotl-status")
 def get_hotl_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Current state of the autonomous containment (HOTL) kill switch."""
-    return _hotl_payload(get_bool("hotl_enabled", db=db))
+    return _hotl_payload(hotl_effective(db))
 
 
 @router.post("/hotl-toggle")
@@ -743,7 +744,7 @@ def toggle_hotl_status(
     [Admin Only] Toggle or set the HOTL engine. While paused, every alert waits for analyst approval.
     """
     ensure_default_configurations(db)
-    current = get_bool("hotl_enabled", db=db)
+    current = hotl_effective(db)  # what is actually applied: a switch set in the environment without protected assets is not "on"
     new_value = (not current) if (payload is None or payload.enabled is None) else bool(payload.enabled)
 
     row = db.query(SystemConfig).filter(

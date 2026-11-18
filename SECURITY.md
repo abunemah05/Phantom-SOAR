@@ -96,3 +96,11 @@ the systems that do it. Whoever controls it can cause outages and read your aler
 - [ ] Backups running, copied off-host, encrypted there, and a restore test done in the last quarter (`backup verify`)
 - [ ] CI green (`pip-audit`, `npm audit`, tests); no open advisories from `npm audit --omit=dev`
 - [ ] Logs reviewed for `Insecure configuration`, `cannot be decrypted` and failed-login bursts
+
+
+## Agent API key lifetime
+
+Service-account (AI agent) keys now expire after **90 days** unless an expiry was given when the key was created.
+Set `PHANTOM_AGENT_KEY_DEFAULT_DAYS` to change the default (`0` = no expiry). An expired key is refused with 401 until
+it is rotated with a new expiry; rotating without a body keeps the previous expiry. Keys created before this default
+existed are not changed.

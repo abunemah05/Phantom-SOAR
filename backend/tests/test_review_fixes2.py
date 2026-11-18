@@ -423,3 +423,41 @@ def test_step_targets_unattended_only_malicious_ips_approved_keeps_non_clean():
     approved = runner._step_targets("block_ip", alert, iocs, entities, approved=True)
     assert approved == ["198.51.100.1", "198.51.100.2", "198.51.100.3", "203.0.113.9"]          # never clean, never the host
     assert runner._step_targets("block_ip", alert, [], entities, approved=False) == []
+
+
+# --- second review round ------------------------------------------------------------------------------------
+
+def test_hotl_status_endpoints_report_the_effective_state(client, admin_headers, monkeypatch):
+    """The switch set without protected assets is NOT 'on': the Navbar must not show Autonomous Containment Online."""
+    from backend import integration_config as ic
+
+    values = {"hotl_enabled": "true", "protected_hosts": "", "protected_users": "", "protected_ips": "",
+              "siem_manager_url": ""}
+    original = ic.get_setting
+    monkeypatch.setattr(ic, "get_setting", lambda k, db=None, default=None: values[k] if k in values else original(k, db=db, default=default))
+    monkeypatch.setattr(ic, "_system_identity", lambda: (["soar-box"], ["127.0.0.0/8"]))
+    ic.clear_auto_protect_cache()
+    assert client.get("/api/configuration/hotl-status", headers=admin_headers).json()["hotl_enabled"] is False
+    assert client.get("/api/configuration/runtime-status", headers=admin_headers).json()["hotl_enabled"] is False
+    refused = client.post("/api/configuration/hotl-toggle", json={"enabled": True}, headers=admin_headers)
+    assert refused.status_code == 409 and refused.json()["detail"]["blockers"]
+
+
+def test_literal_entry_with_glob_characters_matches_itself():
+    from backend.engine import policy
+
+    assert policy._matches_pattern("svc[1]", ["svc[1]"]) is True
+    assert policy._matches_pattern("svc1", ["svc[1]"]) is True      # as a glob it also matches
+    assert policy._matches_pattern("other", ["svc[1]"]) is False
+
+
+def test_hotl_ignored_warning_is_logged_once_per_change(caplog):
+    import logging
+    from backend import integration_config as ic
+
+    ic._last_hotl_warning = ()
+    with caplog.at_level(logging.WARNING, logger=ic.logger.name):
+        for _ in range(5):
+            ic._warn_hotl_ignored(("No protected users",))
+        ic._warn_hotl_ignored(("No protected hosts",))
+    assert len([r for r in caplog.records if "HOTL is switched on but ignored" in r.getMessage()]) == 2

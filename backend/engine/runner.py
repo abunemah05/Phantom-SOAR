@@ -335,6 +335,10 @@ def _step_targets(action: Optional[str], alert: Alert, iocs: List[Any], entities
     return values[:MAX_TARGETS_PER_STEP]
 
 
+def _alert_has_entities(entities: Dict[str, List[str]], target_type: str) -> bool:
+    return bool(entities.get(TARGET_ENTITY_KEYS.get(target_type, ""), []))
+
+
 def _record_key(action: str, target: Optional[str], alert: Alert) -> tuple:
     if ACTION_CATALOG.get(action, {}).get("target_type") == "none":
         return (action, f"Alert #{alert.alert_id}")
@@ -394,7 +398,12 @@ def run_playbook_steps(
             records.append(create_containment_action(
                 db, alert.alert_id, canonical, status="Skipped", executed_by=executed_by,
                 target=None, connector=ACTION_CATALOG[canonical]["connector"], execution_mode="skipped",
-                details={"reason": "no_target", "message": f"The alert names no {target_type} for {canonical}."},
+                details={"reason": "no_target", "message": (
+                    f"No {target_type} target for {canonical}: "
+                    + ("the alert names none." if not _alert_has_entities(entities, target_type)
+                       else f"none of the alert's {target_type}s has a Malicious verdict, so nothing is acted on "
+                            "without analyst approval.")
+                )},
             ))
             continue
 

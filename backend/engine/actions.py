@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 _AGENT_ID_PARAM = {
     "type": "string",
-    "description": "Wazuh agent id to run on; defaults to the alert's agent.id",
+    "description": "Wazuh agent id to run on; defaults to the alert's agent.id. Analyst-only: automation (AI agent, playbooks) is denied any other agent id.",
 }
 
 ACTION_CATALOG: Dict[str, Dict[str, Any]] = {
