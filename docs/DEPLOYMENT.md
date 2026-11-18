@@ -2,7 +2,7 @@
 
 This is the one supported way to run Phantom SOAR as a service. For development on your own machine see
 the README ("Local development"). Nothing here has been run on your server by the authors; follow
-`LIVE_CHECKLIST.md` for the first start and keep simulation mode on until you have worked through it.
+`LIVE_CHECKLIST.md` for the first start and keep simulation mode on (a hard stop for every response action, even with credentials saved) until you have worked through it.
 
 ## 1. First start
 
@@ -25,6 +25,12 @@ Required values in `.env` (compose refuses to start without them): `POSTGRES_PAS
 production mode (`PHANTOM_ENV=production`, the compose default) additionally refuses to start with a weak JWT
 secret, a missing or invalid encryption key, or simulation mode ON next to configured real connectors
 (unless `PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION=true`). Every variable is documented in `.env.example`.
+
+How settings are resolved: the database holds only values saved on the Configuration page; for everything else the
+environment variable is read at run time and then the built-in default. A value saved in the console wins over the
+environment, and a database created by an older version may hold frozen leftovers (see the README, "Upgrading an
+existing database"). HOTL is enforced at run time: `PHANTOM_HOTL_ENABLED=true` is ignored, and a warning logged, until
+protected hosts/IPs and protected users are listed.
 
 **Back up `PHANTOM_ENCRYPTION_KEY` separately from the database backups.** Integration secrets and MFA seeds
 in the database are encrypted with it; without the key they cannot be read.
@@ -196,6 +202,6 @@ and set `WAZUH_CA_BUNDLE=/app/certs/wazuh-ca.pem` in `.env`.
 
 * `required variable ... is missing a value`: a REQUIRED value in `.env` is empty. Run `python scripts/gen_env.py` for a new `.env`.
 * Backend exits with `Insecure configuration`: the JWT secret is shorter than 32 characters or the encryption key is missing or not a valid Fernet key.
-* Backend exits with `PHANTOM_ENV=production with simulation mode ON while real connectors are configured`: you added real credentials; set `PHANTOM_SIMULATION_MODE=false` after completing `LIVE_CHECKLIST.md`, or `PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION=true` if simulation is really what you want.
+* Backend exits with `PHANTOM_ENV=production with simulation mode ON while real connectors are configured`: real credentials or threat-intelligence keys are saved while simulation mode is on. Environment variables are read at start-up, so restart after changing `.env`. Either set `PHANTOM_SIMULATION_MODE=false` after completing `LIVE_CHECKLIST.md` (this has no effect when the console holds its own saved `simulation_mode` value, because the console wins), or set `PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION=true` if simulation really is what you want. With simulation on, no response action is sent anywhere even though credentials are saved; to act for real you must turn simulation off.
 * Port 80 or 443 is in use: stop the other service, or set `PHANTOM_HTTP_PORT`/`PHANTOM_HTTPS_PORT` for a local test (the HTTP-to-HTTPS redirect then points at the wrong port; use the HTTPS URL directly).
 * `docker compose logs backend celery_worker proxy` shows the start-up messages. The one-time admin password path is logged, the password itself never is.

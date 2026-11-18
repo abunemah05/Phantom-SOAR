@@ -34,7 +34,7 @@ setting is named. Nothing here has been verified against live vendor systems (se
   `re_enrich_iocs`, `process_alert`, and the periodic `maintenance` task (scheduled by the embedded beat of the one
   worker container). Tasks are written to be safe to run twice. If the broker is unreachable the webhook processes the
   alert inside the request instead.
-* **Frontend** (`frontend/`): Next.js 14 (App Router, standalone build), React 18, TypeScript, Tailwind. Pages:
+* **Frontend** (`frontend/`): Next.js 15 (App Router, standalone build), React 18, TypeScript, Tailwind. Pages:
   Dashboard, Alerts (with the Investigate drawer), AI Agent, Playbooks, Logs, Reports, Configuration, Accounts, Security
   (MFA), Login. The session token is kept in browser storage and sent as a Bearer token.
 * **Database**: PostgreSQL 16 in Docker; SQLite for local development and the test suite.
@@ -76,9 +76,11 @@ Tables: `users`, `system_configs`, `alerts`, `ioc_artifacts`, `playbooks`, `play
 
 ## 3. Guardrails
 
-* **Simulation mode** (default on): a connector without credentials records a clearly labelled `Simulated` action;
-  with simulation off, it records `Skipped`. A simulated action is not counted as containment, and repeating the run
-  after configuring the connector performs the action for real. The demo seeder only works in simulation mode.
+* **Simulation mode** (default on) is a hard stop: no response action is sent to Wazuh, Okta, Jira or Slack, even when
+  credentials are saved (`_dispatch` in `engine/actions.py`); each is recorded as a clearly labelled `Simulated` action. Read-only
+  threat-intel lookups are unaffected. With simulation off, a connector with credentials acts for real and one without
+  records `Skipped`. A simulated action is not counted as containment, and repeating the run after simulation is turned off
+  performs the action for real. The demo seeder only works in simulation mode.
 * **Policy** (`engine/policy.py`): automated actors (playbooks, the AI agent) can never touch protected hosts, users
   or IPs; analysts can, except for the automatically protected entries (the Wazuh manager, loopback, this server and
   its default gateway), which no actor may isolate or block. Loopback/reserved addresses are never blocked. Actions
@@ -86,6 +88,10 @@ Tables: `users`, `system_configs`, `alerts`, `ioc_artifacts`, `playbooks`, `play
   (default 0.85) and the configured autonomy (`recommend_only` default, `low_impact`, `policy`).
 * **HOTL switch** cannot be enabled until protected users and hosts/IPs (or the Wazuh manager) are configured; the
   API answers 409 with the list of blockers.
+  The requirement is also enforced at run time (`integration_config.hotl_effective`): a switch set from the environment is
+  ignored, with a logged warning, until the protected lists exist. Protected host and user entries match by short name in
+  both directions. Automated actors may only act through the Wazuh agent that raised the alert, an unattended HOTL block
+  targets only IPs with a `Malicious` verdict, and an analyst-approved run keeps every IP that is not clean.
 * **Production start-up checks**: weak JWT secret, missing/invalid encryption key, or simulation mode on next to
   real connectors stop the API from starting.
 

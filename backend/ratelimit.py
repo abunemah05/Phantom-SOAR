@@ -32,6 +32,7 @@ DEFAULT_LIMITS: Dict[str, Tuple[int, int]] = {
     "test_connection": (10, 60),
     "service_key_failures": (20, 300),
     "ingest_failures": (20, 300),
+    "agent_proposals": (30, 60),    # POST /agent/alerts/{id}/proposals, per service account (PHANTOM_RATE_LIMIT_AGENT_PROPOSALS)
 }
 # Failure thresholds for sign-in
 PAIR_MAX_FAILURES = 5            # per (username, client IP): hard lock

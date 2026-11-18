@@ -267,11 +267,11 @@ export const FIELD_META: Record<string, FieldMeta> = {
   slack_webhook_url: { label: "Slack incoming webhook URL" },
   simulation_mode: {
     label: "Simulation mode",
-    help: "On: actions on connectors that are not configured are recorded as SIMULATED (nothing changes on real systems) and lab threat-intel fixtures answer for documentation IPs. Off: unconfigured actions are SKIPPED and configured connectors act for real. Turn off only after reviewing the protected lists.",
+    help: "On (default): a hard stop. No response action is sent to Wazuh, Okta, Jira or Slack, even where credentials are saved; actions are recorded as SIMULATED, and lab threat-intel fixtures answer for documentation IPs. Threat-intel lookups are unaffected. Off: every connector with credentials acts on real systems and the others record SKIPPED. Turn off only after reviewing the protected lists, and only while you are testing.",
   },
   hotl_enabled: {
     label: "HOTL autonomous containment",
-    help: "On: HOTL playbooks may contain automatically when there is real evidence and policy allows it. Off: every action waits for analyst approval. Needs protected assets to be listed first.",
+    help: "On: HOTL playbooks may contain automatically when there is real evidence and policy allows it. Off: every action waits for analyst approval. Needs protected hosts/IPs and protected users to be listed first; until they are, it is ignored even if switched on.",
   },
   simulation_confirmed_in_production: { label: "Confirm simulation mode in production", help: "Explicit acknowledgement that simulation mode is intended although real connectors are configured." },
   require_mfa_for_admin: { label: "Require MFA for administrators", help: "Administrators without MFA must enrol an authenticator before using the console." },

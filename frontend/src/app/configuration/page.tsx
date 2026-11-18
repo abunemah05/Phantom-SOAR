@@ -27,7 +27,7 @@ const CATEGORY_ICONS: Record<string, React.ElementType> = {
 const HIGH_IMPACT: Record<string, (next: string) => string | null> = {
   simulation_mode: (n) =>
     n === "false"
-      ? "Simulation mode OFF: connectors that are configured will act on real systems, and unconfigured actions are skipped instead of rehearsed."
+      ? "Simulation mode OFF: every connector that has credentials will act on real systems, and connectors without credentials record SKIPPED instead of SIMULATED."
       : "Simulation mode ON: actions are only rehearsed and recorded as SIMULATED. Nothing is contained.",
   hotl_enabled: (n) =>
     n === "true"
@@ -41,7 +41,7 @@ const HIGH_IMPACT: Record<string, (next: string) => string | null> = {
       ? "The FULL raw alert payload (possible usernames, hostnames, credentials) will be sent to a third-party model provider."
       : "Only a redacted summary of each alert will be sent to the model provider.",
   require_mfa_for_admin: (n) => (n === "true" ? "Administrators without MFA must enrol before using the console." : "Administrators will no longer be forced to use MFA."),
-  simulation_confirmed_in_production: (n) => (n === "true" ? "You acknowledge that simulation mode is intended although real connectors are configured." : null),
+  simulation_confirmed_in_production: (n) => (n === "true" ? "You acknowledge that simulation mode is intended although real connectors are configured (the API would otherwise refuse to start in production)." : null),
 };
 
 const fieldId = (category: string, key: string) => `${category}.${key}`;

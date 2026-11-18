@@ -48,6 +48,9 @@ IP_RESTRICTING_ACTIONS = {"block_ip", "apply_rate_limit"}
 # Actions that cut an asset off the network; denied against the automatic protected entries for everyone.
 CUTOFF_ACTIONS = {"isolate_endpoint", "block_ip", "apply_rate_limit"}
 WAZUH_MANAGER_AGENT_ID = "000"
+# Actions that UNDO a containment step (lift an isolation, remove a block). Their catalog impact is "low", but a
+# reversal can re-expose an asset a human chose to contain, so an AI agent never runs one on its own: always approval.
+REVERSAL_ACTIONS = {"unisolate_endpoint", "unblock_ip"}
 
 # "Private" for policy purposes: internal address space. Documentation ranges
 # (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) are not included: they are not
@@ -425,6 +428,9 @@ def evaluate_action(
         elif impact == "high":
             requires_approval = True
             reasons.append(f"{canonical} is a high-impact action; agent requests always need analyst approval.")
+        elif canonical in REVERSAL_ACTIONS:
+            requires_approval = True
+            reasons.append(f"{canonical} reverses a containment step; agent requests always need analyst approval.")
         elif confidence is None:
             requires_approval = True
             reasons.append("Agent did not report a confidence; analyst approval required.")

@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import re
@@ -62,7 +63,7 @@ LEGACY_DEFAULT_PASSWORD = "Admin1"
 
 INVALID_CREDENTIALS = "Invalid security credentials. Check username or password."
 PASSWORD_PROOF_FAILED = "Current password verification failed."
-_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{1,49}$")
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{2,49}$")  # 3-50 characters, like the admin API
 
 _bootstrap_username: Optional[str] = None
 
@@ -70,6 +71,8 @@ _bootstrap_username: Optional[str] = None
 def get_bootstrap_admin_username() -> str:
     """Username of the account created at first start (env override > the account found at startup > 'admin')."""
     configured = os.getenv("PHANTOM_BOOTSTRAP_ADMIN_USERNAME", "").strip()
+    if configured and not _USERNAME_RE.match(configured):
+        configured = ""  # ensure_default_user() rejected it at creation, so no account carries this name
     return configured or _bootstrap_username or DEFAULT_BOOTSTRAP_ADMIN_USERNAME
 
 
@@ -177,7 +180,15 @@ def ensure_default_user(db: Session) -> User:
     return user
 
 
-def _register_failure(db: Session, scope: str, username: str, user: Optional[User], ip: str, reason: str) -> None:
+def _unknown_label(username: str) -> str:
+    """Log label for a typed username that matches no account. People sometimes type their password into the
+    username box, so the text itself is never logged: only a short digest (to correlate repeats) and the length."""
+    digest = hashlib.sha256((username or "").encode("utf-8")).hexdigest()[:8]
+    return f"<unknown user #{digest}, {len(username or '')} chars>"
+
+
+def _register_failure(db: Session, scope: str, username: str, user: Optional[User], ip: str, reason: str,
+                      known: Optional[bool] = None) -> None:
     """Count a failed credential check for (username, ip), the username and the address.
 
     Nothing here locks the account for everybody: only this (username, address) pair is blocked.
@@ -186,10 +197,12 @@ def _register_failure(db: Session, scope: str, username: str, user: Optional[Use
     if user is not None:
         user.failed_login_attempts = min((user.failed_login_attempts or 0) + 1, 100000)
         db.commit()
+    known = (user is not None) if known is None else known
+    label = _safe_label(username) if known else _unknown_label(username)
     record_log(
         db, "AUTH", "WARNING",
-        f"Failed sign-in for '{_safe_label(username)}' from {ip} ({reason}).",
-        target=_safe_label(username)[:200],
+        f"Failed sign-in for '{label}' from {ip} ({reason}).",
+        target=label[:200],
         details={"ip": ip, "scope": scope, "pair_failures": counts["pair"], "address_failures": counts["ip"],
                  "pair_blocked": counts["pair"] >= ratelimit.PAIR_MAX_FAILURES},
     )
@@ -247,7 +260,8 @@ def login(creds: LoginRequest, request: Request, db: Session = Depends(get_db)):
     if locked or user is None or user.is_service_account:
         burn_password_check(creds.password)
         if not locked:
-            _register_failure(db, "login", username, None, ip, "unknown or non-interactive account")
+            _register_failure(db, "login", username, None, ip, "unknown or non-interactive account",
+                              known=user is not None)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=INVALID_CREDENTIALS)
 
     if not verify_password(creds.password, user.password_hash):

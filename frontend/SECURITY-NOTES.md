@@ -2,7 +2,7 @@
 
 ## Session token storage
 
-The access token lives in `sessionStorage` (key `phantom_soar_token`, profile cache `phantom_soar_user`).
+The access token lives in `sessionStorage` (key `phantom_soar_token`, profile cache `phantom_user`).
 It is scoped to one tab and disappears when the tab closes. The old duplicated key in `localStorage` is
 removed on every load and is never written. Tokens are never logged, put in URLs or shipped in client code.
 

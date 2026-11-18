@@ -235,12 +235,12 @@ const EXECUTION_MODE: Record<string, BadgeMeta> = {
   simulated: {
     label: "SIMULATED",
     className: "bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/40",
-    hint: "Connector not configured and simulation mode is on: nothing was changed on a real system. Not containment.",
+    hint: "Simulation mode was on: the action was not sent to any system and nothing was changed on a real system. Not containment.",
   },
   skipped: {
     label: "SKIPPED",
     className: "bg-slate-700/40 text-slate-300 border-slate-600/50",
-    hint: "Connector not configured and simulation mode is off: the action was not performed.",
+    hint: "Simulation mode is off but this connector has no credentials: the action was not performed.",
   },
   blocked: {
     label: "BLOCKED",

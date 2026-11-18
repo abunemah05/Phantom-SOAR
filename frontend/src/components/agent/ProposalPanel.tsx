@@ -85,7 +85,7 @@ export default function ProposalPanel({
       title: `Approve ${chosen.length} action${chosen.length === 1 ? "" : "s"} from proposal #${proposal.proposal_id}?`,
       message: simulation
         ? "Simulation mode is on: approved actions are only rehearsed and recorded as SIMULATED. Nothing will change on any real system."
-        : "Simulation mode is off: approved actions run against your real systems (EDR, firewall, identity provider, ticketing) as soon as you confirm.",
+        : "Simulation mode is off: approved actions run against your real systems (EDR, firewall, identity provider, ticketing) wherever credentials are configured, as soon as you confirm.",
       items: [
         ...chosen.map(({ a }) => `${a.action}${a.target ? ` on ${a.target}` : ""}`),
         "Each action is checked by the policy engine again before it runs; protected assets are still refused.",

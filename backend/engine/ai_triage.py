@@ -19,6 +19,9 @@ Flow of ``run_triage``:
    count as containment). Denied actions are recorded as Blocked. Everything else waits for a human.
 6. A human approves (each action re-evaluated with ``actor="analyst"``, and actions that policy denied for the agent
    stay denied) or rejects; the status change is a compare-and-swap, so a second decision gets HTTP 409.
+   If an approval is interrupted (crash, database error) the proposal stays "approved" with unfinished
+   execution_results; POST approve again resumes it (at once after an in-process failure, after
+   APPROVAL_LEASE_SECONDS after a crash). Actions that already ran live are never repeated.
 
 The same ``submit_proposal`` serves the agent-key endpoint (external agents), so both paths share one gate.
 """
@@ -28,6 +31,7 @@ import re
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -65,6 +69,8 @@ MAX_IOCS = 25
 MAX_RAW_JSON_CHARS = 8_000
 MAX_TEXT_CHARS = 500
 INFLIGHT_SECONDS = 300
+APPROVAL_LEASE_SECONDS = 300   # an `approved` proposal whose actions never finished can be re-approved after this long
+AWAITING = "awaiting analyst approval"
 NON_TRIAGE_STATUSES = {"Closed", "Resolved", "Contained"}  # auto-triage skips these
 CALL_MARKER = "AI model call started"
 
@@ -492,27 +498,59 @@ _inflight_lock = threading.Lock()
 def _reserve_model_call(db: Session, alert_id: int, trigger: str, model: str) -> None:
     """Spend one unit of the per-minute budget (or raise AIRateLimited).
 
-    The budget is counted from the system log, so it holds across API and worker processes; the lock makes the
-    check-and-reserve step atomic inside one process.
+    Insert-then-count: the reservation row is written (and committed) FIRST, then the rows of the last minute with
+    an id up to and including ours are counted. Whoever's row ranks beyond the limit gives its row back and is
+    refused. Because every process inserts before it counts, two API workers or Celery workers can never both read
+    "limit - 1 used" and both proceed: at least the later inserter sees the earlier row. The in-process lock only
+    keeps one process from doing the dance twice at once. The residual error is on the safe side: a refused
+    reservation that is not yet deleted can make a concurrent neighbour see one row too many (a spurious refusal,
+    never an extra call).
     """
+    from backend.routers.logs import record_log
+
     limit = max_calls_per_minute(db)
     with _budget_lock:
+        entry = record_log(
+            db, LOG_SOURCE, "INFO", f"{CALL_MARKER} for Alert #{alert_id} ({trigger}, model {model}).",
+            f"Alert #{alert_id}", {"alert_id": alert_id, "trigger": trigger, "model": model, "kind": "model_call"})
         cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=60)
-        recent = (
+        ranked = (
             db.query(SystemLog)
-            .filter(SystemLog.source == LOG_SOURCE, SystemLog.message.like(f"{CALL_MARKER}%"), SystemLog.created_at >= cutoff)
-            .order_by(SystemLog.created_at.asc())
+            .filter(SystemLog.source == LOG_SOURCE, SystemLog.message.like(f"{CALL_MARKER}%"),
+                    SystemLog.created_at >= cutoff, SystemLog.log_id <= entry.log_id)
+            .order_by(SystemLog.created_at.asc(), SystemLog.log_id.asc())
             .all()
         )
-        if len(recent) >= limit:
-            oldest = recent[0].created_at
+        if len(ranked) > limit:
+            oldest = ranked[0].created_at
             wait = 60 - (_utcnow() - oldest).total_seconds() if oldest else 60
+            try:
+                db.delete(entry)
+                db.commit()
+            except Exception:
+                db.rollback()
             raise AIRateLimited(
                 f"AI triage rate limit reached ({limit} per minute). Try again in a moment.",
                 retry_after=max(1.0, round(wait, 1)),
             )
-        _audit(db, "INFO", f"{CALL_MARKER} for Alert #{alert_id} ({trigger}, model {model}).",
-               f"Alert #{alert_id}", {"alert_id": alert_id, "trigger": trigger, "model": model, "kind": "model_call"})
+
+
+@contextmanager
+def exclusive_alert(db: Session, alert_id: int):
+    """Preconditions shared by every way of attaching a proposal to an alert (built-in triage and the agent API):
+    404 when the alert does not exist, 409 while the response runner is processing it or another proposal for it
+    is being produced in this process. Yields the alert and releases the claim on exit."""
+    alert = get_alert(db, alert_id)
+    if alert is None:
+        raise AIAlertNotFound(f"Alert #{alert_id} not found.")
+    if alert.status == runner.STATUS_PROCESSING:
+        raise AIAlertBusy(f"Alert #{alert_id} is being processed by the response runner; try again shortly.", retry_after=30)
+    if not _claim_inflight(alert_id):
+        raise AIAlertBusy(f"Alert #{alert_id} is already being triaged by the AI.", retry_after=30)
+    try:
+        yield alert
+    finally:
+        _release_inflight(alert_id)
 
 
 def _claim_inflight(alert_id: int) -> bool:
@@ -655,7 +693,7 @@ def submit_proposal(
                 results.append(record.to_dict())
             elif decision.requires_approval:
                 pending += 1
-                results.append({"skipped": "awaiting analyst approval"})
+                results.append({"skipped": AWAITING})
             else:
                 outcome, record = _run_action(db, alert, act["action"], act["target"], act["params"], executed_by)
                 results.append(outcome)
@@ -672,7 +710,7 @@ def submit_proposal(
 
     proposal = db.query(AgentProposal).filter(AgentProposal.proposal_id == proposal.proposal_id).one()
     # Nothing ran or was recorded yet (everything waits for approval): keep the list empty, as the contract shows.
-    proposal.execution_results = [] if all(r.get("skipped") == "awaiting analyst approval" for r in results) else results
+    proposal.execution_results = [] if all(r.get("skipped") == AWAITING for r in results) else results
     proposal.status = _final_status(len(actions), pending, ok, bad)
     db.commit()
 
@@ -796,6 +834,59 @@ def _claim_decision(db: Session, proposal_id: int, new_status: str, username: st
     return proposal
 
 
+def approval_incomplete(proposal: AgentProposal) -> bool:
+    """True for an `approved` proposal whose actions never finished (the process died or failed between the claim
+    and the final write). A finished approval has an outcome for EVERY action, so no entry is still
+    "awaiting analyst approval" and the list is as long as the action list."""
+    if proposal.status != "approved":
+        return False
+    actions = list(proposal.proposed_actions or [])
+    results = list(proposal.execution_results or [])
+    if not actions:
+        return False
+    return len(results) < len(actions) or any(isinstance(r, dict) and r.get("skipped") == AWAITING for r in results)
+
+
+def _claim_resume(db: Session, proposal_id: int, username: str, notes: Optional[str]) -> AgentProposal:
+    """Take over an interrupted approval. Compare-and-swap on the decision timestamp: of several concurrent retries
+    exactly one wins, and none while the original attempt may still be running (its lease has not run out)."""
+    proposal = db.query(AgentProposal).filter(AgentProposal.proposal_id == proposal_id).first()
+    if proposal is None:
+        raise ProposalNotFound(f"Proposal #{proposal_id} not found.")
+    if not approval_incomplete(proposal):
+        raise ProposalConflict(f"Proposal #{proposal_id} was already decided ({proposal.status}).")
+    decided_at = proposal.decided_at
+    if decided_at is not None and (_utcnow() - (decided_at if decided_at.tzinfo else decided_at.replace(tzinfo=timezone.utc))
+                                   ).total_seconds() < APPROVAL_LEASE_SECONDS:
+        raise ProposalConflict(
+            f"Proposal #{proposal_id} is being approved or its approval was interrupted moments ago; "
+            f"retry in a few minutes.", retry_after=float(APPROVAL_LEASE_SECONDS))
+    claimed = (
+        db.query(AgentProposal)
+        .filter(AgentProposal.proposal_id == proposal_id, AgentProposal.status == "approved",
+                AgentProposal.decided_at == decided_at)
+        .update({AgentProposal.decided_by: _short(username, 50), AgentProposal.decided_at: _utcnow(),
+                 AgentProposal.decision_notes: notes}, synchronize_session=False)
+    )
+    db.commit()
+    db.expire_all()
+    if claimed != 1:
+        raise ProposalConflict(f"Proposal #{proposal_id} is already being re-approved by someone else.")
+    return db.query(AgentProposal).filter(AgentProposal.proposal_id == proposal_id).one()
+
+
+def _release_lease(db: Session, proposal_id: int) -> None:
+    """After an in-process failure nobody is running the approval any more: let the retry start at once."""
+    try:
+        db.rollback()
+        db.query(AgentProposal).filter(AgentProposal.proposal_id == proposal_id, AgentProposal.status == "approved") \
+            .update({AgentProposal.decided_at: _utcnow() - timedelta(seconds=APPROVAL_LEASE_SECONDS + 1)},
+                    synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
 def reject_proposal(db: Session, proposal_id: int, username: str, notes: Optional[str] = None) -> AgentProposal:
     notes = redact_text(notes, None, 1000) if notes else None
     proposal = _claim_decision(db, proposal_id, "rejected", username, notes)
@@ -825,7 +916,25 @@ def approve_proposal(
     if len(set(selected)) != len(selected) or any(not isinstance(i, int) or i < 0 or i >= count for i in selected):
         raise ProposalSelectionError(f"action_indexes must be unique numbers between 0 and {max(count - 1, 0)}.")
 
-    proposal = _claim_decision(db, proposal_id, "approved", username, notes)
+    if existing.status == "approved" and approval_incomplete(existing):
+        # Recovery path: the process died (or failed) after the claim but before the actions finished. Approving
+        # again by the same status resumes it; actions with a live success are never repeated (_run_action).
+        proposal = _claim_resume(db, proposal_id, username, notes)
+    else:
+        proposal = _claim_decision(db, proposal_id, "approved", username, notes)
+    try:
+        return _execute_approval(db, proposal, proposal_id, username, notes, selected)
+    except Exception:
+        # Anything that escapes the per-action handling (database failure, the alert vanishing, ...): keep the
+        # status `approved` with the results unfinished and hand the lease back so a retry can resume at once.
+        logger.exception(f"Approving AI proposal #{proposal_id} did not finish; it can be approved again")
+        _release_lease(db, proposal_id)
+        raise
+
+
+def _execute_approval(
+    db: Session, proposal: AgentProposal, proposal_id: int, username: str, notes: Optional[str], selected: List[int],
+) -> Tuple[AgentProposal, List[Dict[str, Any]]]:
     alert = get_alert(db, proposal.alert_id)
     actions = list(proposal.proposed_actions or [])
     evaluations = list(proposal.policy_evaluation or [])

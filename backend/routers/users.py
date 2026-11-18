@@ -1,5 +1,6 @@
 import ipaddress
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -99,6 +100,22 @@ def _validated_allowlist(entries: Optional[List[str]]) -> Optional[List[str]]:
         if text not in result:
             result.append(text)
     return result
+
+
+DEFAULT_AGENT_KEY_DAYS = 90
+
+
+def default_agent_key_days() -> int:
+    """Lifetime in days of a service-account key created without `expires_in_days`
+    (PHANTOM_AGENT_KEY_DEFAULT_DAYS, default 90; 0 = such keys never expire)."""
+    raw = os.getenv("PHANTOM_AGENT_KEY_DEFAULT_DAYS", "").strip()
+    if not raw:
+        return DEFAULT_AGENT_KEY_DAYS
+    try:
+        return min(max(int(raw), 0), 3650)
+    except ValueError:
+        logger.warning("Invalid PHANTOM_AGENT_KEY_DEFAULT_DAYS=%r; using %d.", raw, DEFAULT_AGENT_KEY_DAYS)
+        return DEFAULT_AGENT_KEY_DAYS
 
 
 def _expiry_from_days(days: Optional[int]) -> Optional[datetime]:
@@ -219,7 +236,9 @@ def create_service_account(
     db.flush()
     policy = ServiceAccountPolicy(
         user_id=account.user_id,
-        expires_at=_expiry_from_days(payload.expires_in_days),
+        # An explicit value always wins; an omitted one gets the default lifetime so no key lives forever by accident.
+        expires_at=_expiry_from_days(
+            payload.expires_in_days if payload.expires_in_days is not None else (default_agent_key_days() or None)),
         ip_allowlist=allowlist or [],
     )
     db.add(policy)

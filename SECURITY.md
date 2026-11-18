@@ -27,9 +27,9 @@ the systems that do it. Whoever controls it can cause outages and read your aler
 |---|---|
 | Stolen or guessed passwords | Argon2id, 15-character minimum (8 with MFA), common-password blocklist, TOTP MFA (can be made mandatory for admins), per-user/address lockout and rate limits, uniform responses and timing for unknown users |
 | Stolen session token | 12-hour tokens (`PHANTOM_JWT_EXPIRE_MINUTES`), revocation at logout stored in the database, role re-read on every request, token held in `sessionStorage` (dies with the tab) |
-| Forged alerts | per-sender ingest tokens (hashed, revocable, optional expiry), failed-token throttling, body size cap; alerts alone cannot cause autonomous action (HOTL needs live threat-intel evidence and is off by default) |
+| Forged alerts | per-sender ingest tokens (hashed, revocable, optional expiry), failed-token throttling, body size cap; alerts alone cannot cause autonomous action (HOTL is off by default, ignored at run time until protected assets are listed, and needs live threat-intel evidence) |
 | Attacker-controlled alert text | text is data: playbook choice by strong signals first, AI prompts keep alert text out of the system prompt and in nonce-delimited data blocks, model output is schema-validated and passes the same policy check |
-| Runaway or malicious automation | policy engine: protected hosts/users/IPs, automatic protection of the Wazuh manager, this server, loopback and gateway, confidence and autonomy limits for agents, simulation mode, HOTL master switch with preconditions |
+| Runaway or malicious automation | policy engine: protected hosts/users/IPs, automatic protection of the Wazuh manager, this server, loopback and gateway, confidence and autonomy limits for agents, automation limited to the alert's own Wazuh agent, simulation mode (a hard stop for all response actions), HOTL master switch with preconditions enforced at run time |
 | Database or backup leak | integration secrets and MFA seeds are Fernet-encrypted (`PHANTOM_ENCRYPTION_KEY`); password hashes are Argon2id; API keys and ingest tokens stored as hashes; API never returns stored secrets (masked previews only) |
 | Abuse of the "test connection" feature | admin only, rate limited, stored secrets are only sent to the stored host, other hosts must resolve to public addresses (SSRF guard, re-checked at connect time) |
 | Browser attacks | Content-Security-Policy and security headers from the console and API, bearer tokens instead of cookies (no CSRF), no wildcard CORS |
@@ -38,9 +38,10 @@ the systems that do it. Whoever controls it can cause outages and read your aler
 
 ### Known limits (read these)
 
-* **The console's own dependency audit currently fails on the pinned Next.js 14.2.x line** (`npm audit --omit=dev --audit-level=high`
-  reports advisories whose fixes need a newer major version). Track the CI result and upgrade before exposing the console to
-  untrusted networks.
+* **Console dependencies.** `npm audit --omit=dev` is clean as of the upgrade to Next.js 15.5.x (the earlier Next.js 14.2.35 had
+  critical advisories, including remote code execution on Windows-hosted servers, which is why it was upgraded). PostCSS is pinned
+  through the `overrides` section of `frontend/package.json`. The audit runs in CI on every change and new advisories appear over
+  time, so keep it green; it is not a guarantee against unknown flaws.
 * The session token lives in browser storage, so a script-injection bug in the console would expose it. The CSP allows inline
   scripts because of how Next.js bootstraps pages.
 * Anyone who can read the database **and** `PHANTOM_ENCRYPTION_KEY` can read all stored secrets; keep them in different places.
@@ -93,5 +94,5 @@ the systems that do it. Whoever controls it can cause outages and read your aler
 - [ ] Allow-list file installed on every Wazuh agent that runs the response scripts (your jump host, DNS, domain controllers, the SOAR server)
 - [ ] AI triage: off unless needed; `recommend_only`; raw payload sending off; a spending limit set at OpenRouter
 - [ ] Backups running, copied off-host, encrypted there, and a restore test done in the last quarter (`backup verify`)
-- [ ] CI green (`pip-audit`, `npm audit`, tests); Next.js upgraded past the advisories flagged by `npm audit`
+- [ ] CI green (`pip-audit`, `npm audit`, tests); no open advisories from `npm audit --omit=dev`
 - [ ] Logs reviewed for `Insecure configuration`, `cannot be decrypted` and failed-login bursts

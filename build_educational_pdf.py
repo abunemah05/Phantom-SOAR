@@ -142,11 +142,12 @@ BLOCKS = [
     ("p", "This is the principle of **least agency**: give automation the narrowest authority that still helps, and put the limit in code that the automation cannot rewrite."),
 
     ("h1", "9. Simulation mode and honest outcomes"),
-    ("p", "A new install runs in simulation mode, so you can try playbooks without touching a real system. The important teaching point is how results are labelled. A step ends in one of: `live` (really done), `simulated` (pretend), `skipped` (nothing configured and simulation off), `blocked` (policy refused) or `failed`."),
+    ("p", "A new install runs in simulation mode, which is a hard stop: no response action reaches a real system, even if credentials are saved, until you turn the mode off. The important teaching point is how results are labelled. A step ends in one of: `live` (really done), `simulated` (pretend), `skipped` (no credentials configured and simulation off), `blocked` (policy refused) or `failed`."),
     ("ul", [
         "An alert whose actions were only simulated gets the status `Simulated`, never `Contained`.",
         "Dashboards and the containment rate count only live success. A tool that reports pretend containment as real is dangerous because people stop looking.",
         "In production mode the API refuses to start with simulation on while real credentials are present, unless an explicit confirmation variable is set.",
+        "Autonomous response is checked again at run time: switching it on without listing protected assets has no effect.",
     ]),
 
     ("h1", "10. Response through Wazuh active response"),
@@ -209,7 +210,6 @@ BLOCKS = [
         "No sender-side forwarder from Wazuh to the webhook is shipped; you must configure one.",
         "Vendor request shapes (Wazuh active-response API for your version, Okta lookups, ThreatFox queries) are implemented from documentation and tested only with mocks.",
         "Confidence from an AI model is self-reported and uncalibrated.",
-        "The frontend's pinned Next.js version has open dependency advisories; upgrade it before exposing the console to untrusted networks.",
         "Licence and security contact are placeholders for the owner to fill in.",
     ]),
 

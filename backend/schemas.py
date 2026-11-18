@@ -61,7 +61,7 @@ class UserCreateResponse(UserResponse):
 
 class ServiceAccountCreateRequest(BaseModel):
     username: str = Field(min_length=1, max_length=50)  # e.g. "triage-agent"
-    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)  # key lifetime; omit for no expiry
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)  # key lifetime in days; omit for the default (PHANTOM_AGENT_KEY_DEFAULT_DAYS, 90; 0 there = no expiry)
     ip_allowlist: Optional[List[str]] = Field(default=None, max_length=50)  # IPs / CIDRs allowed to use the key
 
 class ServiceAccountPolicyRequest(BaseModel):

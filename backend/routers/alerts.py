@@ -68,6 +68,17 @@ def require_responder(
     return current_user
 
 
+def is_read_only(user: User) -> bool:
+    return role_level(user.role) == "read_only"
+
+
+def mask_for(user: User, value: Any) -> Any:
+    """The read-only auditor role sees credentials, tokens and e-mail addresses masked in everything that echoes
+    alert content (raw payload, IOC values and evidence, entity strings, action targets, proposal free text). The
+    shape and the field names are unchanged, so the console renders the same fields."""
+    return mask_sensitive(value) if is_read_only(user) else value
+
+
 def _get_alert_or_404(db: Session, alert_id: int) -> Alert:
     alert = get_alert(db, alert_id)
     if not alert:
@@ -224,8 +235,9 @@ def list_alerts(
     for alert in alerts:
         iocs = get_ioc_artifacts_by_alert(db, alert.alert_id)
         data = alert.to_dict()
-        if role_level(current_user.role) == "read_only":
+        if is_read_only(current_user):
             data["raw_payload"] = mask_sensitive(data.get("raw_payload"))
+            data["rule_id"] = mask_sensitive(data.get("rule_id"))
         data["ioc_count"] = len(iocs)
         data["max_threat_score"] = max([i.threat_score for i in iocs], default=0)
         data["malicious_ioc_count"] = sum(1 for i in iocs if i.verdict == "Malicious")
@@ -260,7 +272,7 @@ def get_alert_detail(
 
     return {
         "alert_id": alert.alert_id,
-        "rule_id": alert.rule_id,
+        "rule_id": mask_for(current_user, alert.rule_id),
         "source": alert.source,
         "severity": alert.severity,
         "status": alert.status,
@@ -270,17 +282,17 @@ def get_alert_detail(
         "resolved_at": alert.resolved_at.isoformat() if alert.resolved_at else None,
         "created_at": alert.created_at.isoformat() if alert.created_at else None,
         # The read-only auditor role sees credentials, tokens and e-mail addresses masked.
-        "raw_payload": mask_sensitive(alert.raw_payload) if role_level(current_user.role) == "read_only" else alert.raw_payload,
-        "ioc_artifacts": [i.to_dict() for i in iocs],
+        "raw_payload": mask_for(current_user, alert.raw_payload),
+        "ioc_artifacts": mask_for(current_user, [i.to_dict() for i in iocs]),
         "playbook_executions": [e.to_dict() for e in executions],
-        "containment_actions": [a.to_dict() for a in actions],
-        "agent_proposals": [p.to_dict() for p in (alert.agent_proposals or [])],
+        "containment_actions": mask_for(current_user, [a.to_dict() for a in actions]),
+        "agent_proposals": mask_for(current_user, [p.to_dict() for p in (alert.agent_proposals or [])]),
         "incident_report": report.to_dict() if report else None,
         "playbook": playbook.to_dict() if playbook else None,
         "routing": runner.evaluate_execution_mode(db, alert, iocs, playbook),
-        "entities": get_alert_entities(alert, iocs),
+        "entities": mask_for(current_user, get_alert_entities(alert, iocs)),
         "mitre_attack": runner.extract_mitre(alert, playbook),
-        "triage_summary": runner.build_triage_summary(db, alert, iocs, playbook),
+        "triage_summary": mask_for(current_user, runner.build_triage_summary(db, alert, iocs, playbook)),
         "simulation_mode": integration_config.is_simulation_mode(db),
         "hotl_enabled": runner.is_hotl_globally_enabled(db),
         "max_threat_score": max([i.threat_score for i in iocs], default=0),

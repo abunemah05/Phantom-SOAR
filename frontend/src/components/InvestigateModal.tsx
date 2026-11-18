@@ -539,7 +539,7 @@ export default function InvestigateModal({
                     {detail.simulation_mode && (
                       <span
                         className="text-[10px] px-2 py-0.5 rounded-full border font-black bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/40 flex items-center gap-1"
-                        title="Simulation mode is on: actions on unconfigured connectors are simulated."
+                        title="Simulation mode is on: no response action is sent to any system, even where credentials are saved."
                       >
                         <FlaskConical className="h-3 w-3" />
                         SIMULATION MODE
@@ -1194,7 +1194,7 @@ export default function InvestigateModal({
                                 {routing.evidence.map((ev, i) => <li key={i}>{ev}</li>)}
                               </ul>
                             ) : (
-                              "none confirmed (no Malicious IOC from live or lab intelligence, telemetry not Critical)."
+                              "none confirmed (no Malicious indicator backed by live or lab intelligence; sender-reported severity is not evidence)."
                             )}
                           </div>
                         </div>

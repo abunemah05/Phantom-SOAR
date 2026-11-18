@@ -12,7 +12,8 @@ Agent endpoints (service-account API key, header X-Phantom-Agent-Key; operator J
     GET  /agent/queue
     GET  /agent/alerts/{id}                 redacted alert context
     GET  /agent/actions                     action catalog
-    POST /agent/alerts/{id}/proposals       submit a proposal; every action goes through the policy engine
+    POST /agent/alerts/{id}/proposals       submit a proposal; every action goes through the policy engine; same
+                                            404/409 alert checks as /agent/triage and a per-key rate limit (429)
 
 The routes carry their own dependency (not a router-level one) because the two groups authenticate differently.
 Policy is the only gate for execution: see backend/engine/ai_triage.py.
@@ -24,13 +25,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
+from backend import ratelimit
 from backend.crud import get_alert, get_alerts
 from backend.database import get_db
 from backend.dependencies import get_current_service_account, get_current_user
 from backend.engine import ai_triage
 from backend.engine.actions import list_actions
 from backend.models import AgentProposal, User
-from backend.routers.alerts import require_responder
+from backend.routers.alerts import mask_for, require_responder
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +78,7 @@ def list_proposals(
         query.order_by(AgentProposal.created_at.desc(), AgentProposal.proposal_id.desc())
         .offset(offset).limit(limit).all()
     )
-    return {"items": [p.to_dict() for p in rows], "total": total, "limit": limit, "offset": offset}
+    return {"items": [mask_for(user, p.to_dict()) for p in rows], "total": total, "limit": limit, "offset": offset}
 
 
 @router.get("/proposals/{proposal_id}")
@@ -84,7 +86,7 @@ def get_proposal(proposal_id: int, db: Session = Depends(get_db), user: User = D
     proposal = db.query(AgentProposal).filter(AgentProposal.proposal_id == proposal_id).first()
     if proposal is None:
         raise HTTPException(status_code=404, detail=f"Proposal #{proposal_id} not found")
-    return proposal.to_dict()
+    return mask_for(user, proposal.to_dict())
 
 
 @router.post("/triage/{alert_id}", status_code=201)
@@ -178,10 +180,18 @@ def submit_agent_proposal(
     agent: User = Depends(get_current_service_account),
 ):
     """Submit a verdict and proposed actions. Every action is evaluated with actor="agent"; actions that policy
-    allows without approval run (live or simulated per simulation mode), the rest wait for a human."""
-    alert = _alert_or_404(db, alert_id)
-    proposal = ai_triage.submit_proposal(
-        db, alert, payload, agent_name=agent.username, executed_by=agent.username,
-        alias_back=ai_triage.alias_back_for_alert(db, alert), origin="agent-api",
-    )
+    allows without approval run (live or simulated per simulation mode), the rest wait for a human.
+    404 for an unknown alert, 409 while the alert is being processed, 429 over PHANTOM_RATE_LIMIT_AGENT_PROPOSALS
+    (default 30 per 60 s per service account)."""
+    ratelimit.enforce("agent_proposals", f"agent:{agent.user_id}")
+    try:
+        # Same gate as built-in triage: 404 unknown alert, 409 while the runner is processing it or a proposal for
+        # it is already being made, so an agent cannot race the response engine on one alert.
+        with ai_triage.exclusive_alert(db, alert_id) as alert:
+            proposal = ai_triage.submit_proposal(
+                db, alert, payload, agent_name=agent.username, executed_by=agent.username,
+                alias_back=ai_triage.alias_back_for_alert(db, alert), origin="agent-api",
+            )
+    except ai_triage.AITriageError as exc:
+        raise _http_error(exc)
     return proposal.to_dict()

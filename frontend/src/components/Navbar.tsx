@@ -62,8 +62,8 @@ export default function Navbar() {
         ? {
             title: "Enable autonomous containment (HOTL)?",
             message: simulation
-              ? "HOTL playbooks will run response actions without waiting for an analyst whenever there is real evidence (a Malicious indicator backed by live or lab intelligence, or Critical telemetry) and policy allows it. Simulation mode is ON, so those actions are only rehearsed."
-              : "HOTL playbooks will run response actions against your REAL systems without waiting for an analyst whenever there is real evidence (a Malicious indicator backed by live intelligence, or Critical telemetry) and policy allows it. Simulation mode is OFF.",
+              ? "HOTL playbooks will run response actions without waiting for an analyst whenever there is real evidence (a Malicious indicator backed by live or lab intelligence; severity reported by a sender is never evidence) and policy allows it. Simulation mode is ON, so those actions are only rehearsed."
+              : "HOTL playbooks will run response actions against your REAL systems without waiting for an analyst whenever there is real evidence (a Malicious indicator backed by live intelligence; severity reported by a sender is never evidence) and policy allows it. Simulation mode is OFF.",
             items: [
               "Protected hosts, users and IPs are still refused by policy.",
               "The switch can be paused again from this bar at any time.",
@@ -136,7 +136,7 @@ export default function Navbar() {
         {simulation && (
           <div
             className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-fuchsia-500/15 border border-fuchsia-500/40 text-fuchsia-300 text-xs font-black tracking-wider"
-            title="Simulation mode is ON: response actions against unconfigured connectors are only rehearsed (recorded as SIMULATED, nothing is changed on real systems, alerts are NOT contained), and lab threat-intel fixtures are used for documentation IPs and demo IOCs."
+            title="Simulation mode is ON: no response action is sent to any system, even where credentials are saved (actions are recorded as SIMULATED, nothing is changed on real systems, alerts are NOT contained). Threat-intel lookups are read-only and unaffected; lab fixtures answer for documentation IPs and demo IOCs. Turn simulation mode off in Configuration to act for real."
           >
             <FlaskConical className="h-3.5 w-3.5" aria-hidden="true" />
             <span>SIMULATION MODE</span>
@@ -198,7 +198,7 @@ export default function Navbar() {
             aria-pressed={hotlEnabled}
             title={
               (hotlEnabled
-                ? "HOTL enabled: HOTL playbooks may contain automatically when there is real evidence (Malicious IOC or Critical telemetry) and policy allows it."
+                ? "HOTL enabled: HOTL playbooks may contain automatically when there is real evidence (a Malicious indicator backed by threat intelligence) and policy allows it."
                 : "HOTL paused: all containment waits for analyst approval (HITL).") +
               (canToggleHotl ? " Click to change (asks for confirmation)." : " Only administrators can change this.")
             }

@@ -23,7 +23,7 @@ COVER = {
         ("Platform", "Phantom SOAR 2.0 (branch real-soar)"),
         ("Backend", "Python 3.12, FastAPI, SQLAlchemy and Alembic, Celery with Redis"),
         ("Database", "PostgreSQL 16 (Docker); SQLite for development and tests"),
-        ("Console", "Next.js 14 (App Router), React 18, TypeScript, Tailwind CSS"),
+        ("Console", "Next.js 15 (App Router), React 18, TypeScript, Tailwind CSS"),
         ("Edge", "Caddy reverse proxy: one HTTPS origin"),
         ("Author", "Omar Abunemah, Balqa Applied University"),
     ],
@@ -132,7 +132,7 @@ BLOCKS = [
     ("h2", "Policy engine"),
     ("p", "Every action, whoever asks for it (playbook, AI agent, analyst), goes through `policy.evaluate_action`. Automated actors can never touch protected hosts, users or IPs (an analyst can, and the decision notes it). The Wazuh manager, loopback, this server and its default gateway are protected automatically and no actor, analysts included, may isolate or block them. Loopback and reserved addresses are never blocked. Agent actions need a confidence of at least `agent_min_confidence` (default 0.85) and the configured autonomy: `recommend_only` (default), `low_impact` or `policy`."),
     ("h2", "Simulation mode"),
-    ("p", "On by default. A connector without credentials records an action labelled `Simulated`; with simulation off it records `Skipped`. A simulated action never counts as containment, and running the alert again after the connector is configured performs it for real. In production the API refuses to start with simulation on while real credentials are configured, unless `PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION=true`."),
+    ("p", "On by default, and a hard stop: while it is on, no response action is sent to Wazuh, Okta, Jira or Slack, even when credentials for them are saved; every action is recorded as `Simulated`. Read-only threat-intelligence lookups are unaffected. With simulation off, a connector with credentials acts on a real system and one without records `Skipped`. A simulated action never counts as containment, and running the alert again after simulation is turned off performs it for real. In production the API refuses to start with simulation on while real credentials are configured, unless `PHANTOM_SIMULATION_CONFIRMED_IN_PRODUCTION=true`. HOTL is enforced at run time: it is ignored until protected hosts/IPs and users are listed. Automation may only act through the Wazuh agent that raised the alert, and unattended HOTL blocks target only IPs with a `Malicious` verdict."),
 
     ("h1", "4. Threat intelligence"),
     ("p", "Each provider result carries a status: `live`, `not_found`, `not_configured`, `error`, `rate_limited` (with a retry time), `lab_fixture` (simulation mode only) or `skipped` (private or reserved addresses are never sent to a provider). Only `live` and `lab_fixture` results with a score count as evidence; a rate-limited or missing answer is never treated as clean."),
@@ -201,7 +201,6 @@ BLOCKS = [
         "No high availability: one API process and one worker with the scheduler.",
         "Alerts must be sent to the webhook by something else; no Wazuh-side forwarder is shipped.",
         "Vendor behaviour (Wazuh active-response request shape for your version, Okta user lookup by name, ThreatFox query types, rate limits) has to be checked against current vendor documentation and your own systems.",
-        "The console's dependency audit currently reports advisories for the pinned Next.js 14 line; upgrade before exposing it to untrusted networks.",
     ]),
 ]
 
