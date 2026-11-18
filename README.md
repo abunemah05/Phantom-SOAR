@@ -214,6 +214,13 @@ webhook ingest, backup and restore check).
   OneDrive (or other cloud-synced) folder; the sync client turns build files into placeholders that Next.js cannot read.
   Move the project to a local folder outside OneDrive (for example `C:\dev\phantom-soar`) and delete `frontend\.next`
   (see "Windows, and especially OneDrive" above).
+* **Windows: the console says "Cannot reach the Phantom SOAR API" and the backend window shows `DLL load failed ... An
+  Application Control policy has blocked this file`.** Smart App Control (or another Application Control policy) blocks a
+  compiled file that has no reputation yet, typically in a freshly released package. `run_backend.bat` now reinstalls
+  SQLAlchemy without its compiled extension automatically. To do it by hand, in the project folder:
+  `set DISABLE_SQLALCHEMY_CEXT=1` then `.venv\Scripts\python.exe -m pip install --no-binary sqlalchemy --force-reinstall --no-deps sqlalchemy`.
+  If the message names another package, tell us which one. Turning Smart App Control off is a last resort; it cannot be
+  turned back on without reinstalling Windows.
 * **`required variable ... is missing a value`**: run `python scripts/gen_env.py`, or fill the REQUIRED values in `.env`.
 * **API exits with `Insecure configuration`**: JWT secret under 32 characters, or `PHANTOM_ENCRYPTION_KEY` missing or not a Fernet key.
 * **API exits with `... simulation mode ON while real connectors are configured`**: see the safe order above.
