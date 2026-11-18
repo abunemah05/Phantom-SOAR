@@ -25,11 +25,27 @@ if errorlevel 1 goto :error
 :deps
 copy /b /y "backend\requirements.txt"+"backend\requirements-dev.txt" ".venv\requirements.new" >nul
 fc /b ".venv\requirements.new" ".venv\requirements.installed" >nul 2>&1
-if not errorlevel 1 goto :run
+if not errorlevel 1 goto :checkext
 echo [setup] Installing backend dependencies ...
 ".venv\Scripts\python.exe" -m pip install -r backend\requirements-dev.txt
 if errorlevel 1 goto :error
 move /y ".venv\requirements.new" ".venv\requirements.installed" >nul
+
+:checkext
+rem Some Windows PCs (Smart App Control / Windows Defender Application Control) block compiled Python extensions that
+rem have no reputation yet ("DLL load failed ... An Application Control policy has blocked this file"). SQLAlchemy can
+rem run without its compiled extension, so reinstall it from source with the extension disabled.
+".venv\Scripts\python.exe" -c "import sqlalchemy.sql.base" >nul 2>&1
+if not errorlevel 1 goto :run
+echo [setup] SQLAlchemy could not be loaded. Installing its pure-Python build ^(no compiled files^) ...
+set "DISABLE_SQLALCHEMY_CEXT=1"
+".venv\Scripts\python.exe" -m pip install --no-binary sqlalchemy --force-reinstall --no-deps "sqlalchemy>=2.0.28,<3"
+set "DISABLE_SQLALCHEMY_CEXT="
+".venv\Scripts\python.exe" -c "import sqlalchemy.sql.base" >nul 2>&1
+if errorlevel 1 (
+  echo [error] SQLAlchemy still cannot be loaded. See README, Troubleshooting ^(Application Control^).
+  goto :error
+)
 
 :run
 echo ========================================================
