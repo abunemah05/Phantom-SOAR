@@ -241,13 +241,17 @@ def test_kill_process_refuses_protected_names(env, name):
 def test_kill_process_refuses_protected_process_even_when_pid_given(env):
     proc = subprocess.Popen(["sleep", "120"])
     try:
-        shutil.copy(shutil.which("sleep"), Path(env["_dir"]) / "sshd")
-        decoy = subprocess.Popen([str(Path(env["_dir"]) / "sshd"), "120"])
+        # Copy a real, self-contained shell (not `sleep`: on newer images coreutils is one multi-call binary that
+        # refuses to run under another name, so the decoy would exit at once). `read` blocks without using CPU.
+        shutil.copy(shutil.which("sh"), Path(env["_dir"]) / "sshd")
+        decoy = subprocess.Popen([str(Path(env["_dir"]) / "sshd"), "-c", "read _unused"], stdin=subprocess.PIPE)
         try:
             rc, log = run(env, "kill-process", "sshd", str(decoy.pid), dry=False)
             assert rc == 1 and "protected process" in log and decoy.poll() is None
         finally:
             decoy.kill(); decoy.wait()
+            if decoy.stdin:
+                decoy.stdin.close()
     finally:
         proc.kill(); proc.wait()
 
