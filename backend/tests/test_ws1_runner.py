@@ -201,11 +201,14 @@ def test_two_racing_claims_exactly_one_wins(db, cfg):
 
 def test_concurrent_process_alert_threads_execute_each_action_once(db, cfg, live_connectors):
     alert = make_alert(db, ransomware())
+    # Read the id once, here. Touching the ORM instance from the worker threads would share this test's
+    # Session across threads (not thread-safe) and can trigger a refresh of an expired instance.
+    alert_id = alert.alert_id
     results, errors = [], []
 
     def worker():
         try:
-            results.append(process_alert(alert.alert_id))
+            results.append(process_alert(alert_id))
         except Exception as exc:  # pragma: no cover - reported below
             errors.append(f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}")
 
@@ -215,10 +218,10 @@ def test_concurrent_process_alert_threads_execute_each_action_once(db, cfg, live
     for t in threads:
         t.join()
 
-    assert not errors, errors
+    assert not errors, "\n".join(errors)
     assert sorted(c[1] for c in live_connectors) == sorted(EXPECTED)
     assert sum(1 for r in results if r.get("mode") == "HOTL") == 1
-    assert len(records(db, alert.alert_id)) == 4
+    assert len(records(db, alert_id)) == 4
 
 
 def test_reentrant_call_during_a_run_does_nothing(db, cfg, live_connectors, monkeypatch):

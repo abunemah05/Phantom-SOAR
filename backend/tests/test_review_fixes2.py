@@ -305,12 +305,13 @@ def test_failed_login_for_unknown_user_does_not_log_the_typed_text(client, db, c
         res = client.post("/api/auth/login", json={"username": typed, "password": "whatever-else-1"})
     assert res.status_code == 401
     db.expire_all()
-    entries = [r for r in db.query(SystemLog).filter(SystemLog.source == "AUTH").all() if "Failed sign-in" in r.message]
-    assert entries
-    for entry in entries[-1:]:
-        blob = json.dumps(entry.to_dict())
+    rows = db.query(SystemLog).filter(SystemLog.source == "AUTH").order_by(SystemLog.log_id).all()
+    for row in rows:  # the typed text must appear in no authentication log line at all
+        blob = json.dumps(row.to_dict())
         assert typed not in blob and "Tr0ub4dor" not in blob
-        assert "unknown user #" in entry.message and f"{len(typed)} chars" in entry.message
+    entries = [r for r in rows if "Failed sign-in" in r.message and "unknown user #" in r.message
+               and f"{len(typed)} chars" in r.message]
+    assert entries, "the failed sign-in for an unknown user was not logged in the redacted form"
     assert typed not in caplog.text
     # the same typed text always hashes to the same short label, so repeated attempts can be correlated
     assert auth_router._unknown_label(typed) == auth_router._unknown_label(typed) != auth_router._unknown_label(typed + "x")
