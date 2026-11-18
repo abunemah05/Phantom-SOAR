@@ -178,7 +178,18 @@ TARGET_ENTITY_KEYS: Dict[str, str] = {
 }
 
 CONTAINMENT_CONNECTORS = {"edr", "firewall", "iam"}
-EXECUTED_STATUSES = {"Success", "Simulated"}
+# Only a LIVE Success means a command really reached the target system. A "Simulated"
+# result is a rehearsal: it never counts as done, as containment, or as a reason to skip
+# the action when the run is repeated after the connector has been configured.
+LIVE_STATUSES = {"Success"}
+EXECUTED_STATUSES = LIVE_STATUSES  # "really executed": Simulated is deliberately NOT included
+RAN_STATUSES = {"Success", "Simulated"}  # the action ran, live or as a rehearsal (for display only)
+
+
+def is_live_success(status: Optional[str], execution_mode: Optional[str] = None) -> bool:
+    """True for a record whose command was really executed (never a simulated one)."""
+    return status in LIVE_STATUSES and (execution_mode or "live") != "simulated"
+
 
 _LOG_SOURCE = {"edr": "EDR", "firewall": "FIREWALL", "iam": "IAM", "itsm": "ITSM"}
 _LOG_LEVEL = {"Success": "ACTION", "Simulated": "INFO", "Skipped": "WARNING", "Failed": "ERROR"}

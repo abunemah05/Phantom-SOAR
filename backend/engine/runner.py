@@ -5,20 +5,36 @@ synchronously). It matches a playbook, then either runs the playbook's steps
 autonomously (HOTL) or parks the alert for analyst approval (HITL).
 
 HOTL requires all of:
-  * the global HOTL switch (ORCHESTRATION.hotl_enabled) is on,
-  * the matched playbook's execution_mode is HOTL,
-  * real evidence: an IOC whose verdict is Malicious backed by live or lab
-    threat intelligence, or Critical telemetry severity.
-Unknown evidence never triggers autonomous containment.
+  * the global HOTL switch (ORCHESTRATION.hotl_enabled, default OFF) is on,
+  * the matched playbook's execution_mode is HOTL, and the playbook was
+    selected by a strong signal (MITRE id, or the sender's rule description /
+    groups), never by keywords in free-text log fields alone,
+  * real evidence: an IOC whose verdict is Malicious backed by LIVE provider
+    data (lab_fixture results count only while simulation mode is on).
+Telemetry severity is NOT evidence: for EDR/XDR sources it is whatever the
+sender writes. Unknown evidence never triggers autonomous containment.
 
 Every step goes through policy.evaluate_action(actor="playbook") and then
 actions.execute_action, and every outcome (including policy blocks) is
 recorded as a ContainmentAction. MTTR is the real time from alert creation to
-the end of the run that contained it.
+the end of the run that really contained it.
+
+Alert status vocabulary: New -> Processing (claimed, lease held) -> Triaged
+(awaiting analyst), Contained (at least one LIVE containment action
+succeeded), Simulated (only simulated actions ran: nothing is contained) ->
+Resolved / Closed / Monitoring (analyst). A simulated action never counts as
+done: repeating the run after the connector is configured performs it for real.
+
+Idempotency: process_alert claims the alert with a single atomic
+UPDATE ... WHERE status='New' and holds a lease (a PlaybookExecution row with
+status 'Running' whose executed_at is the lease time). A concurrent call or a
+Celery redelivery cannot claim it; a claim older than LEASE_SECONDS is stale
+and may be reclaimed, resuming the run while skipping actions that already
+have a live Success record.
 """
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -36,10 +52,10 @@ from backend.database import SessionLocal
 from backend.engine.actions import (
     ACTION_CATALOG,
     CONTAINMENT_CONNECTORS,
-    EXECUTED_STATUSES,
     TARGET_ENTITY_KEYS,
     alert_agent,
     execute_action,
+    is_live_success,
     pseudo_step_kind,
     record_policy_block,
     resolve_action_name,
@@ -47,17 +63,24 @@ from backend.engine.actions import (
 from backend.engine.playbooks_catalog import TEMPLATES_BY_NAME
 from backend.engine.policy import evaluate_action, get_alert_entities
 from backend.engine.reporter import generate_pdf_report
-from backend.models import Alert, IncidentReport, Playbook, PlaybookExecution
+from backend.models import Alert, ContainmentAction, IncidentReport, Playbook, PlaybookExecution
 
 logger = logging.getLogger(__name__)
 
 MAX_TARGETS_PER_STEP = 5
 EVIDENCE_STATUSES = {"live", "lab_fixture"}
 HOTL_ENGINE = "HOTL Engine"
+LEASE_SECONDS = 600  # a Processing claim older than this is stale and may be reclaimed
+STATUS_PROCESSING = "Processing"
+LEASE_RUNNING = "Running"
 
 
 class NoPlaybookError(ValueError):
     """Raised when an approval is requested but no playbook applies to the alert."""
+
+
+class AlertBusyError(ValueError):
+    """Raised when another worker or analyst holds a fresh claim on the alert (map to HTTP 409)."""
 
 
 def utc_now() -> datetime:
@@ -78,7 +101,7 @@ def elapsed_seconds_since(created_at: Optional[datetime]) -> float:
 
 
 def is_hotl_globally_enabled(db: Optional[Session] = None) -> bool:
-    """Global HOTL kill switch (ORCHESTRATION.hotl_enabled; default on)."""
+    """Global HOTL kill switch (ORCHESTRATION.hotl_enabled; default OFF)."""
     return integration_config.get_bool("hotl_enabled", db=db)
 
 
@@ -101,17 +124,32 @@ def _rule(alert: Alert) -> Dict[str, Any]:
     return raw.get("rule") if isinstance(raw.get("rule"), dict) else {}
 
 
-def _alert_text(alert: Alert) -> str:
+def _norm(text: str) -> str:
+    return text.replace("_", " ").lower()
+
+
+def _alert_signal_text(alert: Alert) -> str:
+    """Text from the sender's rule / detection fields: a strong signal for playbook selection."""
     raw = alert.raw_payload or {}
     rule = _rule(alert)
     parts = [alert.rule_id or "", str(rule.get("description") or "")]
     groups = rule.get("groups")
     if isinstance(groups, list):
         parts.extend(str(g) for g in groups)
-    for key in ("title", "description", "threat_name", "detection_name", "mitre_tactic", "category", "full_log"):
+    for key in ("title", "description", "threat_name", "detection_name", "mitre_tactic", "category"):
         if isinstance(raw.get(key), str):
             parts.append(raw[key])
-    return " ".join(parts).replace("_", " ").lower()
+    return _norm(" ".join(parts))
+
+
+def _alert_freetext(alert: Alert) -> str:
+    """Free-text telemetry (full_log): attacker-influenced, so a weak signal only."""
+    raw = alert.raw_payload or {}
+    return _norm(raw["full_log"]) if isinstance(raw.get("full_log"), str) else ""
+
+
+def _alert_text(alert: Alert) -> str:
+    return (_alert_signal_text(alert) + " " + _alert_freetext(alert)).strip()
 
 
 def _alert_mitre_ids(alert: Alert) -> List[str]:
@@ -139,25 +177,38 @@ def _playbook_keywords(playbook: Playbook, workflow: Dict[str, Any]) -> List[str
 
 
 def match_playbook(db: Session, alert: Alert) -> Optional[Playbook]:
-    """Best active playbook for the alert, by MITRE technique and threat keywords; None if nothing matches."""
-    text = _alert_text(alert)
+    """Best active playbook for the alert; None if nothing matches.
+
+    Signals, strongest first: MITRE id from the sender's rule (exact 4, technique family 3),
+    keywords in the rule description / groups / detection fields (2), keywords in free-text
+    full_log (1, attacker-influenced). Ranking is by strong score, then weak score. A HOTL
+    playbook is never selected on weak signals alone, so log text cannot steer the alert
+    into an autonomous playbook.
+    """
+    strong_text = _alert_signal_text(alert)
+    weak_text = _alert_freetext(alert)
     mitre_ids = set(_alert_mitre_ids(alert))
     mitre_bases = {m.split(".")[0] for m in mitre_ids}
 
-    best, best_score = None, 0
+    best, best_key = None, (0, 0)
     playbooks = db.query(Playbook).filter(Playbook.is_active == True).order_by(Playbook.playbook_id).all()  # noqa: E712
     for playbook in playbooks:
         workflow = parse_workflow(playbook)
-        score = 0
+        strong = weak = 0
         pb_mitre = str(workflow.get("mitre_id") or "").strip().upper()
         if pb_mitre and pb_mitre in mitre_ids:
-            score += 3
+            strong += 4
         elif pb_mitre and pb_mitre.split(".")[0] in mitre_bases:
-            score += 2
-        if any(k and k.lower() in text for k in _playbook_keywords(playbook, workflow)):
-            score += 2
-        if score > best_score:
-            best, best_score = playbook, score
+            strong += 3
+        keywords = [k.lower() for k in _playbook_keywords(playbook, workflow) if k]
+        if any(k in strong_text for k in keywords):
+            strong += 2
+        if any(k in weak_text for k in keywords):
+            weak += 1
+        if strong == 0 and (weak == 0 or (playbook.execution_mode or "").upper() == "HOTL"):
+            continue
+        if (strong, weak) > best_key:
+            best, best_key = playbook, (strong, weak)
     return best
 
 
@@ -186,37 +237,44 @@ def _provider_results(ioc: Any) -> Dict[str, Dict[str, Any]]:
     return {name: p for name, p in providers.items() if isinstance(p, dict) and "status" in p}
 
 
-def ioc_evidence_sources(ioc: Any) -> List[str]:
-    """Providers whose live or lab-fixture result produced a score for this IOC."""
+def ioc_evidence_sources(ioc: Any, allow_lab: bool = True) -> List[str]:
+    """Providers whose live (or, if allow_lab, lab-fixture) result produced a score for this IOC."""
+    accepted = EVIDENCE_STATUSES if allow_lab else {"live"}
     return sorted(
         str(p.get("provider") or name)
         for name, p in _provider_results(ioc).items()
-        if p.get("status") in EVIDENCE_STATUSES and p.get("threat_score") is not None
+        if p.get("status") in accepted and p.get("threat_score") is not None
     )
 
 
-def ioc_evidence_kind(ioc: Any) -> Optional[str]:
+def ioc_evidence_kind(ioc: Any, allow_lab: bool = True) -> Optional[str]:
     """"lab fixture" when every scored result is a lab fixture, "live" when any is live, else None."""
+    accepted = EVIDENCE_STATUSES if allow_lab else {"live"}
     statuses = {
         p.get("status") for p in _provider_results(ioc).values() if p.get("threat_score") is not None
-    } & EVIDENCE_STATUSES
+    } & accepted
     if not statuses:
         return None
     return "lab fixture" if statuses == {"lab_fixture"} else "live"
 
 
-def collect_evidence(alert: Alert, iocs: List[Any]) -> List[str]:
+def collect_evidence(alert: Alert, iocs: List[Any], db: Optional[Session] = None) -> List[str]:
+    """Confirmed evidence for autonomous action: Malicious IOCs backed by live provider data.
+
+    Lab-fixture results count only while simulation mode is on. Telemetry severity is
+    never evidence: for EDR/XDR sources it is supplied by the sender.
+    """
+    allow_lab = integration_config.is_simulation_mode(db)
     evidence = []
     for ioc in iocs:
         if (ioc.verdict or "") != "Malicious":
             continue
-        kind = ioc_evidence_kind(ioc)
+        kind = ioc_evidence_kind(ioc, allow_lab=allow_lab)
         if kind is None:
             continue
         label = "lab fixture" if kind == "lab fixture" else "live threat intelligence"
-        evidence.append(f"{ioc.artifact_type} {ioc.value} is Malicious per {label} ({', '.join(ioc_evidence_sources(ioc))})")
-    if (alert.severity or "").capitalize() == "Critical":
-        evidence.append("Telemetry severity is Critical")
+        sources = ", ".join(ioc_evidence_sources(ioc, allow_lab=allow_lab))
+        evidence.append(f"{ioc.artifact_type} {ioc.value} is Malicious per {label} ({sources})")
     return evidence
 
 
@@ -224,7 +282,7 @@ def evaluate_execution_mode(
     db: Optional[Session], alert: Alert, iocs: List[Any], playbook: Optional[Playbook]
 ) -> Dict[str, Any]:
     """Route an alert to HOTL or HITL. Returns {"mode", "reasons", "evidence"}."""
-    evidence = collect_evidence(alert, iocs)
+    evidence = collect_evidence(alert, iocs, db)
     if playbook is None:
         return {"mode": "HITL", "evidence": evidence,
                 "reasons": ["No active playbook matches this alert; analyst triage required."]}
@@ -236,8 +294,8 @@ def evaluate_execution_mode(
                 "reasons": [f"Playbook '{playbook.name}' is configured for analyst approval (HITL)."]}
     if not evidence:
         return {"mode": "HITL", "evidence": evidence, "reasons": [
-            "No confirmed evidence: no IOC has a Malicious verdict from live or lab threat intelligence "
-            "and telemetry severity is not Critical. Analyst review required."
+            "No confirmed evidence: no IOC has a Malicious verdict backed by live threat intelligence "
+            "(sender-supplied severity is not evidence). Analyst review required."
         ]}
     return {"mode": "HOTL", "evidence": evidence,
             "reasons": [f"Playbook '{playbook.name}' is HOTL and the alert has confirmed evidence."]}
@@ -290,7 +348,8 @@ def run_playbook_steps(
     """Execute a playbook's steps for an alert. Steps already executed for the alert are not repeated."""
     entities = get_alert_entities(alert, iocs)
     existing = list(alert.containment_actions or [])
-    done = {_record_key(ca.action_type, ca.target, alert) for ca in existing if ca.status in EXECUTED_STATUSES}
+    # Only a LIVE Success is done. Simulated, Failed, Skipped and Blocked records are redone.
+    done = _live_done_keys(db, alert, existing)
     held = {}
     for ca in existing:
         if ca.status == "Awaiting Approval":
@@ -335,6 +394,8 @@ def run_playbook_steps(
             continue
 
         for target in targets:
+            if canonical:
+                done |= _live_done_keys(db, alert)  # another worker may have executed it meanwhile
             if canonical and _record_key(canonical, target, alert) in done:
                 reused.append({"action": canonical, "target": target})
                 continue
@@ -355,6 +416,16 @@ def run_playbook_steps(
     return {"records": records, "notes": notes, "already_done": reused, "paused_at_gate": paused_at_gate}
 
 
+def _live_done_keys(db: Session, alert: Alert, records: Optional[List[Any]] = None) -> set:
+    if records is None:
+        db.expire_all()
+        records = db.query(ContainmentAction).filter(ContainmentAction.alert_id == alert.alert_id).all()
+    return {
+        _record_key(ca.action_type, ca.target, alert)
+        for ca in records if is_live_success(ca.status, ca.execution_mode)
+    }
+
+
 def _resolve_held(record: Any, status: str, by: str, action_id: Optional[int] = None) -> None:
     details = dict(record.details or {})
     details["resolution"] = {"status": status, "by": by, "at": utc_now().isoformat(), "executed_action_id": action_id}
@@ -373,10 +444,16 @@ def close_pending_actions(db: Session, alert: Alert, by: str, status: str = "Dec
 
 
 def _classify_run(run: Dict[str, Any], mode: str) -> Dict[str, Any]:
+    """Alert and execution status for a run.
+
+    Contained requires at least one LIVE containment success (this run or an earlier one).
+    A run whose containment actions all merely simulated ends as "Simulated": nothing is contained.
+    """
     records = run["records"]
     containment_ok = [
-        r for r in records if r.connector in CONTAINMENT_CONNECTORS and r.status in EXECUTED_STATUSES
+        r for r in records if r.connector in CONTAINMENT_CONNECTORS and is_live_success(r.status, r.execution_mode)
     ]
+    containment_sim = [r for r in records if r.connector in CONTAINMENT_CONNECTORS and r.status == "Simulated"]
     reused_ok = [
         r for r in run["already_done"] if ACTION_CATALOG.get(r["action"], {}).get("connector") in CONTAINMENT_CONNECTORS
     ]
@@ -392,31 +469,150 @@ def _classify_run(run: Dict[str, Any], mode: str) -> Dict[str, Any]:
     if run["paused_at_gate"] or awaiting:
         return {"alert_status": "Triaged", "execution_status": f"Awaiting Approval ({mode})", "simulated": simulated}
     if not containment_ok and not reused_ok:
+        if containment_sim:
+            status = f"Partial ({mode}, simulated)" if problems else f"Simulated ({mode})"
+            return {"alert_status": "Simulated", "execution_status": status, "simulated": True}
         return {"alert_status": "Triaged", "execution_status": f"No Containment ({mode})", "simulated": simulated}
     if problems:
         return {"alert_status": "Contained", "execution_status": f"Partial ({mode}{suffix})", "simulated": simulated}
     return {"alert_status": "Contained", "execution_status": f"Completed ({mode}{suffix})", "simulated": simulated}
 
 
-def _upsert_execution(db: Session, alert: Alert, playbook: Optional[Playbook], status: str, mttr: float) -> PlaybookExecution:
-    pending = (
-        db.query(PlaybookExecution)
-        .filter(PlaybookExecution.alert_id == alert.alert_id, PlaybookExecution.status.like("Pending%"))
-        .order_by(PlaybookExecution.execution_id.desc())
-        .first()
-    )
-    if pending:
-        pending.playbook_id = playbook.playbook_id if playbook else pending.playbook_id
-        pending.status = status
-        pending.mttr_seconds = mttr
-        pending.executed_at = utc_now()
+def _upsert_execution(
+    db: Session, alert: Alert, playbook: Optional[Playbook], status: str, mttr: float,
+    lease_id: Optional[int] = None,
+) -> PlaybookExecution:
+    """Record the run's outcome on its lease row, else on the pending approval row, else a new row."""
+    row = None
+    if lease_id is not None:
+        row = db.query(PlaybookExecution).filter(PlaybookExecution.execution_id == lease_id).first()
+    if row is None:
+        row = (
+            db.query(PlaybookExecution)
+            .filter(PlaybookExecution.alert_id == alert.alert_id, PlaybookExecution.status.like("Pending%"))
+            .order_by(PlaybookExecution.execution_id.desc())
+            .first()
+        )
+    if row:
+        row.playbook_id = playbook.playbook_id if playbook else row.playbook_id
+        row.status = status
+        row.mttr_seconds = mttr
+        row.executed_at = utc_now()
         db.commit()
-        db.refresh(pending)
-        return pending
+        db.refresh(row)
+        return row
     return create_playbook_execution(
         db, alert_id=alert.alert_id, playbook_id=playbook.playbook_id if playbook else None,
         status=status, mttr_seconds=mttr,
     )
+
+
+# --- Claiming (idempotency) ---------------------------------------------------
+
+def _claim_alert(db: Session, alert_id: int, expected_status: str) -> Optional[int]:
+    """Atomically move the alert from expected_status to Processing and open a Running lease.
+
+    A single UPDATE ... WHERE status=expected is the compare-and-swap: of any number of
+    racing callers exactly one sees rowcount == 1. The lease row is created in the same
+    transaction. Returns the lease (PlaybookExecution) id, or None when the claim was lost.
+    """
+    try:
+        claimed = (
+            db.query(Alert)
+            .filter(Alert.alert_id == alert_id, Alert.status == expected_status)
+            .update({Alert.status: STATUS_PROCESSING}, synchronize_session=False)
+        )
+        if claimed != 1:
+            db.rollback()
+            return None
+        # An analyst-approval row left by routing is adopted as the lease so one run = one row.
+        lease = (
+            db.query(PlaybookExecution)
+            .filter(PlaybookExecution.alert_id == alert_id, PlaybookExecution.status.like("Pending%"))
+            .order_by(PlaybookExecution.execution_id.desc())
+            .first()
+        )
+        if lease is not None:
+            lease.status, lease.executed_at = LEASE_RUNNING, utc_now()
+        else:
+            lease = PlaybookExecution(
+                alert_id=alert_id, playbook_id=None, status=LEASE_RUNNING, mttr_seconds=0.0, executed_at=utc_now()
+            )
+            db.add(lease)
+        db.commit()
+        lease_id = lease.execution_id
+    except Exception:
+        db.rollback()
+        raise
+    db.expire_all()
+    return lease_id
+
+
+def _reclaim_stale(db: Session, alert_id: int) -> Optional[int]:
+    """Take over a Processing alert whose lease is older than LEASE_SECONDS (compare-and-swap on the lease time)."""
+    lease = (
+        db.query(PlaybookExecution)
+        .filter(PlaybookExecution.alert_id == alert_id, PlaybookExecution.status == LEASE_RUNNING)
+        .order_by(PlaybookExecution.execution_id.desc())
+        .first()
+    )
+    if lease is None:
+        return None
+    seen = lease.executed_at
+    age = (utc_now() - (_as_utc(seen) or utc_now())).total_seconds()
+    if age < LEASE_SECONDS:
+        return None
+    won = (
+        db.query(PlaybookExecution)
+        .filter(
+            PlaybookExecution.execution_id == lease.execution_id,
+            PlaybookExecution.status == LEASE_RUNNING,
+            PlaybookExecution.executed_at == seen,
+        )
+        .update({PlaybookExecution.executed_at: utc_now()}, synchronize_session=False)
+    )
+    db.commit()
+    db.expire_all()
+    return lease.execution_id if won == 1 else None
+
+
+def _release_claim(db: Session, alert_id: int, lease_id: Optional[int], back_to: str) -> None:
+    """After an unexpected error: hand the alert back so a retry can claim it (finished actions are skipped)."""
+    try:
+        db.rollback()
+        db.query(Alert).filter(Alert.alert_id == alert_id, Alert.status == STATUS_PROCESSING).update(
+            {Alert.status: back_to}, synchronize_session=False
+        )
+        if lease_id is not None:
+            db.query(PlaybookExecution).filter(
+                PlaybookExecution.execution_id == lease_id, PlaybookExecution.status == LEASE_RUNNING
+            ).update({PlaybookExecution.status: "Interrupted"}, synchronize_session=False)
+        db.commit()
+    except Exception as exc:
+        logger.error(f"Could not release claim on Alert #{alert_id}: {exc}")
+        db.rollback()
+
+
+def resume_stale_alerts(limit: int = 50) -> List[int]:
+    """Re-run alerts stuck in Processing past the lease (worker died). For a periodic Celery beat task."""
+    db = SessionLocal()
+    try:
+        cutoff = utc_now() - timedelta(seconds=LEASE_SECONDS)
+        ids = [
+            row.alert_id for row in db.query(PlaybookExecution)
+            .join(Alert, Alert.alert_id == PlaybookExecution.alert_id)
+            .filter(Alert.status == STATUS_PROCESSING, PlaybookExecution.status == LEASE_RUNNING,
+                    PlaybookExecution.executed_at < cutoff.replace(tzinfo=None))
+            .limit(limit).all()
+        ]
+    finally:
+        db.close()
+    for alert_id in ids:
+        try:
+            process_alert(alert_id)
+        except Exception as exc:
+            logger.error(f"Resuming stale Alert #{alert_id} failed: {exc}")
+    return ids
 
 
 def _log(db: Session, level: str, message: str, alert: Alert, details: Dict[str, Any]) -> None:
@@ -429,7 +625,7 @@ def _log(db: Session, level: str, message: str, alert: Alert, details: Dict[str,
 
 
 def _finish_run(
-    db: Session, alert: Alert, playbook: Playbook, run: Dict[str, Any], mode: str
+    db: Session, alert: Alert, playbook: Playbook, run: Dict[str, Any], mode: str, lease_id: Optional[int] = None
 ) -> Dict[str, Any]:
     outcome = _classify_run(run, mode)
     alert.status = outcome["alert_status"]
@@ -437,13 +633,14 @@ def _finish_run(
     db.refresh(alert)
 
     mttr = elapsed_seconds_since(alert.created_at) if alert.status == "Contained" else 0.0
-    execution = _upsert_execution(db, alert, playbook, outcome["execution_status"], mttr)
+    execution = _upsert_execution(db, alert, playbook, outcome["execution_status"], mttr, lease_id=lease_id)
     pdf_path = generate_and_save_report(db, alert)
 
     _log(
         db, "ACTION" if alert.status == "Contained" else "WARNING",
         f"Playbook '{playbook.name}' ({mode}) on Alert #{alert.alert_id}: {outcome['execution_status']}"
-        + (f", MTTR {mttr}s" if mttr else ""),
+        + (f", MTTR {mttr}s" if mttr else "")
+        + (" - NOT contained: only simulated actions ran" if alert.status == "Simulated" else ""),
         alert,
         {"alert_id": alert.alert_id, "playbook_id": playbook.playbook_id, "mode": mode,
          "execution_status": outcome["execution_status"], "notes": run["notes"],
@@ -466,57 +663,81 @@ def _finish_run(
 
 # --- Entry points -------------------------------------------------------------
 
+def _acquire_for_processing(db: Session, alert_id: int) -> Optional[int]:
+    """Claim a New alert, or reclaim a stale Processing one. None when someone else holds it."""
+    lease_id = _claim_alert(db, alert_id, "New")
+    if lease_id is None:
+        lease_id = _reclaim_stale(db, alert_id)
+        if lease_id is not None:
+            logger.warning(f"[SOAR Runner] Alert #{alert_id}: reclaimed a stale Processing claim; resuming.")
+    return lease_id
+
+
 def process_alert(alert_id: int) -> Dict[str, Any]:
-    """Route a newly ingested alert: run its HOTL playbook autonomously or park it for HITL approval."""
+    """Route a newly ingested alert: run its HOTL playbook autonomously or park it for HITL approval.
+
+    Idempotent: the alert is claimed atomically (New -> Processing), so concurrent calls and
+    Celery redeliveries never execute an action twice.
+    """
     db = SessionLocal()
+    lease_id: Optional[int] = None
     try:
         alert = get_alert(db, alert_id)
         if not alert:
             logger.error(f"Alert #{alert_id} not found in database.")
             return {"status": "Error", "message": f"Alert {alert_id} not found"}
-        if alert.status != "New":
-            return {"status": alert.status, "mode": None, "alert_id": alert_id,
-                    "message": "Alert was already processed; nothing was re-run."}
 
-        iocs = get_ioc_artifacts_by_alert(db, alert_id)
-        playbook = match_playbook(db, alert)
-        routing = evaluate_execution_mode(db, alert, iocs, playbook)
-        logger.info(f"[SOAR Runner] Alert #{alert_id}: playbook={playbook.name if playbook else None} -> {routing['mode']}")
-        _log(
-            db, "INFO",
-            f"Alert #{alert_id} routed to {routing['mode']}"
-            + (f" with playbook '{playbook.name}'" if playbook else " (no matching playbook)")
-            + ": " + " ".join(routing["reasons"]),
-            alert,
-            {"alert_id": alert_id, "playbook_id": playbook.playbook_id if playbook else None, **routing},
-        )
+        lease_id = _acquire_for_processing(db, alert_id)
+        if lease_id is None:
+            db.expire_all()
+            alert = get_alert(db, alert_id)
+            busy = alert.status == STATUS_PROCESSING
+            return {"status": alert.status, "mode": None, "alert_id": alert_id, "busy": busy,
+                    "message": ("Alert is being processed by another worker; nothing was re-run." if busy
+                                else "Alert was already processed; nothing was re-run.")}
 
-        if routing["mode"] == "HOTL":
-            run = run_playbook_steps(
-                db, alert, playbook, iocs, executed_by=HOTL_ENGINE, approved=False, stop_at_gate=True
+        try:
+            alert = get_alert(db, alert_id)
+            iocs = get_ioc_artifacts_by_alert(db, alert_id)
+            playbook = match_playbook(db, alert)
+            routing = evaluate_execution_mode(db, alert, iocs, playbook)
+            logger.info(f"[SOAR Runner] Alert #{alert_id}: playbook={playbook.name if playbook else None} -> {routing['mode']}")
+            _log(
+                db, "INFO",
+                f"Alert #{alert_id} routed to {routing['mode']}"
+                + (f" with playbook '{playbook.name}'" if playbook else " (no matching playbook)")
+                + ": " + " ".join(routing["reasons"]),
+                alert,
+                {"alert_id": alert_id, "playbook_id": playbook.playbook_id if playbook else None, **routing},
             )
-            result = _finish_run(db, alert, playbook, run, "HOTL")
-            result.update({"reasons": routing["reasons"], "evidence": routing["evidence"]})
-            return result
 
-        alert.status = "Triaged"
-        db.commit()
-        create_playbook_execution(
-            db,
-            alert_id=alert.alert_id,
-            playbook_id=playbook.playbook_id if playbook else None,
-            status="Pending Analyst Approval" if playbook else "Pending Analyst Triage",
-            mttr_seconds=0.0,
-        )
-        return {
-            "status": "Triaged",
-            "mode": "HITL",
-            "alert_id": alert_id,
-            "playbook": playbook.name if playbook else None,
-            "reasons": routing["reasons"],
-            "evidence": routing["evidence"],
-            "action": "Awaiting analyst approval",
-        }
+            if routing["mode"] == "HOTL":
+                run = run_playbook_steps(
+                    db, alert, playbook, iocs, executed_by=HOTL_ENGINE, approved=False, stop_at_gate=True
+                )
+                result = _finish_run(db, alert, playbook, run, "HOTL", lease_id=lease_id)
+                result.update({"reasons": routing["reasons"], "evidence": routing["evidence"]})
+                return result
+
+            alert.status = "Triaged"
+            db.commit()
+            _upsert_execution(
+                db, alert, playbook,
+                "Pending Analyst Approval" if playbook else "Pending Analyst Triage", 0.0, lease_id=lease_id,
+            )
+            return {
+                "status": "Triaged",
+                "mode": "HITL",
+                "alert_id": alert_id,
+                "playbook": playbook.name if playbook else None,
+                "reasons": routing["reasons"],
+                "evidence": routing["evidence"],
+                "action": "Awaiting analyst approval",
+            }
+        except Exception:
+            # Hand the alert back so a retry can claim it; actions with a live Success are never repeated.
+            _release_claim(db, alert_id, lease_id, back_to="New")
+            raise
     finally:
         db.close()
 
@@ -529,12 +750,15 @@ def approve_and_contain_alert(
 ) -> Dict[str, Any]:
     """Analyst sign-off: run the alert's playbook (approval gates satisfied) and record the outcome.
 
-    Raises ValueError when the alert or the requested playbook does not exist, and
-    NoPlaybookError when no playbook applies and none was chosen.
+    Also the way to redo a "Simulated" alert for real once connectors are configured.
+    Raises ValueError when the alert or the requested playbook does not exist,
+    NoPlaybookError when no playbook applies and none was chosen, and AlertBusyError
+    when another worker holds a fresh claim on the alert.
     """
     alert = get_alert(db, alert_id)
     if not alert:
         raise ValueError(f"Alert {alert_id} not found")
+    db.refresh(alert)  # the claim below compares against the status as stored, not a cached copy
 
     if playbook_id is not None:
         playbook = get_playbook(db, playbook_id)
@@ -547,13 +771,28 @@ def approve_and_contain_alert(
             f"No playbook matches Alert #{alert_id}; choose a playbook_id or respond with individual actions."
         )
 
-    iocs = get_ioc_artifacts_by_alert(db, alert_id)
-    run = run_playbook_steps(db, alert, playbook, iocs, executed_by=approved_by, approved=True, stop_at_gate=False)
-    result = _finish_run(db, alert, playbook, run, "HITL")
+    previous = alert.status
+    if previous == STATUS_PROCESSING:
+        lease_id = _reclaim_stale(db, alert_id)
+        previous = "Triaged"
+    else:
+        lease_id = _claim_alert(db, alert_id, previous)
+    if lease_id is None:
+        raise AlertBusyError(f"Alert #{alert_id} is being processed by another worker; try again shortly.")
+
+    try:
+        alert = get_alert(db, alert_id)
+        iocs = get_ioc_artifacts_by_alert(db, alert_id)
+        run = run_playbook_steps(db, alert, playbook, iocs, executed_by=approved_by, approved=True, stop_at_gate=False)
+        result = _finish_run(db, alert, playbook, run, "HITL", lease_id=lease_id)
+    except Exception:
+        _release_claim(db, alert_id, lease_id, back_to=previous)
+        raise
     result["approved_by"] = approved_by
     result["message"] = (
         f"Playbook '{playbook.name}' executed for Alert #{alert_id} after approval by {approved_by}: "
         f"{result['execution_status']}."
+        + (" Only simulated actions ran: the alert is NOT contained." if result["status"] == "Simulated" else "")
     )
     return result
 
@@ -598,7 +837,7 @@ def build_triage_summary(db: Session, alert: Alert, iocs: List[Any], playbook: O
     else:
         parts.append("No indicators were extracted.")
 
-    evidence = collect_evidence(alert, iocs)
+    evidence = collect_evidence(alert, iocs, db)
     if evidence:
         parts.append("Evidence: " + "; ".join(evidence) + ".")
 
@@ -618,6 +857,9 @@ def build_triage_summary(db: Session, alert: Alert, iocs: List[Any], playbook: O
         )
         if modes.get("simulated"):
             parts.append("Simulated actions were not executed against any real system.")
+        if alert.status == "Simulated":
+            parts.append("The alert is NOT contained: only simulated actions ran. Configure the connectors, "
+                         "turn simulation off and re-run the playbook.")
     elif alert.status in ("New", "Triaged"):
         routing = evaluate_execution_mode(db, alert, iocs, playbook)
         parts.append("No response actions yet. " + " ".join(routing["reasons"]))

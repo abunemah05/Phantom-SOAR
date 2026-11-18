@@ -38,6 +38,11 @@ NO_EVIDENCE = {
 }
 
 
+def lab_ioc(ip):
+    return {"artifact_type": "IP", "value": ip, "threat_score": 95, "verdict": "Malicious",
+            "enrichment_status": "enriched", "tip_results": lab_evidence()}
+
+
 def ransomware_payload(srcip="198.51.100.45"):
     return {
         "rule": {"id": "100201", "level": 10, "description": "Ransomware activity: bulk file encryption",
@@ -126,8 +131,8 @@ def test_lab_malicious_ransomware_runs_hotl_playbook_steps(db, settings):
     result = process_alert(alert.alert_id)
 
     assert result["mode"] == "HOTL"
-    assert result["status"] == "Contained"
-    assert result["execution_status"] == "Completed (HOTL, simulated)"
+    assert result["status"] == "Simulated"  # WS1: simulated-only runs never count as Contained
+    assert result["execution_status"] == "Simulated (HOTL)"
     assert result["simulated"] is True
     assert any("lab fixture" in e for e in result["evidence"])
 
@@ -142,8 +147,8 @@ def test_lab_malicious_ransomware_runs_hotl_playbook_steps(db, settings):
     assert all(r.status == "Simulated" and r.execution_mode == "simulated" for r in records)
     assert all(r.executed_by == "HOTL Engine" for r in records)
 
-    # MTTR is the real time since the alert was created (about two minutes), not a padded constant.
-    assert 110 <= result["mttr_seconds"] <= 300
+    # MTTR is only recorded for real containment; a simulated run has none.
+    assert result["mttr_seconds"] is None
     assert os.path.exists(result["pdf_path"])
 
     # Re-processing is a no-op.
@@ -152,13 +157,14 @@ def test_lab_malicious_ransomware_runs_hotl_playbook_steps(db, settings):
     assert len(actions_for(db, alert.alert_id)) == len(records)
 
 
-def test_critical_telemetry_counts_as_evidence(db, settings):
+def test_critical_telemetry_is_not_evidence(db, settings):
+    # WS1: sender-supplied severity must not trigger HOTL (was: counted as evidence).
     alert = make_alert(db, ransomware_payload(srcip="8.8.8.8"), severity="Critical", ioc={
         "artifact_type": "IP", "value": "8.8.8.8", "verdict": "Unknown", "tip_results": NO_EVIDENCE,
     })
     result = process_alert(alert.alert_id)
-    assert result["mode"] == "HOTL"
-    assert "Telemetry severity is Critical" in result["evidence"]
+    assert result["mode"] == "HITL"
+    assert result["evidence"] == []
 
 
 def test_hotl_switched_off_routes_to_hitl(db, settings):
@@ -194,8 +200,8 @@ def test_hitl_playbook_waits_then_approval_executes_steps(db, settings):
 
     result = approve_and_contain_alert(db, alert.alert_id, approved_by="analyst_omar")
 
-    assert result["status"] == "Contained"
-    assert result["execution_status"] == "Completed (HITL, simulated)"
+    assert result["status"] == "Simulated"
+    assert result["execution_status"] == "Simulated (HITL)"
     records = actions_for(db, alert.alert_id)
     assert [(r.action_type, r.target) for r in records] == [
         ("revoke_user_sessions", "jdoe@corp.example"),
@@ -203,15 +209,15 @@ def test_hitl_playbook_waits_then_approval_executes_steps(db, settings):
     ]
     assert all(r.executed_by == "analyst_omar" for r in records)
     assert any("approval gate satisfied" in n for n in result["notes"])
-    assert result["mttr_seconds"] >= 55
+    assert result["mttr_seconds"] is None
 
     executions = db.query(PlaybookExecution).filter(PlaybookExecution.alert_id == alert.alert_id).all()
     assert len(executions) == 1  # the pending execution was completed, not duplicated
-    assert executions[0].status == "Completed (HITL, simulated)"
+    assert executions[0].status == "Simulated (HITL)"
 
 
 def test_private_ip_block_is_held_for_approval(db, settings):
-    alert = make_alert(db, ransomware_payload(srcip="10.9.9.9"), severity="Critical")
+    alert = make_alert(db, ransomware_payload(srcip="10.9.9.9"), severity="Critical", ioc=lab_ioc("10.9.9.9"))
 
     result = process_alert(alert.alert_id)
 
@@ -222,10 +228,13 @@ def test_private_ip_block_is_held_for_approval(db, settings):
     assert [(r.action_type, r.target, r.execution_mode) for r in held] == [("block_ip", "10.9.9.9", "blocked")]
 
     approved = approve_and_contain_alert(db, alert.alert_id, approved_by="lead")
-    assert approved["status"] == "Contained"
-    new_actions = approved["actions"]
+    # WS1: the earlier steps were only Simulated, so they are performed again, not skipped as done.
+    assert approved["status"] == "Simulated"
+    assert approved["already_done"] == []
+    new_actions = [a for a in approved["actions"] if a["action_type"] == "block_ip"]
     assert [(a["action_type"], a["target"]) for a in new_actions] == [("block_ip", "10.9.9.9")]
-    assert {d["action"] for d in approved["already_done"]} == {"isolate_endpoint", "terminate_process", "revoke_user_sessions"}
+    assert {a["action_type"] for a in approved["actions"]} == {
+        "isolate_endpoint", "terminate_process", "block_ip", "revoke_user_sessions"}
 
     db.expire_all()
     resolved = db.get(ContainmentAction, held[0].action_id)
@@ -235,7 +244,7 @@ def test_private_ip_block_is_held_for_approval(db, settings):
 
 
 def test_dismissing_declines_held_actions(db, settings):
-    alert = make_alert(db, ransomware_payload(srcip="10.9.9.9"), severity="Critical")
+    alert = make_alert(db, ransomware_payload(srcip="10.9.9.9"), severity="Critical", ioc=lab_ioc("10.9.9.9"))
     process_alert(alert.alert_id)
     db.expire_all()
     alert = db.get(type(alert), alert.alert_id)
@@ -248,7 +257,7 @@ def test_dismissing_declines_held_actions(db, settings):
 
 def test_protected_host_is_blocked_for_the_playbook(db, settings):
     settings["protected_hosts"] = "srv-prod-*"
-    alert = make_alert(db, ransomware_payload(), severity="Critical")
+    alert = make_alert(db, ransomware_payload(), severity="Critical", ioc=lab_ioc("198.51.100.45"))
 
     result = process_alert(alert.alert_id)
 
