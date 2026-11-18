@@ -7,7 +7,16 @@ needs ``nvd_api_key`` (Configuration page or NVD_API_KEY). Each CVE result has a
     live            NVD returned the CVE record
     not_found       NVD has no record of this CVE id
     not_configured  no NVD API key is set, so no lookup was made
-    unavailable     the lookup failed (timeout, rate limit, auth failure, bad response)
+    unavailable     the lookup failed (timeout, auth failure, bad response)
+    rate_limited    NVD answered 429 or the local request budget is used up; retry_after_seconds
+                    says when to try again (never cached)
+    pending         allow_live=False and the CVE is not cached yet: no network call was made;
+                    refresh_alert_vulnerabilities() fills the cache in the background
+
+NVD allows 5 requests per rolling 30 seconds without an API key and 50 with one
+(https://nvd.nist.gov/developers/start-here); the local budget defaults to 45 per 30 seconds and
+is the setting nvd_requests_per_30s. Alert views should call analyze_alert_vulnerabilities with
+allow_live=False and let a background task call refresh_alert_vulnerabilities(alert_id).
 
 Only live CVSS data can make an alert eligible for the HOTL isolation recommendation
 (CVSS >= 9.0 with a NETWORK attack vector); the response policy still decides what runs.
@@ -17,12 +26,14 @@ import logging
 import re
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from backend import integration_config
+from backend.integrations.tip import RateLimiter, _num, parse_retry_after
 
 logger = logging.getLogger(__name__)
 
@@ -48,16 +59,40 @@ class NationalVulnerabilityDatabase:
     BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
     MAX_CVES_PER_ALERT = 10
 
-    def __init__(self, transport: Optional[httpx.BaseTransport] = None, timeout: float = 8.0, cache_ttl: float = 6 * 3600):
+    def __init__(
+        self,
+        transport: Optional[httpx.BaseTransport] = None,
+        timeout: float = 8.0,
+        cache_ttl: float = 6 * 3600,
+        cache_max_entries: int = 2000,
+    ):
         self.transport = transport  # tests inject httpx.MockTransport here
         self.timeout = timeout
         self.cache_ttl = cache_ttl
-        self._cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self.cache_max_entries = max(1, int(cache_max_entries))
+        self._cache: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = OrderedDict()  # LRU, newest last
         self._lock = threading.Lock()
+        self._limiter = RateLimiter(per_window=45, window_seconds=30.0)
 
     def clear_cache(self) -> None:
         with self._lock:
             self._cache.clear()
+
+    def _cache_get(self, cve_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            hit = self._cache.get(cve_id)
+            if hit and time.monotonic() - hit[0] < self.cache_ttl:
+                self._cache.move_to_end(cve_id)
+                return {**hit[1], "cached": True}
+            self._cache.pop(cve_id, None)
+        return None
+
+    def _cache_put(self, cve_id: str, record: Dict[str, Any]) -> None:
+        with self._lock:
+            self._cache[cve_id] = (time.monotonic(), record)
+            self._cache.move_to_end(cve_id)
+            while len(self._cache) > self.cache_max_entries:
+                self._cache.popitem(last=False)
 
     def extract_cves_from_text(self, text: str) -> List[str]:
         """CVE identifiers in order of first appearance, upper-cased and de-duplicated."""
@@ -70,7 +105,9 @@ class NationalVulnerabilityDatabase:
                 seen.append(cve)
         return seen
 
-    def _base_record(self, cve_id: str, status: str, error: Optional[str] = None) -> Dict[str, Any]:
+    def _base_record(
+        self, cve_id: str, status: str, error: Optional[str] = None, retry_after_seconds: Optional[int] = None,
+    ) -> Dict[str, Any]:
         nvd_url = f"https://nvd.nist.gov/vuln/detail/{cve_id}"
         return {
             "cve_id": cve_id,
@@ -96,6 +133,7 @@ class NationalVulnerabilityDatabase:
             "nvd_url": nvd_url,
             "source": None,
             "error": error,
+            "retry_after_seconds": retry_after_seconds if status == "rate_limited" else None,
             "queried_at": _now_iso(),
         }
 
@@ -114,7 +152,9 @@ class NationalVulnerabilityDatabase:
         if resp.status_code in (401, 403):
             return self._base_record(cve_id, "unavailable", f"NVD rejected the request (HTTP {resp.status_code}); check the API key or rate limit")
         if resp.status_code == 429:
-            return self._base_record(cve_id, "unavailable", "NVD rate limit reached (HTTP 429)")
+            retry = parse_retry_after(resp.headers.get("Retry-After"), default=30)  # NVD window is 30 s
+            self._limiter.block(retry)
+            return self._base_record(cve_id, "rate_limited", "NVD rate limit reached (HTTP 429)", retry)
         if resp.status_code != 200:
             return self._base_record(cve_id, "unavailable", f"unexpected NVD response (HTTP {resp.status_code})")
 
@@ -173,29 +213,51 @@ class NationalVulnerabilityDatabase:
         )
         return record
 
-    def get_vulnerability_details(self, cve_id: str) -> Dict[str, Any]:
-        """Look up a CVE in NVD. Never raises and never invents CVSS data."""
+    def get_vulnerability_details(
+        self, cve_id: str, *, allow_live: bool = True, force_refresh: bool = False, db=None,
+    ) -> Dict[str, Any]:
+        """Look up a CVE in NVD. Never raises and never invents CVSS data.
+
+        allow_live=False answers from the cache only (status "pending" on a miss, no network)."""
         cve_id = cve_id.strip().upper()
         if not CVE_RE.fullmatch(cve_id):
             return self._base_record(cve_id, "not_found", "not a valid CVE identifier")
 
-        with self._lock:
-            hit = self._cache.get(cve_id)
-            if hit and time.monotonic() - hit[0] < self.cache_ttl:
-                return {**hit[1], "cached": True}
+        if not force_refresh:
+            cached = self._cache_get(cve_id)
+            if cached:
+                return cached
 
-        api_key = integration_config.get_setting("nvd_api_key")
+        api_key = integration_config.get_setting("nvd_api_key", db=db)
         if not api_key:
             return self._base_record(cve_id, "not_configured", "NVD API key is not configured; no live lookup was made")
+        if not allow_live:
+            return self._base_record(cve_id, "pending", "not cached yet; a background refresh will fetch it")
+
+        per_window = _num(integration_config.get_setting("nvd_requests_per_30s", db=db, default="45"), 45, int)
+        max_wait = _num(integration_config.get_setting("tip_max_wait_seconds", db=db, default="2"), 2.0, float)
+        self._limiter.configure(per_window)
+        allowed, wait = self._limiter.acquire(max_wait=max_wait)
+        if not allowed:
+            return self._base_record(
+                cve_id, "rate_limited", "NVD request budget used up; retry later", int(max(1, round(wait)))
+            )
+        if wait > 0:
+            time.sleep(wait)
 
         record = self.query_nvd_api(cve_id, api_key)
         if record["status"] in ("live", "not_found"):
-            with self._lock:
-                self._cache[cve_id] = (time.monotonic(), record)
+            self._cache_put(cve_id, record)
         return record
 
-    def analyze_alert_vulnerabilities(self, alert_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """CVE context for an alert: CVEs named in its payload, their NVD data, and HOTL eligibility."""
+    def analyze_alert_vulnerabilities(
+        self, alert: Any, db=None, *, allow_live: bool = True, force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """CVE context for an alert: CVEs named in its payload, their NVD data, and HOTL eligibility.
+
+        ``alert`` is an alert dict or an object with ``to_dict()``. With allow_live=False only cached
+        data is used and uncached CVEs report status "pending" (no network call)."""
+        alert_dict = alert if isinstance(alert, dict) else alert.to_dict()
         raw = alert_dict.get("raw_payload") or {}
         try:
             payload_text = json.dumps(raw, default=str)
@@ -204,7 +266,9 @@ class NationalVulnerabilityDatabase:
         found = self.extract_cves_from_text(f"{alert_dict.get('rule_id', '')} {payload_text}")
         truncated = max(0, len(found) - self.MAX_CVES_PER_ALERT)
         cves = found[: self.MAX_CVES_PER_ALERT]
-        details = [self.get_vulnerability_details(c) for c in cves]
+        details = [
+            self.get_vulnerability_details(c, allow_live=allow_live, force_refresh=force_refresh, db=db) for c in cves
+        ]
 
         scores = [d["cvss_score"] for d in details if d["cvss_score"] is not None]
         max_cvss = max(scores) if scores else None
@@ -215,8 +279,12 @@ class NationalVulnerabilityDatabase:
             lookup_status = "live"
         elif statuses & {"live", "not_found"}:
             lookup_status = "partial"
+        elif "pending" in statuses:
+            lookup_status = "pending"
         elif statuses == {"not_configured"}:
             lookup_status = "not_configured"
+        elif statuses == {"rate_limited"}:
+            lookup_status = "rate_limited"
         else:
             lookup_status = "unavailable"
 
@@ -243,6 +311,9 @@ class NationalVulnerabilityDatabase:
             "cves_detected": cves,
             "cves_truncated": truncated,
             "lookup_status": lookup_status,
+            "incomplete": bool(statuses & {"pending", "rate_limited", "unavailable"}),
+            "pending_cves": [d["cve_id"] for d in details if d["status"] == "pending"],
+            "retry_after_seconds": max((d.get("retry_after_seconds") or 0 for d in details), default=0) or None,
             "max_cvss_score": max_cvss,
             "cvss_max_score": max_cvss,  # alias read by the current UI
             "vulnerabilities": details,
@@ -256,5 +327,29 @@ class NationalVulnerabilityDatabase:
             },
         }
 
+    def refresh_alert_vulnerabilities(self, alert_id: int) -> Optional[Dict[str, Any]]:
+        """Background-task entry point: load the alert, look its CVEs up live and fill the cache.
+
+        Opens its own DB session, never raises, returns the analysis (None if the alert is gone)."""
+        from backend.database import SessionLocal
+        from backend.models import Alert
+
+        db = SessionLocal()
+        try:
+            alert = db.get(Alert, alert_id)
+            if alert is None:
+                return None
+            return self.analyze_alert_vulnerabilities(alert.to_dict(), db, allow_live=True)
+        except Exception as exc:
+            logger.warning(f"NVD background refresh for alert {alert_id} failed: {type(exc).__name__}")
+            return None
+        finally:
+            db.close()
+
 
 nvd_client = NationalVulnerabilityDatabase()
+
+
+def clear_cache() -> None:
+    """Clear the shared NVD cache (e.g. after the NVD API key changes)."""
+    nvd_client.clear_cache()
