@@ -28,6 +28,7 @@ from backend.dependencies import (
     require_admin,
     require_roles,
 )
+from backend.integrations import llm
 from backend.integration_config import (
     DEFAULTS,
     INTEGRATION_KEYS,
@@ -45,8 +46,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/configuration", tags=["Configuration & Integrations"])
 
-CATEGORIES = ("TIP", "SIEM", "IAM", "ITSM", "ORCHESTRATION", "AGENT")
-REMOVED_CATEGORIES = {"AI", "EDR", "XDR", "FIREWALL"}
+CATEGORIES = ("TIP", "SIEM", "IAM", "ITSM", "ORCHESTRATION", "AGENT", "AI")
+REMOVED_CATEGORIES = {"EDR", "XDR", "FIREWALL"}  # "AI" is a live category again (OpenRouter triage)
 
 SECRET_KEYS = frozenset(
     key for key in INTEGRATION_KEYS
@@ -79,7 +80,8 @@ KNOWN_DUMMY_VALUES = {
     "wazuh-api-admin",
 }
 
-BOOL_KEYS = {"hotl_enabled", "simulation_mode", "siem_verify_tls", "require_mfa_for_admin"}
+BOOL_KEYS = {"hotl_enabled", "simulation_mode", "siem_verify_tls", "require_mfa_for_admin",
+             "ai_enabled", "ai_auto_triage", "ai_send_raw_payload"}
 URL_KEYS = {"siem_manager_url", "jira_base_url", "jira_webhook_url", "slack_webhook_url"}
 # key -> (minimum, maximum, integer?). Out-of-range values are rejected instead of silently ignored.
 NUMERIC_KEYS: Dict[str, Tuple[float, float, bool]] = {
@@ -97,6 +99,7 @@ NUMERIC_KEYS: Dict[str, Tuple[float, float, bool]] = {
     "tip_critical_threshold": (1, 100, True),
     "wazuh_default_block_hours": (0, 720, True),
     "wazuh_default_rate_limit_hours": (0, 720, True),
+    "ai_max_alerts_per_minute": (1, 600, True),
 }
 JIRA_API_VERSIONS = ("2", "3")
 AGENT_AUTONOMY_LEVELS = ("recommend_only", "low_impact", "policy")
@@ -249,6 +252,10 @@ def _validate_value(key: str, value: str) -> Tuple[str, Optional[str]]:
         if not 0.0 <= number <= 1.0:
             return value, f"{key}: expected a number between 0 and 1."
         return str(number), None
+    if key == "openrouter_model":
+        if not llm.is_valid_model_slug(value):
+            return value, f"{key}: expected a model slug such as vendor/model (see https://openrouter.ai/models)."
+        return value, None
     if key == "agent_autonomy":
         if value not in AGENT_AUTONOMY_LEVELS:
             return value, f"{key}: expected one of {', '.join(AGENT_AUTONOMY_LEVELS)}."
@@ -386,9 +393,11 @@ def get_runtime_status(db: Session = Depends(get_db), user: User = Depends(get_c
             "jira": is_configured("jira_base_url", "jira_email", "jira_api_token", "jira_project_key", db=db)
             or is_configured("jira_webhook_url", db=db),
             "slack": is_configured("slack_webhook_url", db=db),
+            "ai": is_configured("openrouter_api_key", db=db),  # a key exists (does not say AI triage is enabled)
         },
         "agent_autonomy": get_setting("agent_autonomy", db=db),
         "agent_min_confidence": min_confidence,
+        "ai_enabled": get_bool("ai_enabled", db=db),
     }
 
 
@@ -403,11 +412,12 @@ SERVICES: Dict[str, Tuple[str, str]] = {
     "okta": ("IAM", "Okta"),
     "jira": ("ITSM", "Jira"),
     "slack": ("ITSM", "Slack"),
+    "openrouter": ("AI", "OpenRouter"),
 }
 _SERVICE_HINTS = (
     ("abuseipdb", "abuseipdb"), ("threatfox", "threatfox"), ("virustotal", "virustotal"),
     ("alienvault", "otx"), ("otx", "otx"), ("nvd", "nvd"), ("wazuh", "wazuh"), ("siem", "wazuh"),
-    ("okta", "okta"), ("jira", "jira"), ("slack", "slack"),
+    ("okta", "okta"), ("jira", "jira"), ("slack", "slack"), ("openrouter", "openrouter"),
 )
 TEST_TIMEOUT = httpx.Timeout(6.0, connect=4.0)
 
@@ -509,6 +519,15 @@ def _threatfox_ok(response: httpx.Response) -> Optional[bool]:
     return False if "auth" in query_status.lower() else None
 
 
+def _openrouter_ok(response: httpx.Response) -> Optional[bool]:
+    if response.status_code != 200:
+        return None
+    try:
+        return isinstance(response.json().get("data"), dict)
+    except (ValueError, AttributeError):
+        return None
+
+
 class _EndpointOverride(Exception):
     """The test request cannot be run as asked (reported to the admin as HTTP 400)."""
 
@@ -593,6 +612,18 @@ def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict
         if result["http_status"] == 404:
             result.update(status=AUTH_FAILED, is_connected=False,
                           message="NVD returned HTTP 404 for a known CVE, which is how it rejects an invalid API key.")
+        return result
+
+    if service == "openrouter":
+        # One read-only call (GET /api/v1/key, https://openrouter.ai/docs/api-reference/limits): it checks the key and
+        # spends no credits. No alert data is sent and the key only ever goes to the vendor's fixed host.
+        key = setting("openrouter_api_key", override_key)
+        if not key:
+            return not_configured("openrouter_api_key")
+        result = _probe(service, "GET", f"{llm.OPENROUTER_BASE_URL}{llm.KEY_INFO_PATH}", ok=_openrouter_ok,
+                        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
+        if result["http_status"] == 402:
+            result["message"] = "OpenRouter reports insufficient credits for this key (HTTP 402); add credits."
         return result
 
     if service == "wazuh":

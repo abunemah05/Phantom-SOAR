@@ -179,7 +179,7 @@ def test_configuration_categories_and_defaults(client, admin_headers):
     from backend.integration_config import INTEGRATION_KEYS
 
     data = client.get("/api/configuration", headers=admin_headers).json()
-    assert set(data) == {"TIP", "SIEM", "IAM", "ITSM", "ORCHESTRATION", "AGENT"}
+    assert set(data) == {"TIP", "SIEM", "IAM", "ITSM", "ORCHESTRATION", "AGENT", "AI"}  # AI added with the OpenRouter triage
     listed = {key for keys in data.values() for key in keys}
     assert listed == set(INTEGRATION_KEYS)
 
@@ -188,7 +188,8 @@ def test_configuration_categories_and_defaults(client, admin_headers):
     assert data["AGENT"]["agent_min_confidence"]["value"] == "0.85"
     assert data["SIEM"]["siem_manager_url"]["value"] == ""
     assert data["SIEM"]["siem_manager_url"]["is_set"] is False
-    for key in ("virustotal_api_key", "siem_password", "okta_api_token", "slack_webhook_url", "jira_webhook_url"):
+    for key in ("virustotal_api_key", "siem_password", "okta_api_token", "slack_webhook_url", "jira_webhook_url",
+                "openrouter_api_key"):
         assert data[INTEGRATION_KEYS[key][0]][key]["is_secret"] is True
     assert set(data["TIP"]["virustotal_api_key"]) >= {"value", "is_secret", "is_set", "preview", "updated_at"}
 
@@ -245,7 +246,8 @@ def test_runtime_status_shape(client, admin_headers):
     data = res.json()
     assert data["simulation_mode"] is True
     assert isinstance(data["hotl_enabled"], bool)
-    assert set(data["integrations"]) == {"virustotal", "abuseipdb", "otx", "threatfox", "nvd", "wazuh", "okta", "jira", "slack"}
+    assert set(data["integrations"]) == {"virustotal", "abuseipdb", "otx", "threatfox", "nvd", "wazuh", "okta", "jira", "slack",
+                                         "ai"}
     assert all(isinstance(v, bool) for v in data["integrations"].values())
     assert not any(data["integrations"].values())  # tests run with no third-party credentials
 

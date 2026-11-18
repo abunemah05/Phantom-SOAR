@@ -80,6 +80,13 @@ INTEGRATION_KEYS: Dict[str, Tuple[str, str]] = {
     "protected_hosts": ("ORCHESTRATION", "PHANTOM_PROTECTED_HOSTS"),
     "protected_users": ("ORCHESTRATION", "PHANTOM_PROTECTED_USERS"),
     "protected_ips": ("ORCHESTRATION", "PHANTOM_PROTECTED_IPS"),
+    # Built-in AI triage (OpenRouter). Off by default; see backend/engine/ai_triage.py.
+    "openrouter_api_key": ("AI", "OPENROUTER_API_KEY"),
+    "openrouter_model": ("AI", "OPENROUTER_MODEL"),
+    "ai_enabled": ("AI", "PHANTOM_AI_ENABLED"),
+    "ai_auto_triage": ("AI", "PHANTOM_AI_AUTO_TRIAGE"),
+    "ai_max_alerts_per_minute": ("AI", "PHANTOM_AI_MAX_ALERTS_PER_MINUTE"),
+    "ai_send_raw_payload": ("AI", "PHANTOM_AI_SEND_RAW_PAYLOAD"),
     # AI agent guardrails
     "agent_min_confidence": ("AGENT", "PHANTOM_AGENT_MIN_CONFIDENCE"),
     "agent_autonomy": ("AGENT", "PHANTOM_AGENT_AUTONOMY"),  # recommend_only | low_impact | policy
@@ -99,6 +106,12 @@ DEFAULTS: Dict[str, str] = {
     "siem_verify_tls": "true",
     "agent_min_confidence": "0.85",
     "agent_autonomy": "recommend_only",
+    # AI triage is opt-in: nothing is sent to a model until an operator enables it and adds a key.
+    "openrouter_model": "openai/gpt-6.1-terra",  # = backend.integrations.llm.DEFAULT_MODEL (kept in sync by a test)
+    "ai_enabled": "false",
+    "ai_auto_triage": "false",
+    "ai_max_alerts_per_minute": "10",
+    "ai_send_raw_payload": "false",
 }
 
 _TRUE = {"1", "true", "yes", "on"}
@@ -142,6 +155,27 @@ def get_setting(key_name: str, db: Optional[Session] = None, default: Optional[s
     if str(value).strip() == "":
         value = default if default is not None else DEFAULTS.get(key_name, "")
     return str(value).strip()
+
+
+def setting_source(key_name: str, db: Optional[Session] = None) -> Optional[str]:
+    """Where a setting's effective value comes from: "database", "environment", "default" or None (not set).
+    Never returns the value itself, so it is safe for status endpoints."""
+    category, env_var = INTEGRATION_KEYS.get(key_name, ("", key_name.upper()))
+    if category:
+        own_session = db is None
+        session = SessionLocal() if own_session else db
+        try:
+            stored = _read_db_value(session, category, key_name)
+        except Exception:
+            stored = None
+        finally:
+            if own_session:
+                session.close()
+        if stored is not None and str(stored).strip():
+            return "database"
+    if os.getenv(env_var, "").strip():
+        return "environment"
+    return "default" if DEFAULTS.get(key_name) else None
 
 
 def get_bool(key_name: str, db: Optional[Session] = None) -> bool:

@@ -28,6 +28,7 @@ from backend.routers import (
     logs_router,
     reports_router,
     ingest_tokens_router,
+    agent_router,
     ensure_default_user,
     ensure_default_configurations
 )
@@ -166,6 +167,8 @@ app.include_router(playbooks_router, prefix=settings.API_V1_STR, dependencies=_u
 app.include_router(demo_router, prefix=settings.API_V1_STR, dependencies=_user_session)
 app.include_router(logs_router, prefix=settings.API_V1_STR)
 app.include_router(ingest_tokens_router, prefix=settings.API_V1_STR)  # admin-only, per route
+# AI triage: operator routes use the user session, agent routes use the service-account key (per route, not router level).
+app.include_router(agent_router, prefix=settings.API_V1_STR)
 
 @app.get("/")
 def root():

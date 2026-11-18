@@ -11,6 +11,9 @@ IOCs still "pending", severity escalation is computed from the original payload)
                                   by the webhook so the HTTP request returns quickly
   tasks.re_enrich_iocs            delayed re-enrichment of IOCs whose providers were rate limited
   tasks.process_alert             playbook routing only (kept for older callers)
+  tasks.ai_triage_alert           built-in AI triage of one alert; queued after enrichment and routing ONLY when
+                                  ai_enabled and ai_auto_triage are both on (default off); skips alerts that
+                                  already have an AI proposal, so redelivery never triages twice
   tasks.maintenance               periodic housekeeping (celery beat, every MAINTENANCE_INTERVAL_SECONDS):
                                   purge expired logs and revoked tokens, resume alerts whose worker died
 
@@ -182,7 +185,31 @@ def enrich_and_process_alert_task(self, alert_id: int):
         from backend.engine.ingest import enrich_and_process_alert
         return enrich_and_process_alert(alert_id)
 
-    return run_guarded(self, alert_id, "enrich_and_process_alert", _run)
+    result = run_guarded(self, alert_id, "enrich_and_process_alert", _run)
+    # Enrichment and routing are done: queue the (optional, default off) AI triage. Never raises.
+    from backend.engine.ai_triage import maybe_enqueue_auto_triage
+    maybe_enqueue_auto_triage(alert_id)
+    return result
+
+
+AI_TRIAGE_MAX_RETRIES = 3
+
+
+@celery_app.task(name="tasks.ai_triage_alert", bind=True, max_retries=MAX_TASK_RETRIES, ignore_result=True)
+def ai_triage_task(self, alert_id: int):
+    """AI triage of one alert (idempotent). Rate limits, a busy alert and transient model errors are retried later."""
+    logger.info(f"[Celery] AI triage of Alert #{alert_id}.")
+
+    def _run():
+        from backend.engine.ai_triage import auto_triage_alert
+        return auto_triage_alert(alert_id)
+
+    result = run_guarded(self, alert_id, "ai_triage_alert", _run)
+    retry_after = result.get("retry_after") if isinstance(result, dict) else None
+    if retry_after and int(getattr(self.request, "retries", 0) or 0) < AI_TRIAGE_MAX_RETRIES:
+        # Outside run_guarded: Retry is control flow, not a failure to record.
+        raise self.retry(countdown=int(min(max(retry_after, 5), 300)), max_retries=AI_TRIAGE_MAX_RETRIES)
+    return result
 
 
 @celery_app.task(name="tasks.re_enrich_iocs", bind=True, max_retries=MAX_TASK_RETRIES, ignore_result=True)
