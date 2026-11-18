@@ -1,28 +1,36 @@
 "use client";
 
-import React, { createContext, useCallback, useContext, useEffect, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { api, getStoredToken, getStoredUser, subscribeToAuth, syncCurrentUser, LOGIN_PATH } from "@/lib/api";
-import { needsPasswordChange } from "@/lib/roles";
+import { needsMfaEnrollment, needsPasswordChange } from "@/lib/roles";
 import { User } from "@/lib/types";
 
 interface AuthContextValue {
   user: User | null;
   logout: () => Promise<void>;
+  /** Re-read the profile from the backend (e.g. after enabling or disabling MFA). */
+  refreshUser: () => Promise<User | null>;
 }
 
 const AuthContext = createContext<AuthContextValue>({
   user: null,
   logout: async () => {},
+  refreshUser: async () => null,
 });
 
 export function useAuth(): AuthContextValue {
   return useContext(AuthContext);
 }
 
+/** A session that may not use the console yet: the sign-in page owns the password and MFA enrolment forms. */
+function mustFinishSignIn(user: User | null): boolean {
+  return needsPasswordChange(user) || needsMfaEnrollment(user);
+}
+
 /**
- * Client-side session gate. Every route except /login requires a stored token that the
- * backend still accepts (/auth/me), and an account that does not owe a password change.
+ * Client-side session gate. Every route except /login requires a stored token that the backend still accepts
+ * (/auth/me) and an account that owes neither a password change nor mandatory MFA enrolment.
  * The backend enforces the same rules on every request; this only keeps the UI consistent.
  */
 export default function AuthGate({ children }: { children: React.ReactNode }) {
@@ -46,15 +54,14 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
     let cancelled = false;
 
     const token = getStoredToken();
-    const stored = getStoredUser();
-    if (!token || needsPasswordChange(stored)) {
+    if (!token || mustFinishSignIn(getStoredUser())) {
       sendToLogin();
       return;
     }
 
     syncCurrentUser().then((live) => {
       if (cancelled) return;
-      if (!live || needsPasswordChange(live)) {
+      if (!live || mustFinishSignIn(live)) {
         sendToLogin();
         return;
       }
@@ -70,7 +77,7 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     return subscribeToAuth((updated) => {
       setUser(updated);
-      if ((!updated || needsPasswordChange(updated)) && window.location.pathname !== LOGIN_PATH) {
+      if ((!updated || mustFinishSignIn(updated)) && window.location.pathname !== LOGIN_PATH) {
         sendToLogin();
       }
     });
@@ -82,18 +89,26 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
     sendToLogin();
   }, [sendToLogin]);
 
+  const refreshUser = useCallback(async () => {
+    const live = await syncCurrentUser();
+    setUser(live);
+    return live;
+  }, []);
+
+  const value = useMemo(() => ({ user, logout, refreshUser }), [user, logout, refreshUser]);
+
   if (isPublic) {
-    return <AuthContext.Provider value={{ user, logout }}>{children}</AuthContext.Provider>;
+    return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
   }
 
   if (!verified) {
     return (
-      <div className="min-h-screen w-full flex flex-col items-center justify-center space-y-3 bg-slate-950">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500" />
+      <div role="status" className="min-h-screen w-full flex flex-col items-center justify-center space-y-3 bg-slate-950">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500" aria-hidden="true" />
         <p className="text-sm text-slate-400">Verifying session...</p>
       </div>
     );
   }
 
-  return <AuthContext.Provider value={{ user, logout }}>{children}</AuthContext.Provider>;
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

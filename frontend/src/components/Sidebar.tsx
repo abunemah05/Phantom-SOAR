@@ -14,11 +14,13 @@ import {
   Terminal,
   BarChart3,
   Lock,
-  FlaskConical
+  FlaskConical,
+  Bot,
+  KeyRound
 } from "lucide-react";
 import { useAuth } from "@/components/AuthGate";
 import { useRuntimeStatus } from "@/components/RuntimeStatusProvider";
-import { isAdmin, isSecEngOrAdmin } from "@/lib/roles";
+import { accessLabel, isAdmin, isSecEngOrAdmin } from "@/lib/roles";
 
 type Access = "all" | "sec_eng" | "admin";
 
@@ -32,11 +34,13 @@ interface NavItem {
 const navItems: NavItem[] = [
   { name: "Dashboard", href: "/", icon: LayoutDashboard, access: "all" },
   { name: "Alerts & Cases", href: "/alerts", icon: ShieldAlert, access: "all" },
+  { name: "AI Agent", href: "/agent", icon: Bot, access: "all" },
   { name: "Playbooks", href: "/playbooks", icon: ScrollText, access: "all" },
   { name: "Logs & Telemetry", href: "/logs", icon: Terminal, access: "all" },
   { name: "Admin Reports", href: "/reports", icon: BarChart3, access: "admin" },
   { name: "Configuration", href: "/configuration", icon: Sliders, access: "sec_eng" },
   { name: "Accounts & IAM", href: "/accounts", icon: Users, access: "admin" },
+  { name: "My Security", href: "/security", icon: KeyRound, access: "all" },
 ];
 
 const ACCESS_BADGE: Record<Access, string | null> = {
@@ -64,7 +68,7 @@ export default function Sidebar() {
   const tipConfigured = integrations ? TIP_PROVIDERS.filter((p) => integrations[p]).length : null;
 
   return (
-    <aside className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col h-screen fixed left-0 top-0 select-none z-30">
+    <aside aria-label="Primary" className="w-64 bg-slate-950 border-r border-slate-800 flex flex-col h-screen fixed left-0 top-0 select-none z-30">
       {/* Brand Header */}
       <div className="p-5 border-b border-slate-800/80 flex items-center justify-between">
         <div className="flex items-center space-x-3">
@@ -86,7 +90,7 @@ export default function Sidebar() {
       </div>
 
       {/* Main Navigation */}
-      <div className="flex-1 py-6 px-3 space-y-1.5 overflow-y-auto">
+      <nav aria-label="Main navigation" className="flex-1 py-6 px-3 space-y-1.5 overflow-y-auto">
         <div className="px-3 pb-2 text-[11px] font-bold text-slate-500 uppercase tracking-wider">
           Operations Core
         </div>
@@ -100,7 +104,9 @@ export default function Sidebar() {
             <Link
               key={item.name}
               href={item.href}
-              className={`flex items-center justify-between px-3.5 py-2.5 rounded-lg text-sm font-medium transition-all duration-150 group ${
+              aria-current={isActive ? "page" : undefined}
+              title={restricted ? `${item.name} needs the ${badge} role; the backend will refuse access for your role.` : undefined}
+              className={`flex items-center justify-between px-3.5 py-2.5 rounded-lg text-sm font-medium transition-all duration-150 group focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
                 isActive
                   ? "bg-blue-600 text-white shadow-md shadow-blue-600/25"
                   : restricted
@@ -172,12 +178,12 @@ export default function Sidebar() {
             <div className="flex items-center justify-between text-slate-300">
               <span className="font-medium">Your access</span>
               <span className="text-[10px] text-purple-400 bg-purple-500/10 px-1.5 py-0.5 rounded font-mono">
-                {admin ? "Admin" : secEng ? "Sec Eng" : "Analyst"}
+                {accessLabel(user)}
               </span>
             </div>
           </div>
         </div>
-      </div>
+      </nav>
 
       {/* User Profile & Logout Footer */}
       <div className="p-3 border-t border-slate-800/80 bg-slate-950/80 space-y-2">
@@ -198,8 +204,9 @@ export default function Sidebar() {
 
           <button
             onClick={logout}
-            className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-950/40 text-slate-400 hover:text-rose-400 transition"
+            className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-950/40 text-slate-400 hover:text-rose-400 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-400"
             title="Sign out (revokes this session token)"
+            aria-label="Sign out"
           >
             <LogOut className="h-4 w-4" />
           </button>

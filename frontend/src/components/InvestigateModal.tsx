@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   X,
   ShieldAlert,
@@ -22,9 +22,9 @@ import {
   FlaskConical,
   ChevronDown,
   ChevronRight,
-  AlertCircle,
   ScrollText,
-  Bot
+  Bot,
+  Loader2,
 } from "lucide-react";
 import {
   AgentProposal,
@@ -33,10 +33,21 @@ import {
   ContainmentAction,
   IocArtifact,
   TipProviderResult,
-  VulnerabilityIntel
+  VulnerabilityIntel,
 } from "@/lib/types";
 import { api } from "@/lib/api";
+import { ApiError, describeError, errorBlockers } from "@/lib/errors";
 import { formatDateTime, formatDuration, parseApiDate } from "@/lib/format";
+import { canRespond } from "@/lib/roles";
+import { enrichmentMeta, nvdCveStatusMeta, nvdLookupMessage, providerStatusMeta, retryText } from "@/lib/status";
+import { useModalBehavior } from "./Dialog";
+import { useAuth } from "./AuthGate";
+import { useConfirm } from "./ConfirmDialog";
+import { useRuntimeStatus } from "./RuntimeStatusProvider";
+import { useToast } from "./Toast";
+import ProposalPanel from "./agent/ProposalPanel";
+import { ErrorState, InlineNotice, LoadingState } from "./StateViews";
+import { AlertStatusBadge, ExecutionModeBadge, SeverityBadge, VerdictBadge } from "./StatusBadges";
 
 interface InvestigateModalProps {
   alertId: number | null;
@@ -57,83 +68,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   threatfox: "ThreatFox",
 };
 
-const PROVIDER_STATUS: Record<string, { label: string; className: string; hint: string }> = {
-  live: {
-    label: "Live",
-    className: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30",
-    hint: "Answered by the provider's live API.",
-  },
-  not_found: {
-    label: "Not found",
-    className: "bg-slate-700/30 text-slate-300 border-slate-600/40",
-    hint: "The provider has no record of this indicator. That means no known reputation, not that it is malicious.",
-  },
-  not_configured: {
-    label: "Not configured",
-    className: "bg-slate-800 text-slate-400 border-slate-700",
-    hint: "No API key is configured for this provider.",
-  },
-  error: {
-    label: "Error",
-    className: "bg-rose-500/10 text-rose-400 border-rose-500/30",
-    hint: "The lookup failed (network, quota or authentication error).",
-  },
-  lab_fixture: {
-    label: "Lab fixture",
-    className: "bg-fuchsia-500/10 text-fuchsia-300 border-fuchsia-500/30",
-    hint: "Simulation mode: a fixed lab value for a documentation-range IP or demo IOC, not a real lookup.",
-  },
-  skipped: {
-    label: "Skipped",
-    className: "bg-slate-800 text-slate-400 border-slate-700",
-    hint: "Not looked up (private/reserved address or unsupported indicator type).",
-  },
-};
-
-const VERDICT_CLASS: Record<string, string> = {
-  malicious: "bg-rose-500/20 text-rose-400 border-rose-500/30",
-  suspicious: "bg-amber-500/20 text-amber-400 border-amber-500/30",
-  clean: "bg-emerald-500/20 text-emerald-400 border-emerald-500/30",
-  unknown: "bg-slate-700/40 text-slate-300 border-slate-600/50",
-};
-
 const VERDICT_RANK: Record<string, number> = { malicious: 3, suspicious: 2, clean: 1, unknown: 0 };
-
-const ENRICHMENT_LABELS: Record<string, { label: string; className: string }> = {
-  enriched: { label: "Enriched", className: "text-emerald-400" },
-  partial: { label: "Partially enriched", className: "text-amber-400" },
-  unavailable: { label: "Enrichment unavailable", className: "text-rose-400" },
-  not_configured: { label: "No TIP provider configured", className: "text-slate-400" },
-  pending: { label: "Enrichment pending", className: "text-blue-400" },
-};
-
-const EXECUTION_MODE: Record<string, { label: string; className: string; hint: string }> = {
-  live: {
-    label: "LIVE",
-    className: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30",
-    hint: "A real API call was made to the connector.",
-  },
-  simulated: {
-    label: "SIMULATED",
-    className: "bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/40",
-    hint: "Connector not configured and simulation mode is on: nothing was changed on a real system.",
-  },
-  skipped: {
-    label: "SKIPPED",
-    className: "bg-slate-700/40 text-slate-300 border-slate-600/50",
-    hint: "Connector not configured and simulation mode is off: the action was not performed.",
-  },
-  blocked: {
-    label: "BLOCKED",
-    className: "bg-amber-500/10 text-amber-400 border-amber-500/30",
-    hint: "The policy engine refused this action.",
-  },
-  failed: {
-    label: "FAILED",
-    className: "bg-rose-500/10 text-rose-400 border-rose-500/30",
-    hint: "The connector returned an error.",
-  },
-};
 
 const ENTITY_LABELS: Array<[keyof AlertEntities, string]> = [
   ["hosts", "Hosts"],
@@ -145,34 +80,6 @@ const ENTITY_LABELS: Array<[keyof AlertEntities, string]> = [
   ["domains", "Domains"],
   ["urls", "URLs"],
 ];
-
-const NVD_LOOKUP_LABELS: Record<string, string> = {
-  live: "Live NVD lookup",
-  partial: "Partial: some NVD lookups failed",
-  not_configured: "NVD lookup not configured",
-  unavailable: "NVD unreachable",
-  no_cves: "No CVE identifiers in the alert text",
-};
-
-const PROPOSAL_STATUS: Record<string, { label: string; className: string }> = {
-  pending_approval: { label: "Awaiting analyst decision", className: "bg-amber-500/10 text-amber-400 border-amber-500/30" },
-  auto_executed: { label: "Auto-executed by policy", className: "bg-blue-500/10 text-blue-300 border-blue-500/30" },
-  partially_executed: { label: "Partially executed", className: "bg-blue-500/10 text-blue-300 border-blue-500/30" },
-  approved: { label: "Approved by analyst", className: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30" },
-  rejected: { label: "Rejected by analyst", className: "bg-rose-500/10 text-rose-400 border-rose-500/30" },
-  blocked: { label: "Blocked by policy", className: "bg-rose-500/10 text-rose-400 border-rose-500/30" },
-  no_action: { label: "No action proposed", className: "bg-slate-800 text-slate-400 border-slate-700" },
-};
-
-function policyText(decision: Record<string, any> | undefined): { text: string; className: string } {
-  if (!decision) return { text: "—", className: "text-slate-500" };
-  const d = (decision.decision && typeof decision.decision === "object" ? decision.decision : decision) as Record<string, any>;
-  const reasons = Array.isArray(d.reasons) ? d.reasons.join("; ") : "";
-  if (d.allowed === false) return { text: `Denied${reasons ? `: ${reasons}` : ""}`, className: "text-rose-400" };
-  if (d.requires_approval) return { text: `Needs approval${reasons ? `: ${reasons}` : ""}`, className: "text-amber-400" };
-  if (d.allowed) return { text: `Allowed${reasons ? `: ${reasons}` : ""}`, className: "text-emerald-400" };
-  return { text: reasons || "—", className: "text-slate-400" };
-}
 
 function providerLabel(key: string, p?: TipProviderResult): string {
   return PROVIDER_LABELS[key] || PROVIDER_LABELS[p?.provider || ""] || p?.provider || key;
@@ -200,33 +107,6 @@ function iocHasEvidence(ioc: IocArtifact): boolean {
 
 function verdictOf(ioc: IocArtifact): string {
   return ioc.verdict || "Unknown";
-}
-
-function VerdictBadge({ verdict }: { verdict: string }) {
-  return (
-    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${VERDICT_CLASS[verdict.toLowerCase()] || VERDICT_CLASS.unknown}`}>
-      {verdict}
-    </span>
-  );
-}
-
-function ExecutionModeBadge({ mode }: { mode?: string | null }) {
-  const meta = mode ? EXECUTION_MODE[mode.toLowerCase()] : undefined;
-  if (!meta) {
-    return (
-      <span
-        className="px-2 py-0.5 rounded text-[10px] font-bold font-mono border bg-slate-800 text-slate-400 border-slate-700"
-        title="Recorded before execution modes were tracked."
-      >
-        {mode ? mode.toUpperCase() : "UNRECORDED"}
-      </span>
-    );
-  }
-  return (
-    <span className={`px-2 py-0.5 rounded text-[10px] font-bold font-mono border ${meta.className}`} title={meta.hint}>
-      {meta.label}
-    </span>
-  );
 }
 
 function formatSummaryValue(value: unknown): string {
@@ -262,36 +142,43 @@ export default function InvestigateModal({
   onClose,
   onAlertUpdated,
 }: InvestigateModalProps) {
+  const { user } = useAuth();
+  const { status: runtime } = useRuntimeStatus();
+  const toast = useToast();
+  const confirm = useConfirm();
+  const responder = canRespond(user);
+
   const [detail, setDetail] = useState<AlertDetail | null>(null);
   const [vulnIntel, setVulnIntel] = useState<VulnerabilityIntel | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [actionLoading, setActionLoading] = useState<boolean>(false);
+  const [triaging, setTriaging] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [triageError, setTriageError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabId>("context");
   const [copiedPayload, setCopiedPayload] = useState<boolean>(false);
   const [expandedActions, setExpandedActions] = useState<Record<number, boolean>>({});
+  const containerRef = useRef<HTMLDivElement>(null);
+  const loadedFor = useRef<number | null>(null);
 
-  const fetchAlertDetail = useCallback(async (id: number) => {
-    setLoading(true);
+  useModalBehavior(containerRef, isOpen && alertId !== null, onClose);
+
+  /**
+   * The alert detail already carries vulnerability_intel, so the NVD data is not fetched a second time on open.
+   * A dedicated refresh (GET /vulnerabilities) runs only while NVD reports pending or partial results.
+   */
+  const fetchAlertDetail = useCallback(async (id: number, quiet = false) => {
+    if (!quiet) setLoading(true);
     setError(null);
     try {
-      const [data, vIntel] = await Promise.allSettled([
-        api.getAlertDetail(id),
-        api.getAlertVulnerabilities(id),
-      ]);
-      if (data.status !== "fulfilled") {
-        throw data.reason instanceof Error ? data.reason : new Error("Failed to load alert details.");
-      }
-      setDetail(data.value);
-      if (vIntel.status === "fulfilled") {
-        setVulnIntel(vIntel.value);
-      } else {
-        setVulnIntel(data.value.vulnerability_intel ?? null);
-      }
-    } catch (err: any) {
-      setError(err.message || "Failed to load alert details.");
+      const data = await api.getAlertDetail(id);
+      if (loadedFor.current !== null && loadedFor.current !== id) return;
+      setDetail(data);
+      setVulnIntel(data.vulnerability_intel ?? null);
+    } catch (err) {
+      setError(describeError(err, "Failed to load alert details."));
     } finally {
       setLoading(false);
     }
@@ -299,16 +186,43 @@ export default function InvestigateModal({
 
   useEffect(() => {
     if (isOpen && alertId) {
+      loadedFor.current = alertId;
       setActiveTab("context");
       setActionError(null);
       setActionNotice(null);
+      setTriageError(null);
       setExpandedActions({});
-      fetchAlertDetail(alertId);
+      void fetchAlertDetail(alertId);
     } else {
+      loadedFor.current = null;
       setDetail(null);
       setVulnIntel(null);
+      setError(null);
     }
   }, [isOpen, alertId, fetchAlertDetail]);
+
+  // Follow up on a queued or partial NVD lookup (a few tries, then the analyst can reopen the case).
+  const nvdState = (vulnIntel?.lookup_status || vulnIntel?.status || "").toLowerCase();
+  const nvdPending = nvdState === "pending" || nvdState === "partial";
+  useEffect(() => {
+    if (!isOpen || !alertId || !nvdPending) return;
+    let tries = 0;
+    const id = alertId;
+    const timer = setInterval(async () => {
+      tries += 1;
+      if (tries > 5 || document.visibilityState === "hidden") {
+        if (tries > 5) clearInterval(timer);
+        return;
+      }
+      try {
+        const fresh = await api.getAlertVulnerabilities(id);
+        if (loadedFor.current === id) setVulnIntel(fresh);
+      } catch {
+        // The detail view keeps showing the last NVD state; the next tick or a reopen retries.
+      }
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [isOpen, alertId, nvdPending]);
 
   if (!isOpen || !alertId) return null;
 
@@ -319,34 +233,101 @@ export default function InvestigateModal({
     setActionNotice(null);
     try {
       await fn();
-      await fetchAlertDetail(detail.alert_id);
+      await fetchAlertDetail(detail.alert_id, true);
       if (successText) setActionNotice(successText);
       if (onAlertUpdated) onAlertUpdated();
-    } catch (err: any) {
-      setActionError(`${label} failed: ${err.message || "request failed"}`);
+    } catch (err) {
+      const blockers = errorBlockers(err);
+      setActionError(`${label} failed: ${describeError(err)}${blockers.length ? ` (${blockers.join("; ")})` : ""}`);
     } finally {
       setActionLoading(false);
     }
   };
 
-  const handleApprove = () =>
-    runAction("Approval", () => api.approveAlert(detail!.alert_id), "Containment approved. Check each action's execution mode in Response Actions.");
-  const handleDismiss = () =>
-    runAction("Dismissal", () => api.dismissAlert(detail!.alert_id), "Alert dismissed.");
-  const handleLowTicketKeep = () =>
-    runAction(
+  const simulationOn = (detail?.simulation_mode ?? runtime?.simulation_mode) === true;
+  const consequence = simulationOn
+    ? "Simulation mode is on: each action is only rehearsed and recorded as SIMULATED. Nothing real changes and the alert is not contained."
+    : "Each action runs against the connector and may change real systems. Protected assets are refused by policy.";
+
+  const handleApprove = async () => {
+    if (!detail) return;
+    const ok = await confirm({
+      title: `Approve containment for alert #${detail.alert_id}?`,
+      message: `You approve the containment actions chosen by the matched playbook${detail.playbook ? ` (${detail.playbook.name})` : ""}.`,
+      items: [consequence, "The decision is recorded under your username."],
+      confirmLabel: "Approve containment",
+      tone: simulationOn ? "default" : "danger",
+    });
+    if (!ok) return;
+    await runAction(
+      "Approval",
+      () => api.approveAlert(detail.alert_id),
+      simulationOn ? "Approved. Actions were simulated: the alert is NOT contained." : "Containment approved. Check each action's execution mode in Response Actions."
+    );
+  };
+
+  const handleDismiss = async () => {
+    if (!detail) return;
+    const ok = await confirm({
+      title: `Dismiss alert #${detail.alert_id}?`,
+      message: "No containment runs and the alert is closed as a dismissed (false positive / accepted) case.",
+      items: ["The decision is recorded under your username."],
+      confirmLabel: "Dismiss alert",
+      tone: "warning",
+    });
+    if (!ok) return;
+    await runAction("Dismissal", () => api.dismissAlert(detail.alert_id), "Alert dismissed.");
+  };
+
+  const handleLowTicketKeep = async () => {
+    if (!detail) return;
+    const ok = await confirm({
+      title: `Keep alert #${detail.alert_id} under monitoring?`,
+      message: "No containment runs. The alert stays open with status Monitoring.",
+      confirmLabel: "Keep and monitor",
+    });
+    if (!ok) return;
+    await runAction(
       "Keep & monitor",
-      () => api.submitAlertDecision(detail!.alert_id, "keep_and_monitor", "Analyst confirmed monitoring for low-risk activity."),
+      () => api.submitAlertDecision(detail.alert_id, "keep_and_monitor", "Analyst confirmed monitoring for low-risk activity."),
       "Alert kept under monitoring."
     );
-  const handleLowTicketTakeAction = () =>
-    runAction(
+  };
+
+  const handleLowTicketTakeAction = async () => {
+    if (!detail) return;
+    const ok = await confirm({
+      title: `Take action on alert #${detail.alert_id}?`,
+      message: "You escalate this low-severity alert for containment.",
+      items: [consequence, "The decision is recorded under your username."],
+      confirmLabel: "Take action",
+      tone: simulationOn ? "default" : "danger",
+    });
+    if (!ok) return;
+    await runAction(
       "Take action",
-      () => api.submitAlertDecision(detail!.alert_id, "take_action", "Analyst escalated a low-severity alert for containment."),
-      "Containment requested. Check each action's execution mode in Response Actions."
+      () => api.submitAlertDecision(detail.alert_id, "take_action", "Analyst escalated a low-severity alert for containment."),
+      simulationOn ? "Requested. Actions were simulated: the alert is NOT contained." : "Containment requested. Check each action's execution mode in Response Actions."
     );
-  const handleExecuteNvdHotl = () =>
-    runAction("NVD-recommended containment", () => api.executeNvdHotl(detail!.alert_id));
+  };
+
+  const handleExecuteNvdHotl = async () => {
+    if (!detail) return;
+    const action = vulnIntel?.hotl_autonomous_policy?.action_description || vulnIntel?.hotl_autonomous_policy?.action_type;
+    const ok = await confirm({
+      title: "Run NVD-recommended containment?",
+      message: `Runs the containment recommended for the critical CVE${action ? `: ${action}` : ""}.`,
+      items: [consequence, "Each action still passes the policy engine and is labelled live or simulated."],
+      confirmLabel: "Run containment",
+      tone: simulationOn ? "default" : "danger",
+    });
+    if (!ok) return;
+    await runAction(
+      "NVD-recommended containment",
+      () => api.executeNvdHotl(detail.alert_id),
+      simulationOn ? "Simulated only: the alert is NOT contained." : "NVD-recommended containment was executed."
+    );
+  };
 
   const handleBackgroundTipEnrich = async () => {
     if (!detail) return;
@@ -355,14 +336,38 @@ export default function InvestigateModal({
     try {
       await api.triggerBackgroundTipEnrichment(detail.alert_id);
       setActionNotice("Re-enrichment queued. Results refresh shortly.");
-      setTimeout(async () => {
-        await fetchAlertDetail(detail.alert_id);
+      const id = detail.alert_id;
+      setTimeout(() => {
+        if (loadedFor.current !== id) return;
+        void fetchAlertDetail(id, true);
         if (onAlertUpdated) onAlertUpdated();
-      }, 1500);
-    } catch (err: any) {
-      setActionError(`Re-enrichment failed: ${err.message || "request failed"}`);
+      }, 2000);
+    } catch (err) {
+      setActionError(`Re-enrichment failed: ${describeError(err)}`);
     } finally {
       setActionLoading(false);
+    }
+  };
+
+  const handleRunTriage = async () => {
+    if (!detail) return;
+    setTriaging(true);
+    setTriageError(null);
+    try {
+      const proposal = await api.triageAlert(detail.alert_id);
+      toast.success(`AI triage finished: verdict ${proposal.verdict}, status ${proposal.status.replace(/_/g, " ")}.`);
+      await fetchAlertDetail(detail.alert_id, true);
+      setActiveTab("agent");
+      if (onAlertUpdated) onAlertUpdated();
+    } catch (err) {
+      // 409: AI disabled, no key, rate limited (Retry-After), alert still Processing or already being triaged.
+      // 502: the model call failed (the message is already safe to show).
+      const retry = err instanceof ApiError && err.status === 409 ? retryText(err.retryAfterSeconds) : "";
+      const prefix = err instanceof ApiError && err.status === 502 ? "The AI model call failed: " : "";
+      setTriageError(`${prefix}${describeError(err, "AI triage failed.")}${retry ? ` (${retry})` : ""}`);
+      setActiveTab("agent");
+    } finally {
+      setTriaging(false);
     }
   };
 
@@ -370,47 +375,24 @@ export default function InvestigateModal({
     setActionError(null);
     try {
       await api.downloadAlertReport(alertId);
-    } catch (err: any) {
-      setActionError(`PDF report unavailable: ${err.message || "request failed"}`);
+    } catch (err) {
+      setActionError(`PDF report unavailable: ${describeError(err)}`);
     }
   };
 
-  const copyPayload = () => {
+  const copyPayload = async () => {
     if (!detail?.raw_payload) return;
-    navigator.clipboard.writeText(JSON.stringify(detail.raw_payload, null, 2));
-    setCopiedPayload(true);
-    setTimeout(() => setCopiedPayload(false), 2000);
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(detail.raw_payload, null, 2));
+      setCopiedPayload(true);
+      setTimeout(() => setCopiedPayload(false), 2000);
+    } catch {
+      setActionError("Could not copy to the clipboard. Select the JSON and copy it manually.");
+    }
   };
 
   const toggleAction = (id: number) =>
     setExpandedActions((prev) => ({ ...prev, [id]: !prev[id] }));
-
-  const getSeverityBadge = (severity: string) => {
-    switch (severity.toLowerCase()) {
-      case "critical":
-        return "bg-rose-500/10 text-rose-400 border-rose-500/30";
-      case "high":
-        return "bg-orange-500/10 text-orange-400 border-orange-500/30";
-      case "medium":
-        return "bg-amber-500/10 text-amber-400 border-amber-500/30";
-      default:
-        return "bg-blue-500/10 text-blue-400 border-blue-500/30";
-    }
-  };
-
-  const getStatusBadge = (status: string) => {
-    switch (status.toLowerCase()) {
-      case "contained":
-        return "bg-emerald-500/10 text-emerald-400 border-emerald-500/30";
-      case "triaged":
-        return "bg-amber-500/10 text-amber-400 border-amber-500/30";
-      case "closed":
-      case "resolved":
-        return "bg-slate-500/10 text-slate-400 border-slate-500/30";
-      default:
-        return "bg-blue-500/10 text-blue-400 border-blue-500/30";
-    }
-  };
 
   // --- Derived state ---------------------------------------------------------
   const iocs = detail?.ioc_artifacts ?? [];
@@ -450,13 +432,13 @@ export default function InvestigateModal({
   const isLowTicket = detail?.severity?.toLowerCase() === "low";
   const affectedAsset = detail?.raw_payload?.agent?.name || detail?.raw_payload?.agent?.ip || null;
 
-  const timeline: Array<{ at: string; title: string; detail?: string; kind: string }> = detail
+  const timeline: Array<{ at: string; title: string; detail?: string | null; kind: string }> = detail
     ? [
         { at: detail.created_at, title: `Alert ingested from ${detail.source}`, detail: `${detail.rule_id} · severity ${detail.severity}`, kind: "ingest" },
         ...iocs.map((ioc) => ({
           at: ioc.created_at,
           title: `IOC ${ioc.artifact_type} ${ioc.value}`,
-          detail: `Verdict ${verdictOf(ioc)} · ${ENRICHMENT_LABELS[ioc.enrichment_status || ""]?.label || ioc.enrichment_status || "enrichment status not recorded"}`,
+          detail: `Verdict ${verdictOf(ioc)} · ${enrichmentMeta(ioc.enrichment_status).label}`,
           kind: "ioc",
         })),
         ...(detail.playbook_executions ?? []).map((ex) => ({
@@ -531,6 +513,11 @@ export default function InvestigateModal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/85 backdrop-blur-md animate-fade-in">
       <div
+        ref={containerRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="investigate-title"
+        tabIndex={-1}
         className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-7xl h-[88vh] max-h-[92vh] flex flex-col shadow-2xl shadow-black overflow-hidden relative"
         onClick={(e) => e.stopPropagation()}
       >
@@ -538,21 +525,17 @@ export default function InvestigateModal({
         <div className="p-4 px-6 border-b border-slate-800 bg-slate-950/80 flex items-center justify-between flex-shrink-0">
           <div className="flex items-center space-x-3 overflow-hidden">
             <div className="h-9 w-9 rounded-xl bg-blue-600/20 border border-blue-500/30 flex items-center justify-center flex-shrink-0">
-              <ShieldAlert className="h-5 w-5 text-blue-400" />
+              <ShieldAlert className="h-5 w-5 text-blue-400" aria-hidden="true" />
             </div>
             <div className="overflow-hidden">
               <div className="flex items-center space-x-2">
-                <h2 className="text-base font-bold text-white tracking-wide truncate">
+                <h2 id="investigate-title" className="text-base font-bold text-white tracking-wide truncate">
                   Investigation Case #{alertId} {detail ? `— ${detail.rule_id}` : ""}
                 </h2>
                 {detail && (
                   <>
-                    <span className={`text-[10px] px-2 py-0.5 rounded-full border font-bold ${getSeverityBadge(detail.severity)}`}>
-                      {detail.severity}
-                    </span>
-                    <span className={`text-[10px] px-2 py-0.5 rounded-full border font-bold ${getStatusBadge(detail.status)}`}>
-                      {detail.status}
-                    </span>
+                    <SeverityBadge severity={detail.severity} />
+                    <AlertStatusBadge status={detail.status} />
                     {detail.simulation_mode && (
                       <span
                         className="text-[10px] px-2 py-0.5 rounded-full border font-black bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/40 flex items-center gap-1"
@@ -583,7 +566,9 @@ export default function InvestigateModal({
             </button>
 
             <button
+              type="button"
               onClick={onClose}
+              aria-label="Close investigation"
               className="h-8 w-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center transition border border-slate-700"
             >
               <X className="h-4 w-4" />
@@ -705,88 +690,121 @@ export default function InvestigateModal({
                 Response Actions
               </span>
 
-              {actionError && (
-                <div className="p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-400 text-[11px] flex items-start gap-1.5">
-                  <AlertCircle className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />
-                  <span>{actionError}</span>
-                </div>
+              <div aria-live="polite">
+                {actionError && (
+                  <InlineNotice tone="error" onDismiss={() => setActionError(null)}>{actionError}</InlineNotice>
+                )}
+                {actionNotice && !actionError && (
+                  <InlineNotice tone="success" onDismiss={() => setActionNotice(null)}>{actionNotice}</InlineNotice>
+                )}
+              </div>
+
+              {detail && (detail.status || "").toLowerCase() === "simulated" && (
+                <InlineNotice tone="warning">
+                  <b>Simulated, not contained.</b> Response actions were only rehearsed; the threat has not been stopped on any real system.
+                </InlineNotice>
               )}
-              {actionNotice && !actionError && (
-                <div className="p-2.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[11px]">
-                  {actionNotice}
-                </div>
+              {detail && (detail.status || "").toLowerCase() === "processing" && (
+                <InlineNotice tone="info">Still processing: ingest and playbook run are in flight. Decisions are available when it finishes.</InlineNotice>
               )}
 
-              {isLowTicket && detail?.status !== "Contained" && detail?.status !== "Closed" && (
+              {!responder && (
+                <p className="text-[11px] text-slate-500">
+                  Your role ({user?.role || "unknown"}) is read-only here: containment decisions and AI triage need an analyst role or above.
+                </p>
+              )}
+
+              {responder && isLowTicket && detail?.status !== "Contained" && detail?.status !== "Closed" && (
                 <div className="grid grid-cols-2 gap-2">
                   <button
-                    onClick={handleLowTicketKeep}
+                    type="button"
+                    onClick={() => void handleLowTicketKeep()}
                     disabled={actionLoading}
-                    className="py-2 px-2.5 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 text-xs font-bold transition flex items-center justify-center space-x-1 disabled:opacity-50"
+                    className="py-2 px-2.5 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-300 border border-blue-500/40 text-xs font-bold transition flex items-center justify-center space-x-1 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
                   >
-                    <Eye className="h-3.5 w-3.5" />
-                    <span>Keep & Monitor</span>
+                    <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Keep &amp; Monitor</span>
                   </button>
 
                   <button
-                    onClick={handleLowTicketTakeAction}
+                    type="button"
+                    onClick={() => void handleLowTicketTakeAction()}
                     disabled={actionLoading}
-                    className="py-2 px-2.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold shadow-md shadow-amber-600/25 transition flex items-center justify-center space-x-1 disabled:opacity-50"
+                    className="py-2 px-2.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold shadow-md shadow-amber-600/25 transition flex items-center justify-center space-x-1 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-300"
                   >
-                    <Zap className="h-3.5 w-3.5" />
+                    <Zap className="h-3.5 w-3.5" aria-hidden="true" />
                     <span>Take Action</span>
                   </button>
                 </div>
               )}
 
-              {!isLowTicket && detail?.status === "Triaged" && (
+              {responder && !isLowTicket && detail?.status === "Triaged" && (
                 <div className="grid grid-cols-2 gap-2">
                   <button
-                    onClick={handleDismiss}
+                    type="button"
+                    onClick={() => void handleDismiss()}
                     disabled={actionLoading}
-                    className="py-2 px-2.5 rounded-lg bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 text-xs font-bold transition flex items-center justify-center space-x-1 disabled:opacity-50"
+                    className="py-2 px-2.5 rounded-lg bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-500/40 text-xs font-bold transition flex items-center justify-center space-x-1 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-400"
                   >
-                    <XCircle className="h-3.5 w-3.5" />
+                    <XCircle className="h-3.5 w-3.5" aria-hidden="true" />
                     <span>Deny / Dismiss</span>
                   </button>
 
                   <button
-                    onClick={handleApprove}
+                    type="button"
+                    onClick={() => void handleApprove()}
                     disabled={actionLoading}
-                    className="py-2 px-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-md shadow-emerald-600/25 transition flex items-center justify-center space-x-1 disabled:opacity-50"
+                    className="py-2 px-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-md shadow-emerald-600/25 transition flex items-center justify-center space-x-1 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300"
                   >
-                    <CheckCircle2 className="h-3.5 w-3.5" />
+                    <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
                     <span>Approve Contain</span>
                   </button>
                 </div>
               )}
 
-              {vulnIntel?.hotl_autonomous_policy?.eligible_for_hotl && detail?.status !== "Contained" && (
+              {responder && vulnIntel?.hotl_autonomous_policy?.eligible_for_hotl && detail?.status !== "Contained" && (
                 <button
-                  onClick={handleExecuteNvdHotl}
+                  type="button"
+                  onClick={() => void handleExecuteNvdHotl()}
                   disabled={actionLoading}
                   title="Runs the containment recommended for a critical CVE. Each action still goes through the connector and is labelled live or simulated."
-                  className="w-full py-2 px-3 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow-md shadow-rose-600/25 transition flex items-center justify-center space-x-1.5 disabled:opacity-50"
+                  className="w-full py-2 px-3 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold shadow-md shadow-rose-600/25 transition flex items-center justify-center space-x-1.5 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-300"
                 >
-                  <ShieldAlert className="h-3.5 w-3.5" />
+                  <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
                   <span>Run NVD-Recommended Containment</span>
                 </button>
               )}
 
-              <button
-                onClick={handleBackgroundTipEnrich}
-                disabled={actionLoading}
-                className="w-full py-1.5 px-3 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-300 text-xs font-medium transition flex items-center justify-center space-x-1.5 disabled:opacity-50"
-              >
-                <RefreshCw className={`h-3 w-3 ${actionLoading ? "animate-spin text-blue-400" : ""}`} />
-                <span>Re-run Threat Intel Enrichment</span>
-              </button>
+              {responder && (
+                <button
+                  type="button"
+                  onClick={() => void handleRunTriage()}
+                  disabled={actionLoading || triaging || (detail?.status || "").toLowerCase() === "processing"}
+                  title="Ask the built-in AI to review this alert. It only proposes: every action is checked by the policy engine."
+                  className="w-full py-2 px-3 rounded-lg bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-200 border border-cyan-500/40 text-xs font-bold transition flex items-center justify-center space-x-1.5 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
+                >
+                  {triaging ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Bot className="h-3.5 w-3.5" aria-hidden="true" />}
+                  <span>{triaging ? "AI is reviewing..." : "Run AI triage"}</span>
+                </button>
+              )}
+
+              {responder && (
+                <button
+                  type="button"
+                  onClick={() => void handleBackgroundTipEnrich()}
+                  disabled={actionLoading}
+                  className="w-full py-1.5 px-3 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-300 text-xs font-medium transition flex items-center justify-center space-x-1.5 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                >
+                  <RefreshCw className={`h-3 w-3 ${actionLoading ? "animate-spin text-blue-400" : ""}`} aria-hidden="true" />
+                  <span>Re-run Threat Intel Enrichment</span>
+                </button>
+              )}
             </div>
           </div>
 
           {/* RIGHT MAIN VIEW — tabs */}
           <div className="lg:col-span-8 flex flex-col overflow-hidden bg-slate-900 min-h-0">
-            <div className="px-5 pt-3 border-b border-slate-800 bg-slate-950/40 flex items-center space-x-2 flex-shrink-0 overflow-x-auto">
+            <div role="tablist" aria-label="Case sections" className="px-5 pt-3 border-b border-slate-800 bg-slate-950/40 flex items-center space-x-2 flex-shrink-0 overflow-x-auto">
               {([
                 { id: "context", label: "Triage & Context", icon: ClipboardList },
                 { id: "intel", label: "Threat Intel", icon: Layers, badge: iocs.length ? String(iocs.length) : undefined },
@@ -800,8 +818,13 @@ export default function InvestigateModal({
                 return (
                   <button
                     key={tab.id}
+                    type="button"
+                    role="tab"
+                    id={`case-tab-${tab.id}`}
+                    aria-selected={isActive}
+                    aria-controls="case-tabpanel"
                     onClick={() => setActiveTab(tab.id)}
-                    className={`flex items-center space-x-2 px-3.5 py-2.5 rounded-t-lg text-xs font-bold border-b-2 transition whitespace-nowrap ${
+                    className={`flex items-center space-x-2 px-3.5 py-2.5 rounded-t-lg text-xs font-bold border-b-2 transition whitespace-nowrap focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
                       isActive
                         ? "border-blue-500 text-blue-400 bg-slate-900"
                         : "border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/50"
@@ -819,16 +842,11 @@ export default function InvestigateModal({
               })}
             </div>
 
-            <div className="flex-1 p-5 overflow-y-auto space-y-4 min-h-0">
+            <div role="tabpanel" id="case-tabpanel" aria-labelledby={`case-tab-${activeTab}`} className="flex-1 p-5 overflow-y-auto space-y-4 min-h-0">
               {loading && !detail ? (
-                <div className="flex flex-col items-center justify-center py-20 space-y-3">
-                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500" />
-                  <p className="text-sm text-slate-400">Loading incident telemetry & intelligence...</p>
-                </div>
-              ) : error ? (
-                <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-sm">
-                  {error}
-                </div>
+                <LoadingState label="Loading incident telemetry and intelligence..." />
+              ) : error && !detail ? (
+                <ErrorState title="The case could not be loaded" message={error} onRetry={() => void fetchAlertDetail(alertId)} />
               ) : detail ? (
                 <>
                   {/* TAB: TRIAGE & CONTEXT */}
@@ -891,7 +909,7 @@ export default function InvestigateModal({
                             raw_telemetry_payload.json
                           </span>
                           <button
-                            onClick={copyPayload}
+                            onClick={() => void copyPayload()}
                             className="text-xs text-slate-400 hover:text-white flex items-center gap-1 px-2 py-0.5 rounded bg-slate-800 transition"
                           >
                             {copiedPayload ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
@@ -922,7 +940,7 @@ export default function InvestigateModal({
                         iocs.map((ioc) => {
                           const providers = getProviders(ioc);
                           const evidence = iocHasEvidence(ioc);
-                          const enrichment = ENRICHMENT_LABELS[ioc.enrichment_status || ""];
+                          const enrichment = enrichmentMeta(ioc.enrichment_status);
                           return (
                             <div key={ioc.artifact_id} className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
                               <div className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 bg-slate-900/60">
@@ -932,9 +950,7 @@ export default function InvestigateModal({
                                       {ioc.artifact_type}
                                     </span>
                                     <VerdictBadge verdict={verdictOf(ioc)} />
-                                    <span className={`text-[10px] font-semibold ${enrichment?.className || "text-slate-400"}`}>
-                                      {enrichment?.label || (ioc.enrichment_status ? ioc.enrichment_status : "Enrichment status not recorded")}
-                                    </span>
+                                    <span className={`text-[10px] font-semibold ${enrichment.className}`}>{enrichment.label}</span>
                                   </div>
                                   <div className="font-mono text-xs text-slate-200 select-all break-all">{ioc.value}</div>
                                 </div>
@@ -967,11 +983,7 @@ export default function InvestigateModal({
                                   </thead>
                                   <tbody className="divide-y divide-slate-800/70">
                                     {providers.map(([key, p]) => {
-                                      const meta = PROVIDER_STATUS[p.status] || {
-                                        label: p.status,
-                                        className: "bg-slate-800 text-slate-400 border-slate-700",
-                                        hint: "",
-                                      };
+                                      const meta = providerStatusMeta(p.status, p.retry_after_seconds);
                                       const summaryEntries = p.summary && typeof p.summary === "object" ? Object.entries(p.summary) : [];
                                       return (
                                         <tr key={key} className="align-top">
@@ -1032,11 +1044,12 @@ export default function InvestigateModal({
                                 {vulnIntel.cves_detected?.length ? vulnIntel.cves_detected.join(", ") : "None found"}
                               </div>
                               {(vulnIntel.lookup_status || vulnIntel.status || vulnIntel.message) && (
-                                <div className="text-[11px] text-slate-400 mt-1">
+                                <div className="text-[11px] text-slate-400 mt-1" role="status">
                                   {[
-                                    vulnIntel.lookup_status ? NVD_LOOKUP_LABELS[vulnIntel.lookup_status] || vulnIntel.lookup_status : vulnIntel.status,
-                                    vulnIntel.message,
-                                  ].filter(Boolean).join(" — ")}
+                                    nvdLookupMessage(vulnIntel.lookup_status || vulnIntel.status, vulnIntel.retry_after_seconds),
+                                    vulnIntel.message || vulnIntel.error,
+                                  ].filter(Boolean).join(" ")}
+                                  {nvdPending && " Refreshing automatically."}
                                 </div>
                               )}
                             </div>
@@ -1057,7 +1070,10 @@ export default function InvestigateModal({
                               <div className="flex items-center justify-between gap-3">
                                 <span className="font-mono font-bold text-white text-sm">{v.cve_id}</span>
                                 <div className="flex items-center gap-2 text-[11px]">
-                                  {v.status && <span className="px-1.5 py-0.5 rounded border border-slate-700 bg-slate-800 text-slate-300">{v.status}</span>}
+                                  {v.status && (() => {
+                                    const m = nvdCveStatusMeta(v.status, v.retry_after_seconds);
+                                    return <span title={m.hint} className={`px-1.5 py-0.5 rounded border font-semibold ${m.className}`}>{m.label}</span>;
+                                  })()}
                                   <span className="font-mono text-slate-200">
                                     CVSS {typeof v.cvss_score === "number" ? v.cvss_score : "not available"}
                                     {v.severity ? ` · ${v.severity}` : ""}
@@ -1243,73 +1259,43 @@ export default function InvestigateModal({
                   {activeTab === "agent" && (
                     <div className="space-y-4">
                       <p className="text-[11px] text-slate-400 leading-relaxed">
-                        Triage verdicts and response proposals submitted by AI agents through the agent API. Every proposed action is
+                        AI verdicts and response proposals for this alert (built-in triage or an external agent). Every proposed action is
                         checked by the policy engine; anything not allowed automatically waits for an analyst.
                       </p>
+                      {simulationOn && (
+                        <InlineNotice tone="warning">Simulation mode is on: approving or auto-executing proposals changes nothing real and does not contain the alert.</InlineNotice>
+                      )}
+                      {triageError && (
+                        <InlineNotice tone="error" onDismiss={() => setTriageError(null)}>{triageError}</InlineNotice>
+                      )}
+                      {responder && (
+                        <button
+                          type="button"
+                          onClick={() => void handleRunTriage()}
+                          disabled={triaging || actionLoading || (detail.status || "").toLowerCase() === "processing"}
+                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-200 border border-cyan-500/40 text-xs font-bold disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
+                        >
+                          {triaging ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> : <Bot className="h-3.5 w-3.5" aria-hidden="true" />}
+                          <span>{triaging ? "AI is reviewing..." : "Run AI triage"}</span>
+                        </button>
+                      )}
                       {proposals.length === 0 ? (
                         <div className="p-6 text-center text-xs text-slate-500 italic bg-slate-950 border border-slate-800 rounded-xl">
-                          No AI agent has submitted a proposal for this alert.
+                          No AI proposal exists for this alert yet.
                         </div>
                       ) : (
-                        proposals.map((p) => {
-                          const st = PROPOSAL_STATUS[p.status] || { label: p.status, className: "bg-slate-800 text-slate-400 border-slate-700" };
-                          return (
-                            <div key={p.proposal_id} className="bg-slate-950 border border-slate-800 rounded-xl overflow-hidden">
-                              <div className="p-3.5 bg-slate-900/60 border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
-                                <div className="flex items-center gap-2">
-                                  <Bot className="h-4 w-4 text-cyan-300" />
-                                  <span className="text-xs font-bold text-white">{p.agent_name}</span>
-                                  <VerdictBadge verdict={p.verdict ? p.verdict.charAt(0).toUpperCase() + p.verdict.slice(1) : "Unknown"} />
-                                  <span className="text-[11px] font-mono text-slate-300">
-                                    confidence {Number.isFinite(p.confidence) ? `${Math.round(p.confidence * 100)}%` : "—"}
-                                  </span>
-                                </div>
-                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${st.className}`}>{st.label}</span>
-                              </div>
-                              <div className="p-3.5 space-y-2">
-                                {p.summary && <p className="text-xs text-slate-200">{p.summary}</p>}
-                                {p.reasoning && <p className="text-[11px] text-slate-400 whitespace-pre-line">{p.reasoning}</p>}
-                                {p.proposed_actions.length > 0 && (
-                                  <table className="w-full text-left text-[11px]">
-                                    <thead className="text-slate-500 uppercase tracking-wider">
-                                      <tr>
-                                        <th className="py-1.5 pr-3 font-bold">Action</th>
-                                        <th className="py-1.5 pr-3 font-bold">Target</th>
-                                        <th className="py-1.5 pr-3 font-bold">Policy</th>
-                                        <th className="py-1.5 font-bold">Result</th>
-                                      </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-slate-800/70">
-                                      {p.proposed_actions.map((a, i) => {
-                                        const policy = policyText(p.policy_evaluation[i]);
-                                        const result = p.execution_results[i];
-                                        return (
-                                          <tr key={i} className="align-top">
-                                            <td className="py-1.5 pr-3 font-mono text-slate-200">{a.action}</td>
-                                            <td className="py-1.5 pr-3 font-mono text-slate-300 break-all">{a.target || "—"}</td>
-                                            <td className={`py-1.5 pr-3 ${policy.className}`}>{policy.text}</td>
-                                            <td className="py-1.5">
-                                              {result ? (
-                                                <ExecutionModeBadge mode={(result.execution_mode as string) || null} />
-                                              ) : (
-                                                <span className="text-slate-500">not executed</span>
-                                              )}
-                                            </td>
-                                          </tr>
-                                        );
-                                      })}
-                                    </tbody>
-                                  </table>
-                                )}
-                                <div className="text-[10px] text-slate-500">
-                                  Submitted {formatTime(p.created_at)}
-                                  {p.decided_by && ` · decided by ${p.decided_by} ${p.decided_at ? `at ${formatTime(p.decided_at)}` : ""}`}
-                                  {p.decision_notes && ` · ${p.decision_notes}`}
-                                </div>
-                              </div>
-                            </div>
-                          );
-                        })
+                        proposals.map((p) => (
+                          <div key={`${p.proposal_id}-${p.status}`} className="bg-slate-950 border border-slate-800 rounded-xl p-4">
+                            <ProposalPanel
+                              proposal={p}
+                              canDecide={responder}
+                              onUpdated={() => {
+                                void fetchAlertDetail(detail.alert_id, true);
+                                if (onAlertUpdated) onAlertUpdated();
+                              }}
+                            />
+                          </div>
+                        ))
                       )}
                     </div>
                   )}

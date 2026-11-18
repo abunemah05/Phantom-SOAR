@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ScrollText,
   Plus,
@@ -20,11 +20,15 @@ import {
   Zap,
   Lock
 } from "lucide-react";
-import { ExecutionMode, Playbook } from "@/lib/types";
+import { ExecutionMode, JsonObject, Playbook, PlaybookStep, WorkflowLogic } from "@/lib/types";
 import { api } from "@/lib/api";
-import { isSecEngOrAdmin } from "@/lib/roles";
+import { describeError } from "@/lib/errors";
+import { canEditPlaybooks as roleCanEditPlaybooks } from "@/lib/roles";
 import { ActionCatalog, ActionSpec, FALLBACK_ACTIONS, PSEUDO_STEP_LABELS, formatParams, parseParams } from "@/lib/actions";
 import { useAuth } from "@/components/AuthGate";
+import { useConfirm } from "@/components/ConfirmDialog";
+import { useModalBehavior } from "@/components/Dialog";
+import { useToast } from "@/components/Toast";
 
 // Names accepted by the runner for older playbooks (backend ACTION_ALIASES).
 const ACTION_ALIASES: Record<string, string> = {
@@ -54,7 +58,7 @@ interface BuilderStep {
   params: string;
 }
 
-function parseLogic(pb: Pick<Playbook, "workflow_logic">): Record<string, any> {
+function parseLogic(pb: Pick<Playbook, "workflow_logic">): WorkflowLogic {
   const logic = pb.workflow_logic;
   if (typeof logic === "string") {
     try {
@@ -67,19 +71,22 @@ function parseLogic(pb: Pick<Playbook, "workflow_logic">): Record<string, any> {
   return logic && typeof logic === "object" ? logic : {};
 }
 
-function stepsOf(logic: Record<string, any>): Array<Record<string, any>> {
-  return Array.isArray(logic.steps) ? logic.steps.filter((s: unknown) => s && typeof s === "object") : [];
+function stepsOf(logic: WorkflowLogic): PlaybookStep[] {
+  return Array.isArray(logic.steps) ? logic.steps.filter((s) => s && typeof s === "object") : [];
 }
 
 export default function PlaybooksPage() {
   const { user } = useAuth();
-  const canEditPlaybooks = isSecEngOrAdmin(user);
+  const canEditPlaybooks = roleCanEditPlaybooks(user);
+  const toast = useToast();
+  const confirm = useConfirm();
+  const editRef = useRef<HTMLDivElement>(null);
+  const createRef = useRef<HTMLDivElement>(null);
 
   const [playbooks, setPlaybooks] = useState<Playbook[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [modeFilter, setModeFilter] = useState<string>("ALL");
   const [busyIds, setBusyIds] = useState<Record<number, boolean>>({});
 
@@ -114,6 +121,8 @@ export default function PlaybooksPage() {
   const [createJson, setCreateJson] = useState<string>("");
   const [createLoading, setCreateLoading] = useState<boolean>(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  useModalBehavior(editRef, editing !== null, () => setEditing(null));
+  useModalBehavior(createRef, isCreateOpen, () => setIsCreateOpen(false));
 
   const actionsByName = useMemo(() => {
     const map: Record<string, ActionSpec> = {};
@@ -132,8 +141,8 @@ export default function PlaybooksPage() {
       const remote = await api.getPlaybooks();
       setPlaybooks(remote || []);
       setLoadError(null);
-    } catch (err: any) {
-      setLoadError(err.message || "Could not load playbooks.");
+    } catch (err) {
+      setLoadError(describeError(err, "Could not load playbooks."));
     } finally {
       setLoading(false);
     }
@@ -152,10 +161,7 @@ export default function PlaybooksPage() {
     api.getPlaybookTemplates().then((t) => setTemplates(Array.isArray(t) ? t : [])).catch(() => setTemplates([]));
   }, [loadPlaybooks]);
 
-  const showNotice = (text: string) => {
-    setNotice(text);
-    setTimeout(() => setNotice(null), 4000);
-  };
+  const showNotice = (text: string) => toast.success(text);
 
   const setBusy = (id: number, busy: boolean) => setBusyIds((prev) => ({ ...prev, [id]: busy }));
 
@@ -170,8 +176,8 @@ export default function PlaybooksPage() {
       const nextActive = typeof res?.is_active === "boolean" ? res.is_active : !pb.is_active;
       setPlaybooks((prev) => prev.map((p) => (p.playbook_id === pb.playbook_id ? { ...p, is_active: nextActive } : p)));
       showNotice(`Playbook "${pb.name}" ${nextActive ? "enabled" : "disabled"}.`);
-    } catch (err: any) {
-      setPageError(`Could not toggle "${pb.name}": ${err.message || "request failed"}`);
+    } catch (err) {
+      setPageError(`Could not toggle "${pb.name}": ${describeError(err)}`);
     } finally {
       setBusy(pb.playbook_id, false);
     }
@@ -180,15 +186,22 @@ export default function PlaybooksPage() {
   const handleDelete = async (e: React.MouseEvent, pb: Playbook) => {
     e.stopPropagation();
     if (!canEditPlaybooks) return;
-    if (!confirm(`Delete playbook "${pb.name}"? Past executions keep their records.`)) return;
+    const ok = await confirm({
+      title: `Delete playbook "${pb.name}"?`,
+      message: "The playbook is removed and alerts can no longer be matched to it.",
+      items: ["Past executions keep their records.", "This cannot be undone. Disable the playbook instead if you may need it again."],
+      confirmLabel: "Delete playbook",
+      tone: "danger",
+    });
+    if (!ok) return;
     setPageError(null);
     setBusy(pb.playbook_id, true);
     try {
       await api.deletePlaybook(pb.playbook_id);
       setPlaybooks((prev) => prev.filter((p) => p.playbook_id !== pb.playbook_id));
       showNotice(`Playbook "${pb.name}" deleted.`);
-    } catch (err: any) {
-      setPageError(`Could not delete "${pb.name}": ${err.message || "request failed"}`);
+    } catch (err) {
+      setPageError(`Could not delete "${pb.name}": ${describeError(err)}`);
     } finally {
       setBusy(pb.playbook_id, false);
     }
@@ -205,22 +218,23 @@ export default function PlaybooksPage() {
     setCopied(false);
   };
 
-  const validateWorkflow = (text: string): { logic: Record<string, any> | null; error: string | null; warnings: string[] } => {
+  const validateWorkflow = (text: string): { logic: JsonObject | null; error: string | null; warnings: string[] } => {
     let logic: unknown;
     try {
       logic = JSON.parse(text);
-    } catch (e: any) {
-      return { logic: null, error: `Invalid JSON: ${e.message}`, warnings: [] };
+    } catch (e) {
+      return { logic: null, error: `Invalid JSON: ${e instanceof Error ? e.message : "could not parse"}`, warnings: [] };
     }
     if (!logic || typeof logic !== "object" || Array.isArray(logic)) {
       return { logic: null, error: "workflow_logic must be a JSON object.", warnings: [] };
     }
-    const steps = (logic as Record<string, any>).steps;
+    const steps = (logic as JsonObject).steps;
     if (steps !== undefined && !Array.isArray(steps)) {
       return { logic: null, error: "\"steps\" must be an array.", warnings: [] };
     }
     const warnings: string[] = [];
-    (Array.isArray(steps) ? steps : []).forEach((s: any, i: number) => {
+    (Array.isArray(steps) ? (steps as unknown[]) : []).forEach((raw: unknown, i: number) => {
+      const s = raw as JsonObject | null;
       if (!s || typeof s !== "object" || typeof s.action !== "string") {
         warnings.push(`Step ${i + 1} has no "action".`);
       } else if (!knownStep(s.action)) {
@@ -229,7 +243,7 @@ export default function PlaybooksPage() {
         warnings.push(`Step ${i + 1}: "params" must be an object.`);
       }
     });
-    return { logic: logic as Record<string, any>, error: null, warnings };
+    return { logic: logic as JsonObject, error: null, warnings };
   };
 
   const editValidation = editing ? validateWorkflow(editJson) : null;
@@ -260,15 +274,15 @@ export default function PlaybooksPage() {
       );
       setEditing(null);
       showNotice(`Playbook "${editName.trim() || editing.name}" saved.`);
-    } catch (err: any) {
-      setEditError(`Save failed: ${err.message || "request failed"}`);
+    } catch (err) {
+      setEditError(`Save failed: ${describeError(err)}`);
     } finally {
       setEditSaving(false);
     }
   };
 
   // --- Builder -----------------------------------------------------------------
-  const builderLogic = (): { logic: Record<string, any> | null; error: string | null } => {
+  const builderLogic = (): { logic: JsonObject | null; error: string | null } => {
     const steps: Array<Record<string, unknown>> = [];
     for (let i = 0; i < createSteps.length; i++) {
       const st = createSteps[i];
@@ -317,7 +331,7 @@ export default function PlaybooksPage() {
     }
     setCreateMode(t.execution_mode);
     setCreateMitreId(logic.mitre_id || "");
-    setCreatePicerl(PICERL_PHASES.includes(logic.picerl_phase) ? logic.picerl_phase : "Containment");
+    setCreatePicerl(logic.picerl_phase && PICERL_PHASES.includes(logic.picerl_phase) ? logic.picerl_phase : "Containment");
     setCreateKeywords(Array.isArray(logic.keywords) ? logic.keywords.join(", ") : "");
     setCreateSteps(
       stepsOf(logic).map((s, i) => ({ id: i + 1, action: String(s.action || ""), params: formatParams(s.params) }))
@@ -342,7 +356,7 @@ export default function PlaybooksPage() {
       setCreateError("Please give the playbook a name.");
       return;
     }
-    let logic: Record<string, any> | null;
+    let logic: JsonObject | null;
     if (createTab === "json") {
       const v = validateWorkflow(createJson);
       if (v.error || !v.logic) {
@@ -380,8 +394,8 @@ export default function PlaybooksPage() {
       setCreateName("");
       setCreateCustomThreat("");
       showNotice(`Playbook "${created.name}" created and active.`);
-    } catch (err: any) {
-      setCreateError(err.message || "Failed to create playbook.");
+    } catch (err) {
+      setCreateError(describeError(err, "Failed to create playbook."));
     } finally {
       setCreateLoading(false);
     }
@@ -457,12 +471,6 @@ export default function PlaybooksPage() {
         </div>
       </div>
 
-      {notice && (
-        <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs flex items-center space-x-2">
-          <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
-          <span>{notice}</span>
-        </div>
-      )}
       {(pageError || loadError) && (
         <div className="p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs flex items-center justify-between">
           <span className="flex items-center gap-2">
@@ -620,6 +628,11 @@ export default function PlaybooksPage() {
       {editing && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-fade-in">
           <div
+            ref={editRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="playbook-edit-title"
+            tabIndex={-1}
             className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl max-h-[92vh] flex flex-col shadow-2xl shadow-black overflow-hidden relative"
             onClick={(e) => e.stopPropagation()}
           >
@@ -629,7 +642,7 @@ export default function PlaybooksPage() {
                   <Code className="h-4 w-4 text-blue-400" />
                 </div>
                 <div>
-                  <h2 className="text-sm font-bold text-white tracking-wide">
+                  <h2 id="playbook-edit-title" className="text-sm font-bold text-white tracking-wide">
                     {canEditPlaybooks ? "Edit Playbook" : "Inspect Playbook"}: <span className="text-blue-400">{editing.name}</span>
                   </h2>
                   <p className="text-xs text-slate-400 font-mono mt-0.5">
@@ -638,6 +651,8 @@ export default function PlaybooksPage() {
                 </div>
               </div>
               <button
+                type="button"
+                aria-label="Close editor"
                 onClick={() => setEditing(null)}
                 className="h-8 w-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center transition border border-slate-700/60"
               >
@@ -758,20 +773,29 @@ export default function PlaybooksPage() {
       {/* CREATE MODAL */}
       {isCreateOpen && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="w-full max-w-3xl bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+          <div
+            ref={createRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="playbook-create-title"
+            tabIndex={-1}
+            className="w-full max-w-3xl bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+          >
             <div className="p-5 border-b border-slate-800 flex items-center justify-between bg-slate-950/60">
               <div className="flex items-center space-x-3">
                 <div className="h-10 w-10 rounded-xl bg-blue-600/20 border border-blue-500/30 flex items-center justify-center">
                   <Plus className="h-5 w-5 text-blue-400" />
                 </div>
                 <div>
-                  <h2 className="text-base font-bold text-white tracking-wide">Create Playbook</h2>
+                  <h2 id="playbook-create-title" className="text-base font-bold text-white tracking-wide">Create Playbook</h2>
                   <p className="text-xs text-slate-400">
                     Matching uses the MITRE technique, target threat and keywords. Steps run through the policy engine.
                   </p>
                 </div>
               </div>
               <button
+                type="button"
+                aria-label="Close dialog"
                 onClick={() => setIsCreateOpen(false)}
                 className="h-8 w-8 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white flex items-center justify-center transition border border-slate-700/60"
               >
