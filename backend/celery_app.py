@@ -11,6 +11,8 @@ IOCs still "pending", severity escalation is computed from the original payload)
                                   by the webhook so the HTTP request returns quickly
   tasks.re_enrich_iocs            delayed re-enrichment of IOCs whose providers were rate limited
   tasks.process_alert             playbook routing only (kept for older callers)
+  tasks.maintenance               periodic housekeeping (celery beat, every MAINTENANCE_INTERVAL_SECONDS):
+                                  purge expired logs and revoked tokens, resume alerts whose worker died
 
 Settings notes (Celery 5 / kombu 5 Redis transport):
   * visibility_timeout is how long an unacknowledged message waits before redelivery
@@ -37,6 +39,7 @@ TASK_TIME_LIMIT = 300
 RETRY_BACKOFF_BASE = 5      # seconds; doubles per retry
 RETRY_BACKOFF_MAX = 300
 MAX_TASK_RETRIES = 5
+MAINTENANCE_INTERVAL_SECONDS = 300
 
 celery_app = Celery(
     "phantom_soar",
@@ -74,6 +77,14 @@ celery_app.conf.update(
     redis_socket_connect_timeout=3.0,
     redis_socket_timeout=30.0,
     redis_backend_health_check_interval=25,
+    # Run the worker with -B (embedded beat) or a separate `celery beat`; only one scheduler may run.
+    beat_schedule={
+        "phantom-maintenance": {
+            "task": "tasks.maintenance",
+            "schedule": float(MAINTENANCE_INTERVAL_SECONDS),
+            "options": {"expires": MAINTENANCE_INTERVAL_SECONDS},
+        },
+    },
 )
 
 
@@ -184,3 +195,41 @@ def re_enrich_iocs_task(self, alert_id: int, artifact_ids: list, attempt: int = 
         return re_enrich_incomplete_iocs(alert_id, list(artifact_ids), attempt)
 
     return run_guarded(self, alert_id, "re_enrich_iocs", _run)
+
+
+def run_maintenance() -> Dict[str, Any]:
+    """Housekeeping that must not depend on anyone calling an endpoint. Each step is independent."""
+    summary: Dict[str, Any] = {}
+
+    def step(name: str, fn: Callable[[], Any]) -> None:
+        try:
+            summary[name] = fn()
+        except Exception as exc:  # one failing step must not stop the others
+            logger.exception("Maintenance step %s failed", name)
+            summary[name] = f"error: {type(exc).__name__}"
+
+    def _logs():
+        from backend.database import SessionLocal
+        from backend.routers.logs import purge_expired_logs
+        with SessionLocal() as db:
+            return purge_expired_logs(db)
+
+    def _revocations():
+        from backend.security import purge_expired_revocations
+        return purge_expired_revocations()
+
+    def _stale():
+        from backend.engine.runner import resume_stale_alerts
+        return len(resume_stale_alerts())
+
+    step("expired_logs_purged", _logs)
+    step("expired_revocations_purged", _revocations)
+    step("stale_alerts_resumed", _stale)
+    return summary
+
+
+@celery_app.task(name="tasks.maintenance", ignore_result=True)
+def maintenance_task():
+    result = run_maintenance()
+    logger.info("[Celery] Maintenance: %s", result)
+    return result

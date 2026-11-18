@@ -40,6 +40,7 @@ SCRIPT_LOCATION = BACKEND_DIR / "alembic"
 # `alembic revision --autogenerate` (via alembic/env.py) see all tables.
 MODEL_MODULES = (
     "backend.models",
+    "backend.security_models",
 )
 
 # Arbitrary constant identifying "Phantom SOAR schema migration" for pg_advisory_lock.

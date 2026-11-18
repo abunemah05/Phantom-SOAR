@@ -22,11 +22,15 @@ def _sqlite_engine(tmp_path, name="m.db"):
 
 
 def _core_tables():
-    """Tables defined in backend.models. Models other modules add later are covered by the lead's follow-up migration."""
-    from backend import models
+    """Tables defined in backend.models and backend.security_models (the modules listed in MODEL_MODULES)."""
+    import importlib
 
-    return {m.__table__.name for m in vars(models).values()
-            if isinstance(m, type) and issubclass(m, Base) and m is not Base and m.__module__ == models.__name__}
+    names = set()
+    for module_name in ("backend.models", "backend.security_models"):
+        module = importlib.import_module(module_name)
+        names |= {m.__table__.name for m in vars(module).values()
+                  if isinstance(m, type) and issubclass(m, Base) and m is not Base and m.__module__ == module.__name__}
+    return names
 
 
 def _drift(engine):

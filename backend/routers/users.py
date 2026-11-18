@@ -262,7 +262,7 @@ def rotate_service_account_key(
     if not account.is_service_account:
         raise HTTPException(status_code=400, detail="Only service accounts have API keys.")
     existing = _policy_for(db, account)
-    if existing and existing.expires_at and existing.expires_at <= datetime.now(timezone.utc).replace(tzinfo=None) \
+    if existing and existing.expires_at and (existing.expires_at if existing.expires_at.tzinfo else existing.expires_at.replace(tzinfo=timezone.utc)) <= datetime.now(timezone.utc) \
             and not (change and (change.clear_expiry or change.expires_in_days is not None)):
         raise HTTPException(status_code=400, detail="The previous key has expired: set expires_in_days (or clear_expiry) when rotating.")
     old_prefix = account.api_key_prefix

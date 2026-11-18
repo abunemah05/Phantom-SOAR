@@ -50,10 +50,14 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
+def _aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def _status(row: IngestToken) -> str:
     if row.revoked_at is not None:
         return "revoked"
-    if row.expires_at is not None and row.expires_at <= datetime.now(timezone.utc).replace(tzinfo=None):
+    if row.expires_at is not None and _aware(row.expires_at) <= datetime.now(timezone.utc):
         return "expired"
     return "active"
 

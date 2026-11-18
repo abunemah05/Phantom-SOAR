@@ -27,9 +27,11 @@ from backend.routers import (
     config_router,
     logs_router,
     reports_router,
+    ingest_tokens_router,
     ensure_default_user,
     ensure_default_configurations
 )
+from backend import integration_config, security
 from backend.dependencies import get_current_user, require_ingest_token
 from backend.models import Playbook
 from backend.crud import create_playbook
@@ -71,10 +73,13 @@ def bootstrap_database() -> None:
             return
         prepare_database(engine)  # Alembic upgrade; fast create_all when PHANTOM_ENV=test
 
-        # LEAD HOOK (after the schema exists, before seeding): encrypt secrets stored in clear text
-        #   from backend import crypto
-        #   with SessionLocal() as db:
-        #       crypto.encrypt_existing_secrets(db)
+        # Encrypt integration secrets and MFA seeds still stored in clear text (idempotent; a no-op without a key).
+        try:
+            from backend import crypto
+            with SessionLocal() as db:
+                crypto.encrypt_existing_secrets(db)
+        except Exception as exc:
+            logger.warning(f"Could not encrypt stored secrets at start-up: {exc}")
 
         init_system_defaults()
         _bootstrapped = True
@@ -82,11 +87,14 @@ def bootstrap_database() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # LEAD HOOK (first thing, before touching the database): fail fast on unsafe production configuration
-    #   from backend import integration_config, security
-    #   errors = integration_config.production_safety_errors() + security.validate_security_config()
-    #   if errors: raise RuntimeError("; ".join(errors))
+    # Fail fast on unsafe production configuration: weak JWT secret / missing encryption key
+    # (raises SecurityConfigError in production, warns elsewhere).
+    security.validate_security_config()
     bootstrap_database()
+    # Contradictory production setup (simulation mode on next to real credentials) needs the settings table.
+    errors = integration_config.production_safety_errors()
+    if errors:
+        raise RuntimeError("Refusing to start: " + "; ".join(errors))
     yield
     logger.info("Shutting down Phantom SOAR platform.")
 
@@ -157,8 +165,7 @@ app.include_router(alerts_router, prefix=settings.API_V1_STR, dependencies=_user
 app.include_router(playbooks_router, prefix=settings.API_V1_STR, dependencies=_user_session)
 app.include_router(demo_router, prefix=settings.API_V1_STR, dependencies=_user_session)
 app.include_router(logs_router, prefix=settings.API_V1_STR)
-# LEAD HOOK: include the new routers here (agents, AI settings, ...), with the same
-# prefix=settings.API_V1_STR and the appropriate dependencies.
+app.include_router(ingest_tokens_router, prefix=settings.API_V1_STR)  # admin-only, per route
 
 @app.get("/")
 def root():
