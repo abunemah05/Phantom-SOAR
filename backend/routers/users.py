@@ -1,8 +1,13 @@
+import ipaddress
 import logging
-from datetime import datetime, timezone
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
+from fastapi import APIRouter, Body, Depends, HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+from backend import ratelimit
 
 from backend.database import get_db
 from backend.models import User
@@ -13,6 +18,7 @@ from backend.schemas import (
     UserUpdateRequest,
     ServiceAccountCreateRequest,
     ServiceAccountKeyResponse,
+    ServiceAccountPolicyRequest,
 )
 from backend.security import hash_password, generate_temporary_password, generate_api_key
 from backend.dependencies import (
@@ -25,12 +31,17 @@ from backend.dependencies import (
     require_admin,
     role_catalog,
 )
-from backend.routers.auth import BOOTSTRAP_ADMIN_USERNAME
+from backend.routers.auth import get_bootstrap_admin_username, user_public_dict
+from backend.security_models import ServiceAccountPolicy
 from backend.routers.logs import record_log
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["User Accounts & Access Management (Admin Only)"])
+
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{2,49}$")
+MAX_ALLOWLIST_ENTRIES = 50
 
 
 def _get_user_or_404(db: Session, user_id: int) -> User:
@@ -40,19 +51,69 @@ def _get_user_or_404(db: Session, user_id: int) -> User:
     return user
 
 
-def _public(user: User) -> dict:
-    return {**user.to_dict(), "api_key_prefix": user.api_key_prefix}
+def _policy_for(db: Session, user: User) -> Optional[ServiceAccountPolicy]:
+    if not user.is_service_account:
+        return None
+    return db.query(ServiceAccountPolicy).filter(ServiceAccountPolicy.user_id == user.user_id).first()
+
+
+def _public(user: User, policy: Optional[ServiceAccountPolicy] = None) -> dict:
+    data = {**user_public_dict(user), "api_key_prefix": user.api_key_prefix}
+    if user.is_service_account:
+        data.update(
+            expires_at=policy.expires_at.isoformat() if policy and policy.expires_at else None,
+            ip_allowlist=list(policy.ip_allowlist or []) if policy else [],
+            last_used_at=policy.last_used_at.isoformat() if policy and policy.last_used_at else None,
+            last_used_ip=policy.last_used_ip if policy else None,
+        )
+    return data
 
 
 def _validated_username(username: str, db: Session) -> str:
     username = (username or "").strip()
     if not username:
         raise HTTPException(status_code=400, detail="Username cannot be empty.")
-    if len(username) > 50:
-        raise HTTPException(status_code=400, detail="Username cannot exceed 50 characters.")
-    if db.query(User).filter(User.username == username).first():
+    if not USERNAME_RE.match(username):
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be 3-50 characters: letters, digits, '.', '_', '@', '+' or '-', starting with a letter or digit.",
+        )
+    if db.query(User).filter(func.lower(User.username) == username.lower()).first():
         raise HTTPException(status_code=400, detail=f"Operator username '{username}' already exists in the system.")
     return username
+
+
+def _validated_allowlist(entries: Optional[List[str]]) -> Optional[List[str]]:
+    """Normalised list of IPs / CIDR networks; None when not supplied, [] to remove the restriction."""
+    if entries is None:
+        return None
+    if len(entries) > MAX_ALLOWLIST_ENTRIES:
+        raise HTTPException(status_code=400, detail=f"ip_allowlist can hold at most {MAX_ALLOWLIST_ENTRIES} entries.")
+    result: List[str] = []
+    for raw in entries:
+        try:
+            network = ipaddress.ip_network((raw or "").strip(), strict=False)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"'{(raw or '')[:60]}' is not an IP address or CIDR network.")
+        text = str(network)
+        if text not in result:
+            result.append(text)
+    return result
+
+
+def _expiry_from_days(days: Optional[int]) -> Optional[datetime]:
+    if days is None:
+        return None
+    return (datetime.now(timezone.utc) + timedelta(days=days)).replace(tzinfo=None)
+
+
+def _unique_api_key(db: Session):
+    """(plaintext key, prefix, digest) whose lookup prefix is not used by any account yet."""
+    for _ in range(20):
+        key, prefix, digest = generate_api_key()
+        if not db.query(User).filter(User.api_key_prefix == prefix).first():
+            return key, prefix, digest
+    raise HTTPException(status_code=500, detail="Could not allocate a unique API key id; try again.")
 
 
 def _validated_role(role: str) -> str:
@@ -88,7 +149,8 @@ def list_users(
 ):
     """[Admin Only] List operator and service accounts. Password hashes and MFA secrets are never returned."""
     users = db.query(User).order_by(User.user_id.asc()).all()
-    return [_public(u) for u in users]
+    policies: Dict[int, ServiceAccountPolicy] = {p.user_id: p for p in db.query(ServiceAccountPolicy).all()}
+    return [_public(u, policies.get(u.user_id)) for u in users]
 
 
 @router.post("", response_model=UserCreateResponse, status_code=status.HTTP_201_CREATED)
@@ -137,7 +199,8 @@ def create_service_account(
     to the console and cannot call operator endpoints.
     """
     username = _validated_username(payload.username, db)
-    api_key, prefix, digest = generate_api_key()
+    allowlist = _validated_allowlist(payload.ip_allowlist)
+    api_key, prefix, digest = _unique_api_key(db)
     now = datetime.now(timezone.utc)
     account = User(
         username=username,
@@ -153,34 +216,90 @@ def create_service_account(
         created_at=now,
     )
     db.add(account)
+    db.flush()
+    policy = ServiceAccountPolicy(
+        user_id=account.user_id,
+        expires_at=_expiry_from_days(payload.expires_in_days),
+        ip_allowlist=allowlist or [],
+    )
+    db.add(policy)
     db.commit()
     db.refresh(account)
+    db.refresh(policy)
 
     record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' created service account '{username}' (key {prefix}).",
-               target=username, details={"api_key_prefix": prefix, "by": admin.username})
-    return {**_public(account), "api_key": api_key}
+               target=username, details={"api_key_prefix": prefix, "by": admin.username,
+                                         "expires_at": policy.expires_at.isoformat() if policy.expires_at else None,
+                                         "ip_allowlist": policy.ip_allowlist})
+    return {**_public(account, policy), "api_key": api_key}
+
+
+def _apply_policy(db: Session, account: User, change: ServiceAccountPolicyRequest) -> ServiceAccountPolicy:
+    policy = _policy_for(db, account)
+    if policy is None:
+        policy = ServiceAccountPolicy(user_id=account.user_id, ip_allowlist=[])
+        db.add(policy)
+    if change.clear_expiry:
+        policy.expires_at = None
+    elif change.expires_in_days is not None:
+        policy.expires_at = _expiry_from_days(change.expires_in_days)
+    allowlist = _validated_allowlist(change.ip_allowlist)
+    if allowlist is not None:
+        policy.ip_allowlist = allowlist
+    return policy
 
 
 @router.post("/{user_id}/rotate-api-key", response_model=ServiceAccountKeyResponse)
 def rotate_service_account_key(
     user_id: int,
+    change: Optional[ServiceAccountPolicyRequest] = Body(default=None),
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin)
 ):
-    """[Admin Only] Issue a new API key for a service account; the previous key stops working immediately."""
+    """[Admin Only] Issue a new API key for a service account; the previous key stops working immediately.
+    The optional body sets a new expiry (`expires_in_days` / `clear_expiry`) and source allow-list."""
     account = _get_user_or_404(db, user_id)
     if not account.is_service_account:
         raise HTTPException(status_code=400, detail="Only service accounts have API keys.")
+    existing = _policy_for(db, account)
+    if existing and existing.expires_at and existing.expires_at <= datetime.now(timezone.utc).replace(tzinfo=None) \
+            and not (change and (change.clear_expiry or change.expires_in_days is not None)):
+        raise HTTPException(status_code=400, detail="The previous key has expired: set expires_in_days (or clear_expiry) when rotating.")
     old_prefix = account.api_key_prefix
-    api_key, prefix, digest = generate_api_key()
+    api_key, prefix, digest = _unique_api_key(db)
     account.api_key_hash = digest
     account.api_key_prefix = prefix
+    policy = _apply_policy(db, account, change or ServiceAccountPolicyRequest())
     db.commit()
     db.refresh(account)
+    db.refresh(policy)
 
     record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' rotated the API key of '{account.username}'.",
-               target=account.username, details={"old_prefix": old_prefix, "new_prefix": prefix, "by": admin.username})
-    return {**_public(account), "api_key": api_key}
+               target=account.username, details={"old_prefix": old_prefix, "new_prefix": prefix, "by": admin.username,
+                                                 "expires_at": policy.expires_at.isoformat() if policy.expires_at else None,
+                                                 "ip_allowlist": policy.ip_allowlist})
+    return {**_public(account, policy), "api_key": api_key}
+
+
+@router.put("/{user_id}/service-policy", response_model=UserResponse)
+def update_service_account_policy(
+    user_id: int,
+    change: ServiceAccountPolicyRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin)
+):
+    """[Admin Only] Change a service account's key expiry and source-address allow-list without rotating the key."""
+    account = _get_user_or_404(db, user_id)
+    if not account.is_service_account:
+        raise HTTPException(status_code=400, detail="Only service accounts have an API key policy.")
+    policy = _apply_policy(db, account, change)
+    db.commit()
+    db.refresh(policy)
+    record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' changed the key policy of '{account.username}'.",
+               target=account.username, details={"by": admin.username,
+                                                 "expires_at": policy.expires_at.isoformat() if policy.expires_at else None,
+                                                 "ip_allowlist": policy.ip_allowlist})
+    return _public(account, policy)
 
 
 @router.put("/{user_id}", response_model=UserResponse)
@@ -206,8 +325,9 @@ def update_user(
 
     if deactivating and user.user_id == admin.user_id:
         raise HTTPException(status_code=400, detail="You cannot disable your own account.")
-    if deactivating and user.username == BOOTSTRAP_ADMIN_USERNAME:
-        raise HTTPException(status_code=400, detail=f"Cannot disable the bootstrap administrator account '{BOOTSTRAP_ADMIN_USERNAME}'.")
+    bootstrap = get_bootstrap_admin_username()
+    if deactivating and user.username == bootstrap:
+        raise HTTPException(status_code=400, detail=f"Cannot disable the bootstrap administrator account '{bootstrap}'.")
     if (deactivating or demoting) and user.is_active and normalize_role(user.role) in ADMIN_ROLES \
             and _active_admin_count(db, excluding_user_id=user.user_id) == 0:
         raise HTTPException(status_code=400, detail="This change would leave the platform without an active administrator.")
@@ -232,7 +352,7 @@ def update_user(
     if changes:
         record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' updated account '{user.username}'.",
                    target=user.username, details={"changes": changes, "by": admin.username})
-    return _public(user)
+    return _public(user, _policy_for(db, user))
 
 
 @router.post("/{user_id}/reset-password")
@@ -257,6 +377,7 @@ def reset_user_password(
     user.locked_until = None
     user.password_changed_at = datetime.now(timezone.utc)
     db.commit()
+    ratelimit.clear_username(user.username)
 
     record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' reset the password of '{user.username}'.",
                target=user.username, details={"by": admin.username})
@@ -279,6 +400,7 @@ def unlock_user(
     user.failed_login_attempts = 0
     user.locked_until = None
     db.commit()
+    ratelimit.clear_username(user.username)
     record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' unlocked account '{user.username}'.",
                target=user.username, details={"by": admin.username})
     return {"status": "Success", "message": f"Account '{user.username}' unlocked."}
@@ -323,14 +445,17 @@ def delete_user(
 
     if user.user_id == admin.user_id:
         raise HTTPException(status_code=400, detail="You cannot delete your own account.")
-    if user.username == BOOTSTRAP_ADMIN_USERNAME:
-        raise HTTPException(status_code=400, detail=f"Bootstrap administrator account '{BOOTSTRAP_ADMIN_USERNAME}' cannot be deleted.")
+    bootstrap = get_bootstrap_admin_username()
+    if user.username == bootstrap:
+        raise HTTPException(status_code=400, detail=f"Bootstrap administrator account '{bootstrap}' cannot be deleted.")
     if user.is_active and normalize_role(user.role) in ADMIN_ROLES and _active_admin_count(db, excluding_user_id=user.user_id) == 0:
         raise HTTPException(status_code=400, detail="Cannot delete the last active administrator.")
 
     username = user.username
+    db.query(ServiceAccountPolicy).filter(ServiceAccountPolicy.user_id == user.user_id).delete(synchronize_session=False)
     db.delete(user)
     db.commit()
+    ratelimit.clear_username(username)
 
     record_log(db, "RBAC", "ACTION", f"Admin '{admin.username}' deleted account '{username}'.",
                target=username, details={"by": admin.username})

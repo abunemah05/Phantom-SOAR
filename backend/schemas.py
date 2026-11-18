@@ -4,15 +4,17 @@ from pydantic import BaseModel, Field, ConfigDict
 
 # --- Auth & User Schemas (NIST SP 800-63B Compliant) ---
 class LoginRequest(BaseModel):
-    username: str
-    password: str
-    mfa_code: Optional[str] = None  # Optional for single-factor, required when MFA is enabled
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=1024)
+    mfa_code: Optional[str] = Field(default=None, max_length=16)  # required when MFA is enabled
 
 class ChangePasswordRequest(BaseModel):
-    username: str
-    current_password: str
-    new_password: str
-    mfa_code: Optional[str] = None  # required for MFA accounts unless the caller sends its own Bearer session
+    """Always sent with the caller's own Bearer session. The account is the token's subject; `username`
+    is accepted only for older clients and, when present, must match it."""
+    username: Optional[str] = Field(default=None, max_length=100)
+    current_password: Optional[str] = Field(default=None, max_length=1024)  # optional only for a forced first-login change
+    new_password: str = Field(min_length=1, max_length=1024)
+    mfa_code: Optional[str] = Field(default=None, max_length=16)  # required with current_password when MFA is enabled
 
 class MFASetupResponse(BaseModel):
     secret: str
@@ -26,7 +28,8 @@ class MFAVerifyRequest(BaseModel):
     code: str
 
 class MFADisableRequest(BaseModel):
-    code: Optional[str] = None  # current TOTP code, required while MFA is enabled
+    code: Optional[str] = Field(default=None, max_length=16)  # current TOTP code, required while MFA is enabled
+    password: Optional[str] = Field(default=None, max_length=1024)  # current password, required while MFA is enabled
 
 class MFAStatusResponse(BaseModel):
     mfa_enabled: bool
@@ -43,6 +46,12 @@ class UserResponse(BaseModel):
     compromised_reset_required: bool = False
     is_service_account: bool = False
     api_key_prefix: Optional[str] = None  # non-secret lookup id of a service account's API key
+    mfa_enrollment_required: bool = False  # policy require_mfa_for_admin and no MFA yet
+    is_bootstrap_admin: bool = False  # the account created at first start (cannot be deleted or disabled)
+    expires_at: Optional[str] = None  # service accounts: API key expiry
+    ip_allowlist: Optional[List[str]] = None  # service accounts: source addresses allowed to use the key
+    last_used_at: Optional[str] = None
+    last_used_ip: Optional[str] = None
     password_changed_at: Optional[str] = None
     created_at: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
@@ -51,18 +60,26 @@ class UserCreateResponse(UserResponse):
     temporary_password: str  # shown once; the operator must change it at first sign-in
 
 class ServiceAccountCreateRequest(BaseModel):
-    username: str  # e.g. "triage-agent"
+    username: str = Field(min_length=1, max_length=50)  # e.g. "triage-agent"
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)  # key lifetime; omit for no expiry
+    ip_allowlist: Optional[List[str]] = Field(default=None, max_length=50)  # IPs / CIDRs allowed to use the key
+
+class ServiceAccountPolicyRequest(BaseModel):
+    """Used by key rotation and the policy endpoint. Omitted fields are left unchanged."""
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    clear_expiry: bool = False
+    ip_allowlist: Optional[List[str]] = Field(default=None, max_length=50)  # [] removes the restriction
 
 class ServiceAccountKeyResponse(UserResponse):
     api_key: str  # shown once; only a digest is stored
 
 class UserCreateRequest(BaseModel):
-    username: str
-    role: str = "SOC Analyst"
+    username: str = Field(min_length=1, max_length=50)
+    role: str = Field(default="SOC Analyst", max_length=60)
     mfa_enabled: bool = False
 
 class UserUpdateRequest(BaseModel):
-    role: Optional[str] = None
+    role: Optional[str] = Field(default=None, max_length=60)
     is_active: Optional[bool] = None
     compromised_reset_required: Optional[bool] = None
 
@@ -70,6 +87,7 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     mfa_required: bool = False
+    mfa_enrollment_required: bool = False  # policy require_mfa_for_admin: enrol MFA before using the console
     user: UserResponse
 
 

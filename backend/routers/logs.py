@@ -1,37 +1,18 @@
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, Query, status
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 
 from backend.database import get_db
 from backend.models import SystemLog, User
-from backend.dependencies import get_current_user, require_admin
+from backend.dependencies import get_current_user
+from backend.integration_config import get_setting
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/logs", tags=["Telemetry & Audit Logs"])
-
-LOG_LEVELS = {"INFO", "WARNING", "ERROR", "CRITICAL", "ACTION"}
-
-
-class LogCreateRequest(BaseModel):
-    source: str = Field(min_length=1, max_length=50)  # EDR, XDR, SIEM, TIP, FIREWALL, IAM, ITSM, AUTOMATION
-    level: str = "INFO"  # INFO, WARNING, ERROR, CRITICAL, ACTION
-    message: str = Field(min_length=1, max_length=5000)
-    target: Optional[str] = Field(default=None, max_length=200)
-    details: Optional[Dict[str, Any]] = None
-
-    @field_validator("level")
-    @classmethod
-    def _level(cls, v: str) -> str:
-        v = (v or "").strip().upper()
-        if v not in LOG_LEVELS:
-            raise ValueError(f"level must be one of {sorted(LOG_LEVELS)}")
-        return v
-
 
 def get_naive_utc():
     """Naive UTC timestamp (SQLite stores datetimes without a timezone)."""
@@ -99,34 +80,35 @@ def list_logs(
     return [entry.to_dict() for entry in logs]
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
-def create_log(
-    payload: LogCreateRequest,
-    db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
-):
-    """[Admin Only] Append a manual log entry. The author is recorded in details.recorded_by."""
-    details = dict(payload.details or {})
-    details["recorded_by"] = admin.username
-    entry = record_log(
-        db=db,
-        source=payload.source.strip(),
-        level=payload.level,
-        message=payload.message,
-        target=payload.target,
-        details=details
-    )
-    return entry.to_dict()
+# --- Retention ---------------------------------------------------------------------------------
+# The audit trail is append-only through the API for every role, administrators included: there is
+# no endpoint that writes arbitrary entries, edits them or deletes them. The ONLY removal path is this
+# age-based retention purge, called by the scheduled maintenance job, never by a request.
+MIN_RETENTION_DAYS = 30
+DEFAULT_RETENTION_DAYS = 365
 
 
-@router.delete("")
-def clear_logs(
-    db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
-):
-    """[Admin Only] Purge all logs. The purge itself is recorded as the first entry of the new log."""
-    deleted = db.query(SystemLog).delete()
+def purge_expired_logs(db: Session, retention_days: Optional[int] = None, actor: str = "retention-job") -> int:
+    """Delete log entries older than the retention period and record an audit entry about it.
+
+    The period comes from `retention_days`, else the PHANTOM_LOG_RETENTION_DAYS setting (default 365).
+    Anything below MIN_RETENTION_DAYS is refused so a typo cannot wipe the trail. Returns rows deleted.
+    """
+    if retention_days is None:
+        raw = get_setting("phantom_log_retention_days", db=None) or str(DEFAULT_RETENTION_DAYS)
+        try:
+            retention_days = int(raw)
+        except ValueError:
+            logger.error(f"Invalid PHANTOM_LOG_RETENTION_DAYS={raw!r}; using {DEFAULT_RETENTION_DAYS}.")
+            retention_days = DEFAULT_RETENTION_DAYS
+    if retention_days < MIN_RETENTION_DAYS:
+        raise ValueError(f"Log retention must be at least {MIN_RETENTION_DAYS} days (got {retention_days}).")
+    cutoff = get_naive_utc() - timedelta(days=retention_days)
+    deleted = db.query(SystemLog).filter(SystemLog.created_at < cutoff).delete(synchronize_session=False)
     db.commit()
-    record_log(db, "AUDIT", "WARNING", f"Admin '{admin.username}' cleared the log ({deleted} entries).",
-               target=admin.username, details={"deleted": deleted, "by": admin.username})
-    return {"status": "Success", "message": f"Cleared {deleted} log entries.", "deleted": deleted}
+    record_log(
+        db, "AUDIT", "ACTION",
+        f"Retention purge by '{actor}': removed {deleted} log entries older than {retention_days} days.",
+        target=actor, details={"deleted": deleted, "retention_days": retention_days, "cutoff": cutoff.isoformat(), "by": actor},
+    )
+    return deleted

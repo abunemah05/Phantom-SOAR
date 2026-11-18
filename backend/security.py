@@ -1,4 +1,5 @@
 import os
+import re
 import hmac
 import hashlib
 import logging
@@ -11,6 +12,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
 import pyotp
 import jwt
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 
 logger = logging.getLogger(__name__)
 
@@ -252,9 +254,169 @@ def verify_api_key(key: str, stored_hash: Optional[str]) -> bool:
     return hmac.compare_digest(hash_api_key(key), stored_hash)
 
 
-# --- Logout revocation (in-process denylist of token ids until they expire) ---
+# --- Ingest tokens (per-sender webhook credentials) -----------------------------------------------------
+# Format: phi_<8 hex lookup id>_<43 url-safe chars>; only the lookup id and a SHA-256 digest are stored.
+INGEST_TOKEN_PREFIX = "phi_"
+MIN_LEGACY_INGEST_TOKEN_LENGTH = 32
+
+
+def generate_ingest_token() -> Tuple[str, str, str]:
+    """Returns (plaintext shown once, lookup prefix, digest)."""
+    lookup = f"{INGEST_TOKEN_PREFIX}{secrets.token_hex(4)}"
+    token = f"{lookup}_{secrets.token_urlsafe(32)}"
+    return token, lookup, hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def ingest_token_lookup_prefix(token: str) -> Optional[str]:
+    if not token or not token.startswith(INGEST_TOKEN_PREFIX):
+        return None
+    lookup, sep, secret = token[len(INGEST_TOKEN_PREFIX):].partition("_")
+    if not sep or len(lookup) != 8 or not secret:
+        return None
+    return f"{INGEST_TOKEN_PREFIX}{lookup}"
+
+
+def hash_ingest_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# --- Production configuration check ---------------------------------------------------------
+class SecurityConfigError(RuntimeError):
+    """Raised at startup when the environment is unsafe to run in production."""
+
+
+def is_production() -> bool:
+    return os.getenv("PHANTOM_ENV", "").strip().lower() in ("production", "prod")
+
+
+def validate_security_config() -> None:
+    """Refuse to start in production without a strong JWT secret and an encryption key.
+
+    Called by the application at startup. Outside production it only logs warnings.
+    """
+    problems = []
+    jwt_secret = os.getenv("PHANTOM_JWT_SECRET", "").strip()
+    if len(jwt_secret) < 32:
+        problems.append("PHANTOM_JWT_SECRET must be set to a random value of at least 32 characters")
+    has_key = bool(os.getenv("PHANTOM_ENCRYPTION_KEY", "").strip() or os.getenv("PHANTOM_ENCRYPTION_KEYS", "").strip())
+    if not has_key:
+        problems.append("PHANTOM_ENCRYPTION_KEY must be set (Fernet key for secrets at rest)")
+    else:
+        try:
+            from backend import crypto
+            crypto.reset_cache()
+            crypto._fernets()
+        except Exception as exc:
+            problems.append(f"encryption key is invalid: {exc}")
+    legacy = os.getenv("PHANTOM_INGEST_TOKEN", "").strip()
+    if legacy and len(legacy) < 32:
+        logger.warning("PHANTOM_INGEST_TOKEN is shorter than 32 characters and is ignored; create per-sender "
+                       "ingest tokens with POST /api/ingest-tokens instead.")
+    if problems:
+        message = "Insecure configuration: " + "; ".join(problems) + "."
+        if is_production():
+            raise SecurityConfigError(message)
+        logger.warning(message + " (tolerated outside production)")
+
+
+def mfa_required_for_admin() -> bool:
+    """Optional policy: administrators must have MFA enabled (setting require_mfa_for_admin)."""
+    from backend.integration_config import get_setting
+    raw = get_setting("require_mfa_for_admin") or os.getenv("PHANTOM_REQUIRE_MFA_FOR_ADMIN", "")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# --- DB helpers shared by revocation and TOTP replay ---------------------------------------------
+def _naive_utc(ts: float) -> datetime:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+
+
+def _with_security_db(fn):
+    """Run fn(session) on a short-lived session, creating the security tables once if they are missing."""
+    from backend import security_models
+    from backend.database import SessionLocal
+
+    for attempt in (1, 2):
+        db = SessionLocal()
+        try:
+            return fn(db)
+        except (OperationalError, ProgrammingError) as exc:
+            db.rollback()
+            if attempt == 2 or is_production():
+                raise
+            logger.warning(f"Security tables missing ({exc.__class__.__name__}); creating them.")
+            security_models.ensure_tables()
+        finally:
+            db.close()
+
+
+# --- TOTP replay protection (RFC 6238 section 5.2: a code is accepted once) --------------------------
+_used_totp_fallback: Dict[Tuple[str, int], float] = {}
+
+
+def consume_totp_code(db, subject: str, secret: str, code: str) -> bool:
+    """Verify a TOTP code and mark its time step as used for `subject`. A replayed code is rejected."""
+    if not secret or not code:
+        return False
+    code = code.strip()
+    totp = pyotp.TOTP(secret)
+    step_now = int(time.time() // 30)
+    matched = None
+    for step in (step_now, step_now - 1, step_now + 1):
+        if hmac.compare_digest(totp.at(step * 30), code):
+            matched = step
+            break
+    if matched is None:
+        return False
+
+    from backend.security_models import UsedTotpCode
+
+    def _record(session) -> bool:
+        session.query(UsedTotpCode).filter(UsedTotpCode.time_step < step_now - 20).delete(synchronize_session=False)
+        session.add(UsedTotpCode(subject=subject, time_step=matched))
+        try:
+            session.commit()
+            return True
+        except IntegrityError:
+            session.rollback()
+            return False
+
+    try:
+        return _with_security_db(_record)
+    except Exception as exc:  # DB unavailable: still stop replays inside this process
+        logger.error(f"TOTP replay store unavailable ({exc.__class__.__name__}); using process memory.")
+        key = (subject, matched)
+        if key in _used_totp_fallback:
+            return False
+        _used_totp_fallback[key] = time.time()
+        return True
+
+
+# --- Session revocation (persisted, with an in-memory cache) -------------------------------------------
 _revoked_jtis: Dict[str, float] = {}
 _revoked_lock = threading.Lock()
+
+
+def _insert_revoked(jti: str, exp: float) -> bool:
+    """Persist a revoked id. False when it was already present."""
+    from backend.security_models import RevokedToken
+
+    def _insert(db) -> bool:
+        db.query(RevokedToken).filter(RevokedToken.expires_at < _naive_utc(time.time())).delete(synchronize_session=False)
+        db.add(RevokedToken(jti=jti, expires_at=_naive_utc(exp)))
+        try:
+            db.commit()
+            return True
+        except IntegrityError:
+            db.rollback()
+            return False
+
+    try:
+        return _with_security_db(_insert)
+    except Exception as exc:
+        logger.error(f"Could not persist token revocation ({exc.__class__.__name__}); kept in process memory only.")
+        return True
+
 
 def revoke_token(payload: Dict[str, Any]) -> None:
     jti = payload.get("jti")
@@ -266,10 +428,113 @@ def revoke_token(payload: Dict[str, Any]) -> None:
         for stale in [k for k, v in _revoked_jtis.items() if v < now]:
             _revoked_jtis.pop(stale, None)
         _revoked_jtis[jti] = exp
+    _insert_revoked(jti, exp)
+
 
 def is_token_revoked(payload: Dict[str, Any]) -> bool:
     jti = payload.get("jti")
     if not jti:
         return False
     with _revoked_lock:
-        return jti in _revoked_jtis
+        exp = _revoked_jtis.get(jti)
+        if exp is not None and exp >= time.time():
+            return True
+    from backend.security_models import RevokedToken
+
+    try:
+        row_exp = _with_security_db(lambda db: db.query(RevokedToken.expires_at).filter(RevokedToken.jti == jti).first())
+    except Exception as exc:
+        logger.error(f"Revocation lookup failed ({exc.__class__.__name__}); relying on process memory.")
+        return False
+    if row_exp is None:
+        return False
+    with _revoked_lock:  # another worker revoked it: cache the positive answer
+        _revoked_jtis[jti] = payload.get("exp") or (time.time() + 3600)
+    return True
+
+
+def purge_expired_revocations() -> int:
+    """Delete revocation rows whose token has expired anyway. Returns the number removed."""
+    from backend.security_models import RevokedToken
+
+    def _purge(db) -> int:
+        n = db.query(RevokedToken).filter(RevokedToken.expires_at < _naive_utc(time.time())).delete(synchronize_session=False)
+        db.commit()
+        return n
+
+    return _with_security_db(_purge)
+
+
+def forget_revocation_cache() -> None:
+    """Drop the in-memory cache only (simulates a restart in tests)."""
+    with _revoked_lock:
+        _revoked_jtis.clear()
+
+
+# --- Short-lived confirmation tokens for destructive actions ---------------------------------------
+# Signed with a key derived from the JWT secret, so a confirmation token can never be used as a session
+# token (and vice versa). One use only: the id is recorded in the revocation table.
+def _confirmation_key() -> str:
+    return hmac.new(JWT_SECRET_KEY.encode("utf-8"), b"phantom-confirmation-token-v1", hashlib.sha256).hexdigest()
+
+
+def issue_confirmation_token(purpose: str, subject: str, session_id: str, ttl_seconds: int = 120) -> str:
+    now = datetime.now(timezone.utc)
+    claims = {
+        "purpose": purpose, "sub": subject, "sid": session_id or "",
+        "iat": now, "exp": now + timedelta(seconds=ttl_seconds), "jti": "c:" + secrets.token_urlsafe(16),
+    }
+    return jwt.encode(claims, _confirmation_key(), algorithm="HS256")
+
+
+def consume_confirmation_token(token: str, purpose: str, subject: str, session_id: str) -> bool:
+    try:
+        claims = jwt.decode(token or "", _confirmation_key(), algorithms=["HS256"],
+                            options={"require": ["exp", "iat", "sub", "jti"]})
+    except jwt.PyJWTError:
+        return False
+    if claims.get("purpose") != purpose or claims.get("sub") != subject or claims.get("sid") != (session_id or ""):
+        return False
+    return _insert_revoked(claims["jti"], float(claims["exp"]))
+
+
+# --- Masking for read-only audiences --------------------------------------------------------------------
+_SENSITIVE_KEY = re.compile(
+    r"(pass(word|wd|phrase)?|pwd|secret|token|api[_-]?key|apikey|authorization|credential|cookie|session[_-]?id|private[_-]?key|ssn)",
+    re.IGNORECASE,
+)
+_EMAIL = re.compile(r"\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
+_CRED_ASSIGNMENT = re.compile(
+    r"(?i)\b(pass(?:word|wd|phrase)?|pwd|secret|api[_-]?key|apikey|access[_-]?key|token|auth(?:orization)?)\b(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)"
+)
+_BEARER = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}")
+_JWT_LIKE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*")
+_AWS_KEY = re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b")
+_PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.DOTALL)
+REDACTED = "[REDACTED]"
+
+
+def mask_text(value: str) -> str:
+    value = _PRIVATE_KEY.sub(REDACTED, value)
+    value = _JWT_LIKE.sub(REDACTED, value)
+    value = _AWS_KEY.sub(REDACTED, value)
+    value = _BEARER.sub(lambda m: f"{m.group(1)} {REDACTED}", value)
+    value = _CRED_ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", value)
+    return _EMAIL.sub(lambda m: f"{m.group(1)}***@{m.group(2)}", value)
+
+
+def mask_sensitive(obj: Any) -> Any:
+    """Copy of a JSON-like structure with secrets, credential patterns and e-mail local parts masked."""
+    if isinstance(obj, dict):
+        out = {}
+        for key, val in obj.items():
+            if isinstance(key, str) and _SENSITIVE_KEY.search(key) and not isinstance(val, (dict, list)):
+                out[key] = REDACTED if val not in (None, "") else val
+            else:
+                out[key] = mask_sensitive(val)
+        return out
+    if isinstance(obj, list):
+        return [mask_sensitive(v) for v in obj]
+    if isinstance(obj, str):
+        return mask_text(obj)
+    return obj

@@ -1,7 +1,8 @@
 """Integration settings, runtime status and honest connection tests.
 
-Secrets are write-only through the API: reads return a masked preview, and an empty
-value for a secret in an update keeps what is stored unless `clear` is set.
+Secrets are write-only through the API: reads only say whether one is set and where it comes
+from (no characters of the value are ever returned), and an empty value for a secret in an update
+keeps what is stored unless `clear` is set. Secret values are encrypted at rest (backend/crypto.py).
 """
 import ipaddress
 import logging
@@ -17,6 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from backend import netguard, ratelimit
+from backend.crypto import DecryptionError, decrypt_value, is_encrypted, seal_secret
 from backend.database import get_db
 from backend.dependencies import (
     ADMIN_ROLES,
@@ -75,7 +78,7 @@ KNOWN_DUMMY_VALUES = {
     "wazuh-api-admin",
 }
 
-BOOL_KEYS = {"hotl_enabled", "simulation_mode", "siem_verify_tls"}
+BOOL_KEYS = {"hotl_enabled", "simulation_mode", "siem_verify_tls", "require_mfa_for_admin"}
 URL_KEYS = {"siem_manager_url", "jira_base_url", "jira_webhook_url", "slack_webhook_url"}
 AGENT_AUTONOMY_LEVELS = ("recommend_only", "low_impact", "policy")
 _TRUE = {"1", "true", "yes", "on"}
@@ -126,6 +129,9 @@ def ensure_default_configurations(db: Session) -> None:
         if (row.key_value or "") in KNOWN_DUMMY_VALUES:
             row.key_value = ""
             changed = True
+        if secret and row.key_value and not is_encrypted(row.key_value):
+            row.key_value = seal_secret(row.key_value, True)
+            changed = True
 
     for key, (category, _env_var) in INTEGRATION_KEYS.items():
         if key in seen:
@@ -143,13 +149,20 @@ def ensure_default_configurations(db: Session) -> None:
         db.commit()
 
 
-def _mask(value: str) -> str:
-    return "••••" + (value[-4:] if len(value) >= 8 else "")
+SECRET_PLACEHOLDER = "••••••••"  # constant: reveals nothing about the value, not even its length or last characters
+
+
+def _stored_plaintext(row: Optional[SystemConfig]) -> str:
+    try:
+        return (decrypt_value(row.key_value) or "").strip() if row else ""
+    except DecryptionError:
+        logger.error(f"Setting {row.key_name} cannot be decrypted with the configured encryption key(s).")
+        return ""
 
 
 def _describe(key: str, row: Optional[SystemConfig]) -> Dict[str, Any]:
     category, env_var = INTEGRATION_KEYS[key]
-    stored = (row.key_value or "").strip() if row else ""
+    stored = _stored_plaintext(row)
     env_value = os.getenv(env_var, "").strip()
     if stored:
         source, effective = "database", stored
@@ -164,7 +177,7 @@ def _describe(key: str, row: Optional[SystemConfig]) -> Dict[str, Any]:
         "value": "" if secret else effective,
         "is_secret": secret,
         "is_set": bool(effective),
-        "preview": _mask(effective) if secret and effective else None,
+        "preview": SECRET_PLACEHOLDER if secret and effective else None,
         "source": source,
         "env_var": env_var,
         "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
@@ -273,10 +286,10 @@ def update_configurations(
         if row is None:
             row = SystemConfig(category=INTEGRATION_KEYS[key][0], key_name=key, key_value="", is_secret=key in SECRET_KEYS)
             db.add(row)
-        if (row.key_value or "") == value:
+        if _stored_plaintext(row) == value:
             unchanged.append(key)
             continue
-        row.key_value = value
+        row.key_value = seal_secret(value, key in SECRET_KEYS)
         row.is_secret = key in SECRET_KEYS
         row.updated_at = _now()
         updated.append(key)
@@ -393,13 +406,24 @@ def _result(service: str, status: str, health: str, message: str,
 
 
 def _probe(service: str, method: str, url: str, ok: Optional[Callable[[httpx.Response], Optional[bool]]] = None,
-           verify: bool = True, **kwargs) -> Dict[str, Any]:
-    """Make one read-only request and classify the outcome without guessing."""
+           verify: bool = True, guarded: bool = False, **kwargs) -> Dict[str, Any]:
+    """Make one read-only request and classify the outcome without guessing.
+
+    `guarded` (used for any URL that did not come from the stored settings) connects only to public
+    addresses, re-checked at connect time (backend/netguard.py).
+    """
     display = SERVICES[service][1]
     start = time.monotonic()
     try:
-        with httpx.Client(timeout=TEST_TIMEOUT, verify=verify, follow_redirects=False) as client:
+        if guarded:
+            client_ctx = httpx.Client(timeout=TEST_TIMEOUT, transport=netguard.guarded_transport(verify=verify),
+                                      follow_redirects=False, trust_env=False)
+        else:
+            client_ctx = httpx.Client(timeout=TEST_TIMEOUT, verify=verify, follow_redirects=False)
+        with client_ctx as client:
             response = client.request(method, url, **kwargs)
+    except netguard.UnsafeURLError as exc:  # the host resolved to a non-public address when connecting
+        return _result(service, ERROR, "Blocked", f"Connection refused by the SSRF guard: {exc}")
     except httpx.TimeoutException:
         latency = int((time.monotonic() - start) * 1000)
         return _result(service, UNREACHABLE, "Timed out", f"{display} did not answer within {TEST_TIMEOUT.read:.0f}s.", latency)
@@ -431,6 +455,32 @@ def _threatfox_ok(response: httpx.Response) -> Optional[bool]:
     return False if "auth" in query_status.lower() else None
 
 
+class _EndpointOverride(Exception):
+    """The test request cannot be run as asked (reported to the admin as HTTP 400)."""
+
+
+def _resolve_endpoint(stored: str, override: str, normalise: Callable[[str], str], to_url: Callable[[str], str]) -> Tuple[str, bool]:
+    """Pick the URL to test. Returns (value, overridden).
+
+    No override, or an override naming the stored host: the stored value is used. A different host is
+    accepted only if it resolves exclusively to public addresses (SSRF guard); the caller must then
+    use only credentials supplied in the request, never the stored ones.
+    """
+    stored_norm = normalise(stored)
+    if not override:
+        return stored_norm, False
+    candidate = normalise(override)
+    if not candidate:
+        raise _EndpointOverride("endpoint_url is not a valid address for this service.")
+    if stored_norm and netguard.same_origin_host(to_url(candidate), to_url(stored_norm)):
+        return stored_norm, False
+    try:
+        netguard.assert_public_url(to_url(candidate))
+    except netguard.UnsafeURLError as exc:
+        raise _EndpointOverride(f"endpoint_url refused: {exc}")
+    return candidate, True
+
+
 def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict[str, Any]:
     display = SERVICES[service][1]
     override_key = (req.api_key or "").strip()
@@ -442,6 +492,16 @@ def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict
 
     def not_configured(what: str) -> Dict[str, Any]:
         return _result(service, NOT_CONFIGURED, "Missing credentials", f"{display} is not configured: set {what}.")
+
+    def endpoint(stored_key: str, normalise: Callable[[str], str], to_url: Callable[[str], str]) -> Tuple[str, bool]:
+        return _resolve_endpoint(get_setting(stored_key, db=db), override_url, normalise, to_url)
+
+    def require_own_credentials(*supplied: str) -> None:
+        if not all(supplied):
+            raise _EndpointOverride(
+                "To test a different endpoint, supply the credentials to use for it in the request; "
+                "stored credentials are never sent to a host other than the stored one."
+            )
 
     if service == "virustotal":
         key = setting("virustotal_api_key", override_key)
@@ -482,31 +542,42 @@ def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict
         return result
 
     if service == "wazuh":
-        base = _http_url(setting("siem_manager_url", override_url))
-        user = setting("siem_user", override_user)
-        password = setting("siem_password", override_key)
+        base, overridden = endpoint("siem_manager_url", lambda v: _http_url(v) or "", lambda v: v)
+        if overridden:
+            require_own_credentials(override_user, override_key)
+            user, password = override_user, override_key
+        else:
+            user, password = setting("siem_user", override_user), setting("siem_password", override_key)
         if not (base and user and password):
             return not_configured("siem_manager_url (http/https), siem_user and siem_password")
         verify = get_bool("siem_verify_tls", db=db)
-        return _probe(service, "POST", f"{base}/security/user/authenticate", auth=(user, password), verify=verify)
+        return _probe(service, "POST", f"{base}/security/user/authenticate", auth=(user, password), verify=verify,
+                      guarded=overridden)
 
     if service == "okta":
-        host = _host_only(setting("okta_domain", override_url))
-        token = setting("okta_api_token", override_key)
+        host, overridden = endpoint("okta_domain", _host_only, lambda v: f"https://{v}")
+        if overridden:
+            require_own_credentials(override_key)
+            token = override_key
+        else:
+            token = setting("okta_api_token", override_key)
         if not (host and token):
             return not_configured("okta_domain and okta_api_token")
         if not _HOSTNAME_RE.match(host):
             return _result(service, ERROR, "Invalid domain", f"'{host}' is not a valid Okta domain.")
         return _probe(service, "GET", f"https://{host}/api/v1/users/me",
-                      headers={"Authorization": f"SSWS {token}", "Accept": "application/json"})
+                      headers={"Authorization": f"SSWS {token}", "Accept": "application/json"}, guarded=overridden)
 
     if service == "jira":
-        base = _http_url(setting("jira_base_url", override_url))
-        email = setting("jira_email", override_user)
-        token = setting("jira_api_token", override_key)
+        base, overridden = endpoint("jira_base_url", lambda v: _http_url(v) or "", lambda v: v)
+        if overridden:
+            require_own_credentials(override_user, override_key)
+            email, token = override_user, override_key
+        else:
+            email, token = setting("jira_email", override_user), setting("jira_api_token", override_key)
         if base and email and token:
             return _probe(service, "GET", f"{base}/rest/api/2/myself", auth=(email, token),
-                          headers={"Accept": "application/json"})
+                          headers={"Accept": "application/json"}, guarded=overridden)
         if get_setting("jira_webhook_url", db=db):
             return _result(service, NOT_TESTED, "Webhook configured",
                            "A Jira automation webhook is configured. It is not called by this test because every call creates an issue.")
@@ -531,7 +602,10 @@ def test_integration_connection(
     [Admin Only] Perform a real, read-only authentication check against one integration and report
     exactly what happened: Not Configured / Connected / Auth failed / Unreachable / Error, or
     "Configured (not tested to avoid posting)" for webhooks that cannot be called without side effects.
-    Stored settings are used unless api_key / endpoint_url / username overrides are supplied.
+    Stored URLs and secrets are used by default. An `api_key` / `username` override is sent only to the
+    stored host (or the vendor's fixed API). An `endpoint_url` naming a different host is allowed only if
+    it resolves to public addresses, and then the request must carry its own credentials: a stored secret
+    is never sent to a host other than the stored one. Rate limited per administrator.
     """
     service = _resolve_service(req.service_name)
     if not service:
@@ -539,7 +613,13 @@ def test_integration_connection(
             status_code=400,
             detail=f"Unknown service '{req.service_name}'. Supported: {', '.join(SERVICES)}.",
         )
-    result = _test_service(service, req, db)
+    ratelimit.enforce("test_connection", f"user:{admin.user_id}")
+    try:
+        result = _test_service(service, req, db)
+    except _EndpointOverride as exc:
+        record_log(db, "CONFIG", "WARNING", f"Connection test for {service} refused: {exc}", target=service,
+                   details={"by": admin.username, "endpoint_override": True})
+        raise HTTPException(status_code=400, detail=str(exc))
     record_log(db, "CONFIG", "INFO" if result["is_connected"] else "WARNING",
                f"Connection test for {result['service_name']}: {result['status']}.",
                target=service, details={"by": admin.username, "health": result["health"], "http_status": result["http_status"]})

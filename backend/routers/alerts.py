@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -20,7 +20,10 @@ from backend.crud import (
     get_ioc_artifacts_by_alert,
 )
 from backend.database import SessionLocal, get_db
+from backend.security import consume_confirmation_token, issue_confirmation_token, mask_sensitive
 from backend.dependencies import (
+    get_token_payload,
+    role_level,
     get_current_user,
     require_admin,
     require_analyst_or_admin,
@@ -136,9 +139,44 @@ def get_metrics(db: Session = Depends(get_db), current_user: User = Depends(get_
     return get_dashboard_metrics(db)
 
 
+PURGE_CONFIRM_TTL_SECONDS = 120
+
+
+@router.get("/purge/confirm")
+def issue_purge_confirmation(
+    current_user: User = Depends(require_admin),
+    token_payload: Dict[str, Any] = Depends(get_token_payload),
+):
+    """[Admin Only] Step 1 of a purge: returns a one-time token (valid 2 minutes, bound to this admin session).
+    Send it as the `X-Confirm-Token` header of DELETE /alerts/purge."""
+    token = issue_confirmation_token("alerts_purge", current_user.username, token_payload.get("jti", ""),
+                                     PURGE_CONFIRM_TTL_SECONDS)
+    return {"confirm_token": token, "expires_in_seconds": PURGE_CONFIRM_TTL_SECONDS,
+            "message": "Send this value as the X-Confirm-Token header of DELETE /alerts/purge. It works once."}
+
+
 @router.delete("/purge")
-def purge_all_alerts(db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
-    """Delete every alert and its artifacts, executions, actions, proposals and reports (admin only)."""
+def purge_all_alerts(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+    token_payload: Dict[str, Any] = Depends(get_token_payload),
+    confirm_token: Optional[str] = Header(default=None, alias="X-Confirm-Token"),
+):
+    """Delete every alert and its artifacts, executions, actions, proposals and reports (admin only).
+
+    Requires the one-time `X-Confirm-Token` from GET /alerts/purge/confirm, issued to this same session.
+    The purge is audit-logged before and after it runs.
+    """
+    if not confirm_token or not consume_confirmation_token(
+        confirm_token, "alerts_purge", current_user.username, token_payload.get("jti", "")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail="Confirmation required: call GET /alerts/purge/confirm and send the token as X-Confirm-Token.",
+        )
+    from backend.routers.logs import record_log as _audit
+    _audit(db, "RBAC", "WARNING", f"{current_user.username} confirmed and started a purge of ALL alerts.",
+           current_user.username, {"by": current_user.username, "phase": "start"})
     report_paths = [r.pdf_path for r in db.query(IncidentReport).all()]
     for model in (AgentProposal, AnalystActionLog, IncidentReport, ContainmentAction, PlaybookExecution, IocArtifact):
         db.query(model).delete(synchronize_session=False)
@@ -157,9 +195,9 @@ def purge_all_alerts(db: Session = Depends(get_db), current_user: User = Depends
     try:
         from backend.routers.logs import record_log
         record_log(db, "RBAC", "WARNING", f"{current_user.username} purged {deleted_count} alert(s) and their records.",
-                   current_user.username, {"deleted_alerts": deleted_count})
+                   current_user.username, {"deleted_alerts": deleted_count, "by": current_user.username, "phase": "done"})
     except Exception as exc:
-        logger.debug(f"Could not record purge log: {exc}")
+        logger.error(f"Could not record purge audit entry: {exc}")
 
     return {
         "status": "success",
@@ -183,6 +221,8 @@ def list_alerts(
     for alert in alerts:
         iocs = get_ioc_artifacts_by_alert(db, alert.alert_id)
         data = alert.to_dict()
+        if role_level(current_user.role) == "read_only":
+            data["raw_payload"] = mask_sensitive(data.get("raw_payload"))
         data["ioc_count"] = len(iocs)
         data["max_threat_score"] = max([i.threat_score for i in iocs], default=0)
         data["malicious_ioc_count"] = sum(1 for i in iocs if i.verdict == "Malicious")
@@ -218,7 +258,8 @@ def get_alert_detail(alert_id: int, db: Session = Depends(get_db), current_user:
         "resolved_by": alert.resolved_by,
         "resolved_at": alert.resolved_at.isoformat() if alert.resolved_at else None,
         "created_at": alert.created_at.isoformat() if alert.created_at else None,
-        "raw_payload": alert.raw_payload,
+        # The read-only auditor role sees credentials, tokens and e-mail addresses masked.
+        "raw_payload": mask_sensitive(alert.raw_payload) if role_level(current_user.role) == "read_only" else alert.raw_payload,
         "ioc_artifacts": [i.to_dict() for i in iocs],
         "playbook_executions": [e.to_dict() for e in executions],
         "containment_actions": [a.to_dict() for a in actions],

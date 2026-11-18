@@ -16,7 +16,8 @@ os.environ["CELERY_BROKER_URL"] = "redis://127.0.0.1:1/0"  # unreachable -> runn
 os.environ["PHANTOM_ENV"] = "test"
 os.environ["PHANTOM_JWT_SECRET"] = "test-only-jwt-secret-not-for-production-use-0123456789"
 os.environ["PHANTOM_BOOTSTRAP_ADMIN_PASSWORD"] = "Test-Admin-Passphrase-2026"
-os.environ["PHANTOM_INGEST_TOKEN"] = "test-ingest-token"
+os.environ["PHANTOM_BOOTSTRAP_ADMIN_USERNAME"] = "abunemah"
+os.environ["PHANTOM_INGEST_TOKEN"] = "test-ingest-token-0123456789-abcdefghijklmnop"
 os.environ["PHANTOM_SIMULATION_MODE"] = "true"
 
 # Never let tests reach real threat-intel or response APIs.

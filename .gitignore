@@ -53,3 +53,5 @@ backend/reports/*
 !backend/reports/.gitkeep
 *.tsbuildinfo
 *.migrate.lock
+.phantom_dev_key
+phantom_bootstrap_admin_password.txt

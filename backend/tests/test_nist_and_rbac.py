@@ -1,3 +1,6 @@
+import time
+import types
+
 import pyotp
 
 from backend.security import hash_password, verify_password, check_nist_password_policy, is_compromised_password
@@ -13,7 +16,10 @@ def provision_operator(client, admin_headers, username: str, role: str, password
             client.delete(f"/api/users/{u['user_id']}", headers=admin_headers)
     created = client.post("/api/users", json={"username": username, "role": role}, headers=admin_headers)
     assert created.status_code == 201, created.text
-    change = client.post("/api/auth/change-password", json={
+    # Changing a password needs the account's own session: sign in with the one-time password first.
+    login = client.post("/api/auth/login", json={"username": username, "password": created.json()["temporary_password"]})
+    assert login.status_code == 200, login.text
+    change = client.post("/api/auth/change-password", headers={"Authorization": f"Bearer {login.json()['access_token']}"}, json={
         "username": username,
         "current_password": created.json()["temporary_password"],
         "new_password": password,
@@ -56,7 +62,7 @@ def test_nist_password_policy_validation():
     assert valid_comp is False
 
 
-def test_mfa_workflow_and_login_challenge(client, admin_headers):
+def test_mfa_workflow_and_login_challenge(client, admin_headers, monkeypatch):
     op = provision_operator(client, admin_headers, "mfa_operator", "SOC Analyst")
     headers = op["headers"]
 
@@ -68,7 +74,11 @@ def test_mfa_workflow_and_login_challenge(client, admin_headers):
     assert client.post("/api/auth/mfa/verify", json={"code": "000000"}, headers=headers).status_code == 400
 
     totp = pyotp.TOTP(secret)
-    verify_res = client.post("/api/auth/mfa/verify", json={"code": totp.now()}, headers=headers)
+    # A TOTP code is accepted once (replay protection). Pin the server clock in the middle of a step and
+    # use a different step for each use: enrol (now), sign in (+30s), disable (-30s).
+    fixed_now = int(time.time() // 30) * 30 + 15
+    monkeypatch.setattr("backend.security.time", types.SimpleNamespace(time=lambda: fixed_now))
+    verify_res = client.post("/api/auth/mfa/verify", json={"code": totp.at(fixed_now)}, headers=headers)
     assert verify_res.status_code == 200
     assert verify_res.json()["mfa_enabled"] is True
 
@@ -84,21 +94,22 @@ def test_mfa_workflow_and_login_challenge(client, admin_headers):
     assert bad_code.status_code == 401
 
     login_success = client.post("/api/auth/login", json={
-        "username": "mfa_operator", "password": op["password"], "mfa_code": totp.now()
+        "username": "mfa_operator", "password": op["password"], "mfa_code": totp.at(fixed_now + 30)
     })
     assert login_success.status_code == 200
     assert login_success.json()["mfa_required"] is False
     assert len(login_success.json()["access_token"]) > 10
 
     # Password change on an MFA account needs a second factor (code or the operator's own session).
-    no_factor = client.post("/api/auth/change-password", json={
+    no_factor = client.post("/api/auth/change-password", headers=headers, json={
         "username": "mfa_operator", "current_password": op["password"], "new_password": "Another-Long-Passphrase-2026"
     })
     assert no_factor.status_code == 400
 
-    # Disabling MFA requires a current code.
+    # Disabling MFA requires the account password and a current code.
     assert client.post("/api/auth/mfa/disable", headers=headers).status_code == 400
-    disable_res = client.post("/api/auth/mfa/disable", json={"code": totp.now()}, headers=headers)
+    assert client.post("/api/auth/mfa/disable", json={"code": totp.at(fixed_now - 30)}, headers=headers).status_code == 400
+    disable_res = client.post("/api/auth/mfa/disable", json={"code": totp.at(fixed_now - 30), "password": op["password"]}, headers=headers)
     assert disable_res.status_code == 200
     assert disable_res.json()["mfa_enabled"] is False
 
