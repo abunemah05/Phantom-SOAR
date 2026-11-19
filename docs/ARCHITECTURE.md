@@ -74,6 +74,51 @@ Tables: `users`, `system_configs`, `alerts`, `ioc_artifacts`, `playbooks`, `play
    is real elapsed time. An incident PDF can be generated per alert (ReportLab); an analyst-activity PDF is available
    on the Reports page.
 
+### Report filters (Reports page, `GET /api/reports/analyst-activity` and `/pdf`)
+
+Admin only. Every number and table in the JSON report and in the PDF honours the same two filters, the time range and
+the severity, but each record type is placed in the range by its own timestamp:
+
+| Number | A record counts when | Severity / analyst filter |
+|---|---|---|
+| Cases (`total_cases_reviewed`, `severity_breakdown`, the case list, per-analyst cases) | the alert was **created or resolved** inside the range | the alert's severity; analyst = assigned to or resolved by |
+| Analyst decision logs (escalated / monitored / dismissed, the log list) | the log's own `timestamp` is inside the range | severity of its alert; analyst = the logger |
+| Containment actions (`total_containment_actions`, `containment_by_mode`, per-analyst `containment_actions_taken`) | the action's own `timestamp` is inside the range, **whenever its alert was created** | severity of its alert; analyst = `executed_by` (the same definition for the total and the per-analyst figure) |
+| Playbook MTTR (`average_mttr_seconds`, `mttr_sample_size`, per-analyst average) | the execution's own `executed_at` is inside the range | severity of its alert; analyst = alert assigned to or resolved by (an execution has no analyst of its own) |
+
+An action or execution 400 days after the range is therefore never counted, however recent its alert. (Before this
+fix the containment and MTTR figures were selected by the alert's creation or resolution time only, so they could count
+records outside the range; the per-analyst containment count already used the action's timestamp.)
+
+* **Severity** (`severity`): `Critical`, `High`, `Medium`, `Low` (the values of `alerts.severity`), case-insensitive and
+  ignoring surrounding spaces (the filter and `severity_breakdown` use the same normalisation),
+  repeated (`severity=High&severity=Critical`) or comma-separated; omitted, empty or `all` means every severity. An
+  unknown value, or `all` mixed with specific levels, answers **422** with the list of valid values. The filter applies
+  to the matched cases, their containment actions and playbook MTTR, the analyst decision logs and the per-analyst
+  containment counts. The response carries `filtered_severities` and `severity_breakdown` (cases per severity, zeros
+  included, most severe first); the PDF header prints the severity filter and a "Cases by Severity" table.
+* **Time range** (`period`): `day` (since 00:00 UTC today), `week` (7x24h), `month` (30x24h), `relative` or `custom`.
+  `relative` takes `last_n` (whole number >= 1) and `last_unit` (`seconds`, `minutes`, `hours`, `days`) and ends at the
+  server's now. `custom` takes `start_date` (required) and `end_date` (optional, defaults to now).
+* **Time zone**: everything is aware UTC. Inputs with an offset or `Z` are converted to UTC; a date-time without an
+  offset is read as UTC; a date-only value (`YYYY-MM-DD`) is a whole UTC day (start 00:00:00, end 23:59:59.999999).
+  The web page converts the operator's local date-time (a `datetime-local` input with one-second steps) to UTC in the
+  browser, so the backend never guesses a zone. The response (`start_date`, `end_date`, `timezone: "UTC"`) and the PDF
+  header state the exact range used. The range is a closed interval: a record stamped exactly at the start or the end
+  is included.
+* **Limits**: the end must be after the start and the span at most 366 days, otherwise **422** with a message; a year
+  outside 2000-2100, an unparseable date, an unknown `period` and a missing `start_date`/`last_n` are also 422.
+  **Behaviour change for existing callers:** `period=day|week|month` and a well-formed `custom` range with date-only
+  (or date-time) `start_date`/`end_date` give the same results as before, but input that used to be accepted silently
+  now answers 422 instead of quietly reporting the last 30 days: an unknown `period` value (for example `year`),
+  `period=custom` without a `start_date` or with an unparseable one, a year outside 2000-2100, and a range longer than 366
+  days. Two more cases that were silently tolerated are also 422 now: an unparseable `end_date` (it used to mean "now")
+  and an end that is not after the start (it used to produce an empty report).
+  A client that relied on that fallback must send valid parameters (or omit `period` to get the default last 30 days).
+  The Reports page validates the same rules before it sends the request.
+* The page remembers the selected filters for the browser tab (`sessionStorage`), so a reload shows the same report.
+  No database migration is involved: the filters read existing columns only.
+
 ## 3. Guardrails
 
 * **Simulation mode** (default on) is a hard stop: no response action is sent to Wazuh, Okta, Jira or Slack, even when
@@ -86,6 +131,8 @@ Tables: `users`, `system_configs`, `alerts`, `ioc_artifacts`, `playbooks`, `play
   its default gateway), which no actor may isolate or block. Loopback/reserved addresses are never blocked. Actions
   carry per-action parameter validation. Agent actions additionally need `confidence >= agent_min_confidence`
   (default 0.85) and the configured autonomy (`recommend_only` default, `low_impact`, `policy`).
+  The minimum is chosen from a fixed list of named levels in the console, not typed; the levels, the reason for the
+  default and a comparison with other products are in [CONFIDENCE_LEVEL.md](CONFIDENCE_LEVEL.md).
 * **HOTL switch** cannot be enabled until protected users and hosts/IPs (or the Wazuh manager) are configured; the
   API answers 409 with the list of blockers.
   The requirement is also enforced at run time (`integration_config.hotl_effective`): a switch set from the environment is

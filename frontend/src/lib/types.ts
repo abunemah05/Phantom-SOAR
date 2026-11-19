@@ -42,6 +42,33 @@ export interface User {
   last_used_ip?: string | null;
   password_changed_at?: string | null;
   created_at?: string | null;
+  /** GET /users only: what the signed-in administrator may do to this account (backend/rbac.py is the authority). */
+  account_actions?: Partial<Record<AccountActionKey, AccountActionState>>;
+}
+
+export type AccountActionKey =
+  | 'change_role'
+  | 'set_active'
+  | 'reset_password'
+  | 'set_compromised'
+  | 'unlock'
+  | 'delete'
+  | 'rotate_key'
+  | 'service_policy';
+
+export interface AccountActionState {
+  allowed: boolean;
+  /** Why the action is refused (when !allowed) or why it needs a confirmation (when step_up). */
+  reason?: string | null;
+  /** The acting administrator must re-enter their own password (and an MFA code when they use MFA). */
+  step_up?: boolean;
+  code?: string;
+}
+
+/** Sent with a sensitive account change: the acting administrator's OWN credentials. */
+export interface StepUpConfirmation {
+  current_password: string;
+  mfa_code?: string;
 }
 
 export interface LoginResponse {
@@ -562,7 +589,16 @@ export interface AdminReportData {
   period: string;
   start_date: string;
   end_date: string;
+  /** start_date / end_date are ISO-8601 in this zone (always "UTC") and both inclusive. */
+  timezone?: string;
+  /** preset | absolute | relative */
+  range_mode?: string;
+  generated_at?: string | null;
   filtered_analyst?: string | null;
+  /** Empty = all severities. */
+  filtered_severities?: string[];
+  /** Cases in the report per severity, most severe first (zeros included). */
+  severity_breakdown?: Record<string, number>;
   total_cases_reviewed: number;
   total_containment_actions: number;
   /** live / simulated / skipped / blocked / failed */

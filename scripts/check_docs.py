@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DOCS = [
     ROOT / "README.md", ROOT / "SECURITY.md", ROOT / "LIVE_CHECKLIST.md", ROOT / "docs" / "ARCHITECTURE.md",
-    ROOT / "docs" / "DEPLOYMENT.md", ROOT / "wazuh" / "README.md",
+    ROOT / "docs" / "DEPLOYMENT.md", ROOT / "docs" / "PLAYBOOK_IMPORT.md", ROOT / "wazuh" / "README.md",
 ]
 NAME = r"[A-Z][A-Z0-9_]*"
 

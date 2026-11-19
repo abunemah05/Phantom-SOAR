@@ -9,6 +9,8 @@ export interface ParsedErrorDetail {
   message: string;
   /** Reasons an action was refused (e.g. HOTL cannot be enabled yet). */
   blockers: string[];
+  /** Stable machine-readable reason when the backend sends one (account policy: "self_role_change", "step_up_failed", ...). */
+  code?: string;
 }
 
 export class ApiError extends Error {
@@ -16,13 +18,16 @@ export class ApiError extends Error {
   status: number;
   blockers: string[];
   retryAfterSeconds?: number;
+  /** Machine-readable reason from the backend, when it sent one. */
+  code?: string;
 
-  constructor(status: number, message: string, extra?: { blockers?: string[]; retryAfterSeconds?: number }) {
+  constructor(status: number, message: string, extra?: { blockers?: string[]; retryAfterSeconds?: number; code?: string }) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.blockers = extra?.blockers ?? [];
     this.retryAfterSeconds = extra?.retryAfterSeconds;
+    this.code = extra?.code;
   }
 }
 
@@ -65,7 +70,8 @@ export function parseErrorBody(status: number, bodyText: string): ParsedErrorDet
   }
   if (isRecord(detail)) {
     const message = typeof detail.message === 'string' && detail.message ? detail.message : fallback;
-    return { message, blockers: asStringList(detail.blockers) };
+    const code = typeof detail.code === 'string' && detail.code ? detail.code : undefined;
+    return { message, blockers: asStringList(detail.blockers), ...(code ? { code } : {}) };
   }
   return { message: fallback, blockers: [] };
 }
@@ -102,6 +108,11 @@ export function errorBlockers(err: unknown): string[] {
 
 export function isUnauthorized(err: unknown): boolean {
   return err instanceof ApiError && err.status === 401;
+}
+
+/** The backend refused only because a sensitive account change needs the administrator's own password / MFA code. */
+export function isStepUpRequired(err: unknown): boolean {
+  return err instanceof ApiError && (err.status === 428 || err.code === 'step_up_required' || err.code === 'step_up_failed');
 }
 
 export function isForbidden(err: unknown): boolean {

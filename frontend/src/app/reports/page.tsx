@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { 
   BarChart3, 
   Calendar, 
@@ -23,18 +23,59 @@ import { AdminReportData } from "@/lib/types";
 import { canAdminister } from "@/lib/roles";
 import { useAuth } from "@/components/AuthGate";
 import { AccessDenied, ErrorState, LoadingState, StaleBanner } from "@/components/StateViews";
-import { formatDateTime, formatDuration } from "@/lib/format";
+import { formatDateTime, formatDuration, parseApiDate } from "@/lib/format";
+import {
+  DEFAULT_FILTERS,
+  FILTER_STORAGE_KEY,
+  MAX_RANGE_DAYS,
+  RELATIVE_UNITS,
+  ReportFilters,
+  ReportPeriod,
+  SEVERITIES,
+  Severity,
+  describeSeverities,
+  formatUtcSeconds,
+  maxRelativeValue,
+  parseStoredState,
+  serialiseStoredState,
+  timeZoneLabel,
+  toggleSeverity,
+  isLastSelectedSeverity,
+  validateFilters,
+} from "@/lib/reportRange";
+
+const SEVERITY_STYLES: Record<string, { badge: string; card: string }> = {
+  Critical: { badge: "bg-rose-500/20 text-rose-400 border border-rose-500/30", card: "text-rose-400" },
+  High: { badge: "bg-amber-500/20 text-amber-400 border border-amber-500/30", card: "text-amber-400" },
+  Medium: { badge: "bg-blue-500/20 text-blue-400 border border-blue-500/30", card: "text-blue-400" },
+  Low: { badge: "bg-slate-800 text-slate-400 border border-slate-700", card: "text-slate-300" },
+  Other: { badge: "bg-slate-800 text-slate-400 border border-slate-700", card: "text-slate-500" },
+};
+
+const PERIOD_TABS: Array<{ id: ReportPeriod; label: string }> = [
+  { id: "day", label: "Today (UTC)" },
+  { id: "week", label: "Past 7 Days" },
+  { id: "month", label: "Past 30 Days" },
+  { id: "relative", label: "Last N..." },
+  { id: "custom", label: "Custom Range" },
+];
+
+const INPUT_CLASS =
+  "bg-slate-950 border border-slate-800 text-white text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500";
 
 export default function AdminReportsPage() {
   const { user: currentUser } = useAuth();
   const isAuthorized = canAdminister(currentUser);
   
-  // Filter States
-  const [period, setPeriod] = useState<string>("month");
-  const [selectedAnalyst, setSelectedAnalyst] = useState<string>("all");
-  const [startDate, setStartDate] = useState<string>("");
-  const [endDate, setEndDate] = useState<string>("");
+  // Filter state. `filters` are the controls as the operator left them; `applied` is the validated snapshot the
+  // report was last requested with (the range inputs only take effect through "Apply"). Both survive a page
+  // refresh (sessionStorage), so a reload shows the same report again.
+  const [filters, setFilters] = useState<ReportFilters>(DEFAULT_FILTERS);
+  const [applied, setApplied] = useState<ReportFilters>(DEFAULT_FILTERS);
+  const [hydrated, setHydrated] = useState<boolean>(false);
+  const [rangeError, setRangeError] = useState<string | null>(null);
   const [analysts, setAnalysts] = useState<Array<{ username: string; role: string }>>([]);
+  const [zoneLabel, setZoneLabel] = useState<string>("");
 
   // Data & Loading States
   const [report, setReport] = useState<AdminReportData | null>(null);
@@ -43,6 +84,29 @@ export default function AdminReportsPage() {
   const [downloading, setDownloading] = useState<boolean>(false);
 
   const [analystsError, setAnalystsError] = useState<string | null>(null);
+  const requestSeq = useRef(0);
+
+  // Restore the previous selection once on the client (not during render: avoids a hydration mismatch).
+  useEffect(() => {
+    try {
+      const stored = parseStoredState(window.sessionStorage.getItem(FILTER_STORAGE_KEY));
+      setFilters(stored.filters);
+      setApplied(stored.applied);
+    } catch {
+      /* storage unavailable (private mode): start from the defaults */
+    }
+    setZoneLabel(timeZoneLabel());
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    try {
+      window.sessionStorage.setItem(FILTER_STORAGE_KEY, serialiseStoredState({ filters, applied }));
+    } catch {
+      /* ignore */
+    }
+  }, [hydrated, filters, applied]);
 
   const loadAnalysts = useCallback(async () => {
     try {
@@ -54,41 +118,45 @@ export default function AdminReportsPage() {
   }, []);
 
   const loadReport = useCallback(async () => {
+    const check = validateFilters(applied);
+    if (!check.ok) {
+      setError(check.error);
+      setLoading(false);
+      return;
+    }
+    const seq = ++requestSeq.current;
     setLoading(true);
     setError(null);
     try {
-      const data = await api.getAdminReport({
-        analyst: selectedAnalyst,
-        period,
-        start_date: period === "custom" ? startDate : undefined,
-        end_date: period === "custom" ? endDate : undefined,
-      });
-      setReport(data);
+      const data = await api.getAdminReport(check.params);
+      if (seq === requestSeq.current) setReport(data);
     } catch (err) {
-      setError(describeError(err, "Failed to load the reporting analytics."));
+      if (seq === requestSeq.current) setError(describeError(err, "Failed to load the reporting analytics."));
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
-    // Custom date ranges are applied explicitly through the filter form.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [period, selectedAnalyst]);
+  }, [applied]);
 
   useEffect(() => {
-    if (!isAuthorized) return;
+    if (!isAuthorized || !hydrated) return;
     void loadAnalysts();
+  }, [isAuthorized, hydrated, loadAnalysts]);
+
+  useEffect(() => {
+    if (!isAuthorized || !hydrated) return;
     void loadReport();
-  }, [isAuthorized, loadReport, loadAnalysts]);
+  }, [isAuthorized, hydrated, loadReport]);
 
   const handleDownloadPdf = async () => {
+    const check = validateFilters(applied);
+    if (!check.ok) {
+      setError(check.error);
+      return;
+    }
     setDownloading(true);
     setError(null);
     try {
-      await api.downloadAdminReportPdf({
-        analyst: selectedAnalyst,
-        period,
-        start_date: period === "custom" ? startDate : undefined,
-        end_date: period === "custom" ? endDate : undefined,
-      });
+      await api.downloadAdminReportPdf(check.params);
     } catch (err) {
       setError(`PDF export failed: ${describeError(err)}`);
     } finally {
@@ -96,10 +164,46 @@ export default function AdminReportsPage() {
     }
   };
 
-  const handleApplyCustomFilter = (e: React.FormEvent) => {
-    e.preventDefault();
-    loadReport();
+  const changeAnalyst = (analyst: string) => {
+    setFilters((f) => ({ ...f, analyst }));
+    setApplied((a) => ({ ...a, analyst }));
   };
+
+  const changeSeverities = (severity: Severity | "all") => {
+    const next = severity === "all" ? [] : toggleSeverity(filters.severities, severity);
+    setFilters((f) => ({ ...f, severities: next }));
+    setApplied((a) => ({ ...a, severities: next }));
+  };
+
+  const selectPeriod = (period: ReportPeriod) => {
+    const next = { ...filters, period };
+    setFilters(next);
+    setRangeError(null);
+    if (period === "custom" || period === "relative") {
+      // Switch straight to the new range when its inputs are already valid; otherwise wait for the operator.
+      if (validateFilters(next).ok) setApplied({ ...next });
+    } else {
+      setApplied((a) => ({ ...a, period }));
+    }
+  };
+
+  const handleApplyRange = (e: React.FormEvent) => {
+    e.preventDefault();
+    const check = validateFilters(filters);
+    if (!check.ok) {
+      setRangeError(check.error);
+      return;
+    }
+    setRangeError(null);
+    setApplied({ ...filters });
+  };
+
+  const localStart = parseApiDate(report?.start_date);
+  const localEnd = parseApiDate(report?.end_date);
+  const localRange = localStart && localEnd ? `${formatDateTime(report?.start_date)} to ${formatDateTime(report?.end_date)}` : "";
+  const relativeMax = maxRelativeValue(filters.relativeUnit);
+  const reportSeverities = report?.filtered_severities ?? [];
+  const severityCounts = report?.severity_breakdown ?? {};
 
   if (!isAuthorized) {
     return (
@@ -136,7 +240,7 @@ export default function AdminReportsPage() {
             <span>{downloading ? "Preparing PDF..." : "Export Executive PDF Report"}</span>
           </button>
           <button
-            onClick={loadReport}
+            onClick={() => void loadReport()}
             disabled={loading}
             className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-300 transition"
             title="Refresh Report Data"
@@ -146,22 +250,19 @@ export default function AdminReportsPage() {
         </div>
       </div>
 
-      {/* Filter Toolbar (Calendar & Analyst Selector) */}
+      {/* Filter Toolbar (time range, analyst and severity) */}
       <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-xl space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           {/* Quick Period Tabs */}
-          <div className="flex items-center space-x-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800/80">
-            {[
-              { id: "day", label: "Today (24h)" },
-              { id: "week", label: "Past 7 Days" },
-              { id: "month", label: "Past 30 Days" },
-              { id: "custom", label: "Custom Range" },
-            ].map((tab) => (
+          <div className="flex flex-wrap items-center gap-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800/80">
+            {PERIOD_TABS.map((tab) => (
               <button
                 key={tab.id}
-                onClick={() => setPeriod(tab.id)}
+                type="button"
+                onClick={() => selectPeriod(tab.id)}
+                aria-pressed={filters.period === tab.id}
                 className={`px-3 py-1.5 rounded-md text-xs font-semibold transition ${
-                  period === tab.id
+                  filters.period === tab.id
                     ? "bg-blue-600 text-white shadow-sm shadow-blue-600/30"
                     : "text-slate-400 hover:text-slate-200"
                 }`}
@@ -175,8 +276,9 @@ export default function AdminReportsPage() {
           <div className="flex items-center space-x-2 min-w-[240px]">
             <Users className="h-4 w-4 text-slate-400" />
             <select
-              value={selectedAnalyst}
-              onChange={(e) => setSelectedAnalyst(e.target.value)}
+              aria-label="Analyst"
+              value={filters.analyst}
+              onChange={(e) => changeAnalyst(e.target.value)}
               className="flex-1 bg-slate-950 border border-slate-800 text-white text-xs font-medium rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-blue-500"
             >
               <option value="all">All SOC Analysts (Aggregate)</option>
@@ -189,38 +291,126 @@ export default function AdminReportsPage() {
           </div>
         </div>
 
-        {/* Custom Date Picker Inputs (Visible when 'custom' is active) */}
-        {period === "custom" && (
-          <form onSubmit={handleApplyCustomFilter} className="pt-3 border-t border-slate-800/80 flex flex-wrap items-center gap-3">
-            <div className="flex items-center space-x-2 text-xs text-slate-300">
-              <Calendar className="h-4 w-4 text-blue-400" />
-              <span>Start Date:</span>
-              <input
-                type="date"
-                required
-                value={startDate}
-                onChange={(e) => setStartDate(e.target.value)}
-                className="bg-slate-950 border border-slate-800 text-white text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500"
-              />
-            </div>
+        {/* Severity filter: "All" or any combination of levels */}
+        <fieldset className="flex flex-wrap items-center gap-2 text-xs text-slate-300">
+          <legend className="sr-only">Case severity</legend>
+          <Filter className="h-4 w-4 text-slate-400" aria-hidden="true" />
+          <span className="font-semibold text-slate-400 mr-1">Severity:</span>
+          <label className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md border cursor-pointer select-none transition ${
+            filters.severities.length === 0 ? "bg-blue-600/20 border-blue-500/40 text-blue-300" : "border-slate-800 text-slate-400 hover:text-slate-200"
+          }`}>
+            <input
+              type="checkbox"
+              checked={filters.severities.length === 0}
+              onChange={() => changeSeverities("all")}
+              className="accent-blue-500"
+            />
+            <span className="font-semibold">All</span>
+          </label>
+          {SEVERITIES.map((sev) => {
+            const checked = filters.severities.length === 0 || filters.severities.includes(sev);
+            const last = isLastSelectedSeverity(filters.severities, sev);
+            return (
+              <label
+                key={sev}
+                title={last ? "At least one severity must stay selected. Tick All to show every severity." : undefined}
+                className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-md border cursor-pointer select-none transition ${
+                  filters.severities.includes(sev) ? SEVERITY_STYLES[sev].badge : "border-slate-800 text-slate-500 hover:text-slate-300"
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => changeSeverities(sev)}
+                  disabled={last}
+                  className="accent-blue-500"
+                />
+                <span className="font-semibold">{sev}</span>
+              </label>
+            );
+          })}
+        </fieldset>
 
-            <div className="flex items-center space-x-2 text-xs text-slate-300">
-              <span>End Date:</span>
-              <input
-                type="date"
-                required
-                value={endDate}
-                onChange={(e) => setEndDate(e.target.value)}
-                className="bg-slate-950 border border-slate-800 text-white text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-blue-500"
-              />
+        {/* Relative range: last N units (visible when 'relative' is selected) */}
+        {filters.period === "relative" && (
+          <form onSubmit={handleApplyRange} className="pt-3 border-t border-slate-800/80 space-y-2">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center space-x-2 text-xs text-slate-300">
+                <Clock className="h-4 w-4 text-blue-400" />
+                <label htmlFor="rel-value">Last</label>
+                <input
+                  id="rel-value"
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  max={relativeMax}
+                  step={1}
+                  required
+                  value={filters.relativeValue}
+                  onChange={(e) => setFilters((f) => ({ ...f, relativeValue: e.target.value }))}
+                  className={`${INPUT_CLASS} w-28`}
+                />
+                <select
+                  aria-label="Time unit"
+                  value={filters.relativeUnit}
+                  onChange={(e) => setFilters((f) => ({ ...f, relativeUnit: e.target.value as ReportFilters["relativeUnit"] }))}
+                  className={INPUT_CLASS}
+                >
+                  {RELATIVE_UNITS.map((u) => (
+                    <option key={u} value={u}>{u}</option>
+                  ))}
+                </select>
+              </div>
+              <button type="submit" className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition">
+                Apply Filter
+              </button>
             </div>
+            <p className="text-[11px] text-slate-500">
+              The range ends at the moment the report is generated (server clock). Up to {MAX_RANGE_DAYS} days.
+            </p>
+            {rangeError && <p role="alert" className="text-[11px] font-semibold text-rose-400">{rangeError}</p>}
+          </form>
+        )}
 
-            <button
-              type="submit"
-              className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition"
-            >
-              Apply Filter
-            </button>
+        {/* Custom date-time range (visible when 'custom' is active) */}
+        {filters.period === "custom" && (
+          <form onSubmit={handleApplyRange} className="pt-3 border-t border-slate-800/80 space-y-2">
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center space-x-2 text-xs text-slate-300">
+                <Calendar className="h-4 w-4 text-blue-400" />
+                <label htmlFor="custom-start">Start:</label>
+                <input
+                  id="custom-start"
+                  type="datetime-local"
+                  step={1}
+                  required
+                  value={filters.customStart}
+                  onChange={(e) => setFilters((f) => ({ ...f, customStart: e.target.value }))}
+                  className={INPUT_CLASS}
+                />
+              </div>
+
+              <div className="flex items-center space-x-2 text-xs text-slate-300">
+                <label htmlFor="custom-end">End:</label>
+                <input
+                  id="custom-end"
+                  type="datetime-local"
+                  step={1}
+                  value={filters.customEnd}
+                  onChange={(e) => setFilters((f) => ({ ...f, customEnd: e.target.value }))}
+                  className={INPUT_CLASS}
+                />
+              </div>
+
+              <button type="submit" className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition">
+                Apply Filter
+              </button>
+            </div>
+            <p className="text-[11px] text-slate-500">
+              Enter times in your time zone{zoneLabel ? ` (${zoneLabel})` : ""}; they are sent as UTC and both ends are
+              inclusive. Leave the end empty for &quot;until now&quot;. Up to {MAX_RANGE_DAYS} days.
+            </p>
+            {rangeError && <p role="alert" className="text-[11px] font-semibold text-rose-400">{rangeError}</p>}
           </form>
         )}
       </div>
@@ -232,6 +422,34 @@ export default function AdminReportsPage() {
 
       {report && (
       <>
+      {/* What this report covers: the exact range the server used (UTC, to the second) and the filters applied */}
+      <div className="bg-slate-900/60 border border-slate-800 rounded-xl px-4 py-3 text-xs text-slate-300 space-y-1.5" data-testid="report-summary">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <Calendar className="h-4 w-4 text-blue-400" aria-hidden="true" />
+          <span className="font-semibold text-slate-400">Range ({report.timezone ?? "UTC"}, inclusive):</span>
+          <span className="font-mono text-white">{formatUtcSeconds(report.start_date)}</span>
+          <span className="text-slate-500">to</span>
+          <span className="font-mono text-white">{formatUtcSeconds(report.end_date)}</span>
+          {localRange && <span className="text-slate-500">| your time zone: {localRange}</span>}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <Filter className="h-4 w-4 text-purple-400" aria-hidden="true" />
+          <span className="font-semibold text-slate-400">Severity:</span>
+          {reportSeverities.length === 0 ? (
+            <span className="font-semibold text-white">{describeSeverities(reportSeverities)}</span>
+          ) : (
+            reportSeverities.map((sev) => (
+              <span key={sev} className={`px-2 py-0.5 rounded text-[10px] font-bold ${(SEVERITY_STYLES[sev] ?? SEVERITY_STYLES.Other).badge}`}>
+                {sev}
+              </span>
+            ))
+          )}
+          <span className="text-slate-600">|</span>
+          <span className="font-semibold text-slate-400">Analyst:</span>
+          <span className="font-semibold text-white">{report.filtered_analyst || "All analysts"}</span>
+        </div>
+      </div>
+
       {/* KPI Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
@@ -242,7 +460,7 @@ export default function AdminReportsPage() {
           <div className="text-2xl font-black text-white">
             {report?.total_cases_reviewed ?? 0}
           </div>
-          <span className="text-[11px] text-slate-500 mt-1 block">In selected period</span>
+          <span className="text-[11px] text-slate-500 mt-1 block">In selected range and severity</span>
         </div>
 
         <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
@@ -281,6 +499,16 @@ export default function AdminReportsPage() {
         </div>
       </div>
 
+      {/* Cases by severity (within the selected range and filters) */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4" aria-label="Cases by severity">
+        {Object.entries(severityCounts).map(([sev, count]) => (
+          <div key={sev} className="p-3 rounded-xl bg-slate-900 border border-slate-800">
+            <div className="text-slate-400 text-xs font-medium mb-1">{sev} cases</div>
+            <div className={`text-xl font-black ${(SEVERITY_STYLES[sev] ?? SEVERITY_STYLES.Other).card}`}>{count}</div>
+          </div>
+        ))}
+      </div>
+
       {/* Analyst Decision & Performance Matrix Table */}
       <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-xl">
         <div className="p-4 border-b border-slate-800 flex items-center justify-between">
@@ -289,7 +517,7 @@ export default function AdminReportsPage() {
             <h3 className="text-sm font-bold text-white">Analyst Performance & Decision Matrix (HITL Actions)</h3>
           </div>
           <span className="text-xs text-slate-400 font-mono">
-            Range: {report?.start_date.substring(0, 10)} to {report?.end_date.substring(0, 10)}
+            {formatUtcSeconds(report?.start_date)} to {formatUtcSeconds(report?.end_date)} {report?.timezone ?? "UTC"}
           </span>
         </div>
 

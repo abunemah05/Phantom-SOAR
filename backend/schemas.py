@@ -54,18 +54,35 @@ class UserResponse(BaseModel):
     last_used_ip: Optional[str] = None
     password_changed_at: Optional[str] = None
     created_at: Optional[str] = None
+    # GET /users only: what the signed-in administrator may do to this account, from backend/rbac.py
+    # {action: {allowed, reason, step_up}}. The server enforces the same answer on every request.
+    account_actions: Optional[Dict[str, Dict[str, Any]]] = None
     model_config = ConfigDict(from_attributes=True)
 
 class UserCreateResponse(UserResponse):
     temporary_password: str  # shown once; the operator must change it at first sign-in
 
+class StepUpConfirmation(BaseModel):
+    """The acting administrator re-proves who they are before a sensitive account change (docs/ACCESS_CONTROL.md)."""
+    model_config = ConfigDict(extra="forbid")
+    current_password: str = Field(min_length=1, max_length=1024, repr=False)  # the acting admin's OWN password
+    mfa_code: Optional[str] = Field(default=None, max_length=16, repr=False)  # required when the acting admin has MFA
+
+class StepUpBody(BaseModel):
+    """Optional body of POST/DELETE account endpoints."""
+    model_config = ConfigDict(extra="forbid")
+    confirmation: Optional[StepUpConfirmation] = None
+
 class ServiceAccountCreateRequest(BaseModel):
+    # Unknown fields are captured (not silently dropped) so the endpoint can refuse and audit them.
+    model_config = ConfigDict(extra="allow")
     username: str = Field(min_length=1, max_length=50)  # e.g. "triage-agent"
     expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)  # key lifetime in days; omit for the default (PHANTOM_AGENT_KEY_DEFAULT_DAYS, 90; 0 there = no expiry)
     ip_allowlist: Optional[List[str]] = Field(default=None, max_length=50)  # IPs / CIDRs allowed to use the key
 
 class ServiceAccountPolicyRequest(BaseModel):
     """Used by key rotation and the policy endpoint. Omitted fields are left unchanged."""
+    model_config = ConfigDict(extra="forbid")
     expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)
     clear_expiry: bool = False
     ip_allowlist: Optional[List[str]] = Field(default=None, max_length=50)  # [] removes the restriction
@@ -74,11 +91,17 @@ class ServiceAccountKeyResponse(UserResponse):
     api_key: str  # shown once; only a digest is stored
 
 class UserCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")  # unknown fields are refused and audited by the endpoint
+    confirmation: Optional[StepUpConfirmation] = None
     username: str = Field(min_length=1, max_length=50)
     role: str = Field(default="SOC Analyst", max_length=60)
     mfa_enabled: bool = False
 
 class UserUpdateRequest(BaseModel):
+    """Whitelist: role, is_active, compromised_reset_required (+ the confirmation). Any other field is refused
+    by the endpoint (and audited), never bound onto the account."""
+    model_config = ConfigDict(extra="allow")
+    confirmation: Optional[StepUpConfirmation] = None
     role: Optional[str] = Field(default=None, max_length=60)
     is_active: Optional[bool] = None
     compromised_reset_required: Optional[bool] = None
@@ -108,12 +131,20 @@ class AdminReportFilterRequest(BaseModel):
     period: Optional[str] = "month"  # "day", "week", "month", "custom"
     start_date: Optional[str] = None  # YYYY-MM-DD or ISO string
     end_date: Optional[str] = None  # YYYY-MM-DD or ISO string
+    last_n: Optional[int] = None  # period "relative": N units back from now
+    last_unit: Optional[str] = None  # seconds | minutes | hours | days
+    severity: Optional[List[str]] = None  # Critical / High / Medium / Low; empty or "all" = every severity
 
 class AdminReportResponse(BaseModel):
-    period: str
-    start_date: str
-    end_date: str
+    period: str  # day | week | month | custom | relative
+    start_date: str  # exact range start, ISO-8601 aware UTC (inclusive)
+    end_date: str  # exact range end, ISO-8601 aware UTC (inclusive)
+    timezone: str = "UTC"  # zone start_date/end_date are expressed in; always UTC
+    range_mode: str = "preset"  # preset | absolute | relative
+    generated_at: Optional[str] = None
     filtered_analyst: Optional[str] = None
+    filtered_severities: List[str] = Field(default_factory=list)  # empty = all severities
+    severity_breakdown: Dict[str, int] = Field(default_factory=dict)  # cases in the report per severity, most severe first
     total_cases_reviewed: int
     total_containment_actions: int
     containment_by_mode: Dict[str, int] = Field(default_factory=dict)  # live / simulated / skipped / blocked / failed

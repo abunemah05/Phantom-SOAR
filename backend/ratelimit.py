@@ -318,11 +318,46 @@ def clear_pair(scope: str, username: str, ip: str) -> None:
     limiter.reset(_pair(scope, username, ip))
 
 
+# --- step-up confirmation throttling (a sensitive account change re-asks for the acting admin's password) --------
+# Its own counters. A wrong confirmation must never feed the sign-in counters (fail:user / fail:ip): that would let
+# typos in a confirmation dialog, or someone holding a stolen session, slow down or block the admin's real logins.
+STEPUP_MAX_FAILURES = PAIR_MAX_FAILURES  # per (admin, client IP)
+STEPUP_USER_MAX_FAILURES = 20            # per admin across all addresses (a stolen session guessing from many IPs)
+STEPUP_WINDOW = PAIR_WINDOW
+
+
+def _stepup_user_key(username: str) -> str:
+    return f"stepup:user:{_uh(username)}"
+
+
+def stepup_register_failure(username: str, ip: str) -> None:
+    limiter.hit(_pair("stepup", username, ip), STEPUP_WINDOW)
+    limiter.hit(_stepup_user_key(username), STEPUP_WINDOW)
+
+
+def stepup_retry_after(username: str, ip: str) -> int:
+    """Seconds until step-up confirmations are accepted again for this admin; 0 when not locked."""
+    now = time.time()
+    wait = 0.0
+    for key, cap in ((_pair("stepup", username, ip), STEPUP_MAX_FAILURES),
+                     (_stepup_user_key(username), STEPUP_USER_MAX_FAILURES)):
+        if limiter.count(key, STEPUP_WINDOW) >= cap:
+            oldest = limiter.oldest(key)
+            wait = max(wait, (oldest + STEPUP_WINDOW - now) if oldest is not None else STEPUP_WINDOW)
+    return max(1, int(wait) + 1) if wait > 0 else 0
+
+
+def stepup_clear(username: str, ip: str) -> None:
+    """A correct confirmation forgets this admin's recent wrong ones from this address."""
+    limiter.reset(_pair("stepup", username, ip))
+
+
 def clear_username(username: str) -> None:
     """Admin unlock: forget every failure recorded for this username (all scopes, all addresses)."""
     limiter.reset(f"fail:user:{_uh(username)}")
-    for scope in ("login", "chpw", "mfa"):
+    for scope in ("login", "chpw", "mfa", "stepup"):
         limiter.reset_prefix(f"pair:{scope}:{_uh(username)}:")
+    limiter.reset(_stepup_user_key(username))
 
 
 def username_delay(username: str) -> float:

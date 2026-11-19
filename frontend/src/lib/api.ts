@@ -24,6 +24,7 @@ import {
   RuntimeStatus,
   ServiceAccountKey,
   ServiceAccountPolicyChange,
+  StepUpConfirmation,
   SystemConfigGroup,
   SystemLog,
   TestConnectionResult,
@@ -31,6 +32,7 @@ import {
   VulnerabilityIntel,
 } from './types';
 import { ActionCatalog } from './actions';
+import type { PlaybookImportReport, PlaybookImportRequest, PlaybookImportResult } from './playbookImport';
 import {
   ApiError,
   NETWORK_ERROR_MESSAGE,
@@ -114,6 +116,7 @@ async function raiseForResponse(res: Response, isSignIn: boolean): Promise<never
   throw new ApiError(res.status, parsed.message, {
     blockers: parsed.blockers,
     retryAfterSeconds: parseRetryAfter(res.headers.get('Retry-After')),
+    code: parsed.code,
   });
 }
 
@@ -203,6 +206,11 @@ export interface AdminReportParams {
   period?: string;
   start_date?: string;
   end_date?: string;
+  /** period "relative": last_n units (seconds | minutes | hours | days) back from now. */
+  last_n?: number;
+  last_unit?: string;
+  /** Empty / omitted = all severities. */
+  severity?: string[];
 }
 
 function adminReportQuery(params?: AdminReportParams): string {
@@ -211,6 +219,9 @@ function adminReportQuery(params?: AdminReportParams): string {
   if (params?.period) query.append('period', params.period);
   if (params?.start_date) query.append('start_date', params.start_date);
   if (params?.end_date) query.append('end_date', params.end_date);
+  if (params?.last_n !== undefined) query.append('last_n', String(params.last_n));
+  if (params?.last_unit) query.append('last_unit', params.last_unit);
+  (params?.severity ?? []).forEach((s) => query.append('severity', s));
   return query.toString();
 }
 
@@ -286,7 +297,7 @@ export const api = {
   // --- User accounts & RBAC (admin only) --------------------------------------
   getUsers: (): Promise<User[]> => fetchJson(`${API_BASE}/users`),
 
-  createUser: (data: { username: string; role: string }): Promise<CreatedUser> =>
+  createUser: (data: { username: string; role: string; confirmation?: StepUpConfirmation }): Promise<CreatedUser> =>
     fetchJson(`${API_BASE}/users`, { method: 'POST', body: jsonBody(data) }),
 
   /** The API key is returned once; agents send it as X-Phantom-Agent-Key. */
@@ -310,20 +321,34 @@ export const api = {
 
   updateUser: (
     userId: number,
-    data: { role?: string; is_active?: boolean; compromised_reset_required?: boolean }
+    data: { role?: string; is_active?: boolean; compromised_reset_required?: boolean; confirmation?: StepUpConfirmation }
   ): Promise<User> => fetchJson(`${API_BASE}/users/${userId}`, { method: 'PUT', body: jsonBody(data) }),
 
-  resetUserPassword: (userId: number): Promise<{ status: string; message: string; temporary_password?: string }> =>
-    fetchJson(`${API_BASE}/users/${userId}/reset-password`, { method: 'POST' }),
+  /** `confirmation` is required by the server when the target is another administrator. */
+  resetUserPassword: (
+    userId: number,
+    confirmation?: StepUpConfirmation
+  ): Promise<{ status: string; message: string; temporary_password?: string }> =>
+    fetchJson(`${API_BASE}/users/${userId}/reset-password`, {
+      method: 'POST',
+      ...(confirmation ? { body: jsonBody({ confirmation }) } : {}),
+    }),
 
   unlockUser: (userId: number): Promise<{ status: string; message: string }> =>
     fetchJson(`${API_BASE}/users/${userId}/unlock`, { method: 'POST' }),
 
-  flagUserCompromised: (userId: number): Promise<{ status: string; message: string }> =>
-    fetchJson(`${API_BASE}/users/${userId}/flag-compromised`, { method: 'POST' }),
+  flagUserCompromised: (userId: number, confirmation?: StepUpConfirmation): Promise<{ status: string; message: string }> =>
+    fetchJson(`${API_BASE}/users/${userId}/flag-compromised`, {
+      method: 'POST',
+      ...(confirmation ? { body: jsonBody({ confirmation }) } : {}),
+    }),
 
-  deleteUser: (userId: number): Promise<{ status: string; message: string }> =>
-    fetchJson(`${API_BASE}/users/${userId}`, { method: 'DELETE' }),
+  /** POST /users/{id}/delete, not DELETE: some proxies drop a request body on DELETE, and the confirmation is in it. */
+  deleteUser: (userId: number, confirmation?: StepUpConfirmation): Promise<{ status: string; message: string }> =>
+    fetchJson(`${API_BASE}/users/${userId}/delete`, {
+      method: 'POST',
+      ...(confirmation ? { body: jsonBody({ confirmation }) } : {}),
+    }),
 
   // --- Webhook ingest tokens (admin only) -------------------------------------
   getIngestTokens: (): Promise<IngestTokenInfo[]> => fetchJson(`${API_BASE}/ingest-tokens`),
@@ -485,6 +510,14 @@ export const api = {
 
   togglePlaybook: (playbookId: number): Promise<{ is_active: boolean }> =>
     fetchJson(`${API_BASE}/playbooks/${playbookId}/toggle`, { method: 'PATCH' }),
+
+  /** Admin only: validate a playbook pack and report what an import would do. Writes nothing. */
+  previewPlaybookImport: (request: PlaybookImportRequest): Promise<PlaybookImportReport> =>
+    fetchJson(`${API_BASE}/playbooks/import/preview`, { method: 'POST', body: jsonBody(request) }),
+
+  /** Admin only: import a previewed pack (needs expected_sha256). Playbooks are created inactive and in HITL mode. */
+  importPlaybooks: (request: PlaybookImportRequest): Promise<PlaybookImportResult> =>
+    fetchJson(`${API_BASE}/playbooks/import`, { method: 'POST', body: jsonBody(request) }),
 
   /** Admin only, simulation mode only (409 otherwise): sends lab payloads through the real ingest pipeline. */
   seedDemoData: (): Promise<{ status?: string; message?: string }> =>

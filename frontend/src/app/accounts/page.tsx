@@ -16,18 +16,21 @@ import {
   ShieldCheck,
   Trash2,
   UserCheck,
+  UserCog,
   UserPlus,
   Users,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import { describeError } from "@/lib/errors";
+import { actionState, canSubmitRoleChange, initialRoleSelection, lockNote, roleChangeNeedsStepUp, roleOptionsFor, ActionView } from "@/lib/accountPolicy";
+import { ApiError, describeError } from "@/lib/errors";
 import { formatDate, formatDateTime } from "@/lib/format";
 import { ASSIGNABLE_ROLES, ROLE_SOC_ANALYST, canAdminister, isAdmin, roleLevel } from "@/lib/roles";
-import { IngestTokenInfo, User } from "@/lib/types";
+import { IngestTokenInfo, StepUpConfirmation, User } from "@/lib/types";
 import { useResource } from "@/hooks/useResource";
 import { useAuth } from "@/components/AuthGate";
 import { useConfirm } from "@/components/ConfirmDialog";
 import Dialog from "@/components/Dialog";
+import { StepUpAsk, useStepUp } from "@/components/StepUpDialog";
 import SecretOnceDialog, { OneTimeSecret } from "@/components/SecretOnceDialog";
 import { AccessDenied, EmptyState, ErrorState, InlineNotice, LoadingState, StaleBanner } from "@/components/StateViews";
 import { useToast } from "@/components/Toast";
@@ -57,6 +60,7 @@ export default function AccountsPage() {
   const { user: me } = useAuth();
   const toast = useToast();
   const confirm = useConfirm();
+  const { askStepUp, stepUpDialog } = useStepUp(Boolean(me?.mfa_enabled));
   const allowed = canAdminister(me);
 
   const usersFetcher = useCallback(() => api.getUsers(), []);
@@ -70,6 +74,7 @@ export default function AccountsPage() {
   const [showService, setShowService] = useState(false);
   const [showToken, setShowToken] = useState(false);
   const [policyFor, setPolicyFor] = useState<User | null>(null);
+  const [roleFor, setRoleFor] = useState<User | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
 
   const list = useMemo(() => users.data ?? [], [users.data]);
@@ -99,6 +104,31 @@ export default function AccountsPage() {
     }
   };
 
+  /**
+   * Run an account change that may need the administrator's own password (and MFA code). The server decides: the
+   * dialog opens up front when the row says a step-up is needed, and again when the server answers 428 (missing)
+   * or step_up_failed (wrong password / code). Resolves undefined when the administrator cancels.
+   */
+  const withStepUp = async <T,>(needs: boolean, ask: StepUpAsk, call: (confirmation?: StepUpConfirmation) => Promise<T>): Promise<T | undefined> => {
+    let confirmation: StepUpConfirmation | undefined;
+    if (needs) {
+      const first = await askStepUp(ask);
+      if (!first) return undefined;
+      confirmation = first;
+    }
+    for (;;) {
+      try {
+        return await call(confirmation);
+      } catch (err) {
+        const retryable = err instanceof ApiError && (err.status === 428 || err.code === "step_up_failed");
+        if (!retryable) throw err;
+        const again = await askStepUp({ ...ask, error: err.status === 428 ? null : err.message });
+        if (!again) return undefined;
+        confirmation = again;
+      }
+    }
+  };
+
   const resetPassword = async (target: User) => {
     const ok = await confirm({
       title: `Reset the password for ${target.username}?`,
@@ -108,8 +138,11 @@ export default function AccountsPage() {
       tone: "warning",
     });
     if (!ok) return;
+    const view = actionState(target, "reset_password");
     await run(target, async () => {
-      const res = await api.resetUserPassword(target.user_id);
+      const res = await withStepUp(view.stepUp, { title: `Confirm password reset for ${target.username}`, reason: view.reason || "Resetting another administrator's password.", confirmLabel: "Reset password" },
+        (confirmation) => api.resetUserPassword(target.user_id, confirmation));
+      if (!res) return;
       if (res.temporary_password) {
         setSecret({
           title: `One-time password for ${target.username}`,
@@ -132,8 +165,11 @@ export default function AccountsPage() {
       tone: "danger",
     });
     if (!ok) return;
+    const view = actionState(target, "set_compromised");
     await run(target, async () => {
-      await api.flagUserCompromised(target.user_id);
+      const res = await withStepUp(view.stepUp, { title: `Confirm: flag ${target.username}`, reason: view.reason || "Flagging another administrator as compromised.", confirmLabel: "Flag as compromised" },
+        (confirmation) => api.flagUserCompromised(target.user_id, confirmation));
+      if (!res) return;
       toast.success(`${target.username} was flagged as compromised; credential rotation is now mandatory.`);
       void users.reload();
     }, "Could not flag the account.");
@@ -150,8 +186,11 @@ export default function AccountsPage() {
       tone: enable ? "default" : "warning",
     });
     if (!ok) return;
+    const view = actionState(target, "set_active");
     await run(target, async () => {
-      await api.updateUser(target.user_id, { is_active: enable });
+      const res = await withStepUp(view.stepUp, { title: `Confirm: ${enable ? "enable" : "disable"} ${target.username}`, reason: view.reason || "Changing another administrator's active state.", confirmLabel: enable ? "Enable account" : "Disable account" },
+        (confirmation) => api.updateUser(target.user_id, { is_active: enable, ...(confirmation ? { confirmation } : {}) }));
+      if (!res) return;
       toast.success(`${target.username} is now ${enable ? "enabled" : "disabled"}.`);
       void users.reload();
     }, "Could not change the account status.");
@@ -167,8 +206,11 @@ export default function AccountsPage() {
       requireText: target.username,
     });
     if (!ok) return;
+    const view = actionState(target, "delete");
     await run(target, async () => {
-      await api.deleteUser(target.user_id);
+      const res = await withStepUp(view.stepUp, { title: `Confirm: delete ${target.username}`, reason: view.reason || "Deleting another administrator.", confirmLabel: "Delete account" },
+        (confirmation) => api.deleteUser(target.user_id, confirmation));
+      if (!res) return;
       toast.success(`${target.username} was deleted.`);
       void users.reload();
     }, "Could not delete the account.");
@@ -292,6 +334,7 @@ export default function AccountsPage() {
                         user={u}
                         isSelf={u.user_id === me?.user_id}
                         busy={busyId === u.user_id}
+                        onRole={() => setRoleFor(u)}
                         onReset={() => void resetPassword(u)}
                         onFlag={() => void flagCompromised(u)}
                         onToggle={() => void toggleActive(u)}
@@ -369,6 +412,7 @@ export default function AccountsPage() {
       <CreateOperatorDialog
         open={showCreate}
         onClose={() => setShowCreate(false)}
+        withStepUp={withStepUp}
         onCreated={(created) => {
           setShowCreate(false);
           void users.reload();
@@ -396,6 +440,16 @@ export default function AccountsPage() {
           });
         }}
       />
+      <ChangeRoleDialog
+        target={roleFor}
+        onClose={() => setRoleFor(null)}
+        withStepUp={withStepUp}
+        onSaved={(name, role) => {
+          setRoleFor(null);
+          void users.reload();
+          toast.success(`${name} now has the role ${role}.`);
+        }}
+      />
       <PolicyDialog
         target={policyFor}
         onClose={() => setPolicyFor(null)}
@@ -419,6 +473,7 @@ export default function AccountsPage() {
         }}
       />
       <SecretOnceDialog secret={secret} onDone={() => setSecret(null)} />
+      {stepUpDialog}
     </div>
   );
 }
@@ -434,11 +489,12 @@ function Stat({ label, value, sub, icon, tone = "text-white" }: { label: string;
 }
 
 function UserRow({
-  user, isSelf, busy, onReset, onFlag, onToggle, onDelete, onRotate, onPolicy,
+  user, isSelf, busy, onRole, onReset, onFlag, onToggle, onDelete, onRotate, onPolicy,
 }: {
   user: User;
   isSelf: boolean;
   busy: boolean;
+  onRole: () => void;
   onReset: () => void;
   onFlag: () => void;
   onToggle: () => void;
@@ -451,6 +507,16 @@ function UserRow({
   const isService = Boolean(user.is_service_account);
   const level = roleLevel(user);
   const protectedReason = isBootstrap ? "The bootstrap administrator cannot be changed this way" : isSelf ? "You cannot do this to your own account" : "";
+  // The server's answer for this row (backend/rbac.py): disabled buttons say why instead of just greying out.
+  const roleView = actionState(user, "change_role");
+  const resetView = actionState(user, "reset_password");
+  const flagView = actionState(user, "set_compromised");
+  const activeView = actionState(user, "set_active");
+  const deleteView = actionState(user, "delete");
+  const rotateView = actionState(user, "rotate_key");
+  const policyView = actionState(user, "service_policy");
+  const note = lockNote(user, isSelf);
+  const why = (view: ActionView, fallback: string) => (view.allowed ? (view.stepUp ? `${fallback} (asks for your password)` : fallback) : view.reason || protectedReason || "Not allowed");
   const roleClass =
     level === "admin" ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
     : level === "security_engineer" ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
@@ -480,7 +546,10 @@ function UserRow({
           </div>
         </div>
       </td>
-      <td className="py-3.5 px-4"><span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-semibold border ${roleClass}`}>{user.role}</span></td>
+      <td className="py-3.5 px-4">
+        <span className={`inline-flex px-2 py-0.5 rounded-full text-[11px] font-semibold border ${roleClass}`}>{user.role}</span>
+        {note && <div className="mt-1 max-w-[16rem] text-[10px] leading-snug text-slate-500">{note}</div>}
+      </td>
       <td className="py-3.5 px-4 space-y-1">
         {isService ? (
           <>
@@ -514,30 +583,33 @@ function UserRow({
           {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-slate-400" aria-label="Working" />}
           {isService ? (
             <>
-              <button type="button" disabled={busy} onClick={onPolicy} title="Edit expiry and allowed source IPs" aria-label={`Edit access policy of ${user.username}`} className={`${ICON_BTN} text-cyan-300`}>
+              <button type="button" disabled={busy || !policyView.allowed} onClick={onPolicy} title={why(policyView, "Edit expiry and allowed source IPs")} aria-label={`Edit access policy of ${user.username}`} className={`${ICON_BTN} text-cyan-300`}>
                 <Settings2 className="h-3.5 w-3.5" aria-hidden="true" />
               </button>
-              <button type="button" disabled={busy} onClick={onRotate} title="Rotate API key (the current key stops working immediately)" aria-label={`Rotate API key of ${user.username}`} className={`${ICON_BTN} text-cyan-300`}>
+              <button type="button" disabled={busy || !rotateView.allowed} onClick={onRotate} title={why(rotateView, "Rotate API key (the current key stops working immediately)")} aria-label={`Rotate API key of ${user.username}`} className={`${ICON_BTN} text-cyan-300`}>
                 <RotateCw className="h-3.5 w-3.5" aria-hidden="true" />
               </button>
             </>
           ) : (
             <>
-              <button type="button" disabled={busy} onClick={onReset} title="Reset password" aria-label={`Reset password of ${user.username}`} className={`${ICON_BTN} text-amber-400`}>
+              <button type="button" disabled={busy || !roleView.allowed} onClick={onRole} title={why(roleView, "Change role")} aria-label={`Change role of ${user.username}`} className={`${ICON_BTN} text-purple-300`}>
+                <UserCog className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+              <button type="button" disabled={busy || !resetView.allowed} onClick={onReset} title={why(resetView, "Reset password")} aria-label={`Reset password of ${user.username}`} className={`${ICON_BTN} text-amber-400`}>
                 <KeyRound className="h-3.5 w-3.5" aria-hidden="true" />
               </button>
-              <button type="button" disabled={busy || isSelf} onClick={onFlag} title={isSelf ? protectedReason : "Flag as compromised (forces credential rotation)"} aria-label={`Flag ${user.username} as compromised`} className={`${ICON_BTN} text-rose-400`}>
+              <button type="button" disabled={busy || isSelf || !flagView.allowed} onClick={onFlag} title={why(flagView, "Flag as compromised (forces credential rotation)")} aria-label={`Flag ${user.username} as compromised`} className={`${ICON_BTN} text-rose-400`}>
                 <Shield className="h-3.5 w-3.5" aria-hidden="true" />
               </button>
             </>
           )}
-          <button type="button" disabled={busy || isBootstrap || isSelf} onClick={onToggle} title={isBootstrap || isSelf ? protectedReason : isActive ? "Disable account" : "Enable account"} aria-label={`${isActive ? "Disable" : "Enable"} ${user.username}`} className={`${ICON_BTN} ${isActive ? "text-slate-400" : "text-emerald-400"}`}>
+          <button type="button" disabled={busy || isBootstrap || isSelf || !activeView.allowed} onClick={onToggle} title={isBootstrap || isSelf ? protectedReason : why(activeView, isActive ? "Disable account" : "Enable account")} aria-label={`${isActive ? "Disable" : "Enable"} ${user.username}`} className={`${ICON_BTN} ${isActive ? "text-slate-400" : "text-emerald-400"}`}>
             <Power className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
           {isBootstrap ? (
             <span className="p-1.5 opacity-40" title="The bootstrap administrator cannot be deleted"><ShieldCheck className="h-3.5 w-3.5 text-slate-400" aria-label="Bootstrap administrator cannot be deleted" /></span>
           ) : (
-            <button type="button" disabled={busy || isSelf} onClick={onDelete} title={isSelf ? protectedReason : "Delete account"} aria-label={`Delete ${user.username}`} className={`${ICON_BTN} text-slate-400 hover:text-rose-400`}>
+            <button type="button" disabled={busy || isSelf || !deleteView.allowed} onClick={onDelete} title={isSelf ? protectedReason : why(deleteView, "Delete account")} aria-label={`Delete ${user.username}`} className={`${ICON_BTN} text-slate-400 hover:text-rose-400`}>
               <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           )}
@@ -547,7 +619,65 @@ function UserRow({
   );
 }
 
-function CreateOperatorDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (u: User & { temporary_password?: string }) => void }) {
+type WithStepUp = <T,>(needs: boolean, ask: StepUpAsk, call: (confirmation?: StepUpConfirmation) => Promise<T>) => Promise<T | undefined>;
+
+function ChangeRoleDialog({ target, onClose, withStepUp, onSaved }: { target: User | null; onClose: () => void; withStepUp: WithStepUp; onSaved: (name: string, role: string) => void }) {
+  return (
+    <Dialog open={target !== null} onClose={onClose} title={target ? `Change role of ${target.username}` : ""} description="The server checks every role change: you cannot change your own role, and the bootstrap or last active administrator keeps theirs." size="sm">
+      {target && <ChangeRoleForm key={target.user_id} target={target} onClose={onClose} withStepUp={withStepUp} onSaved={onSaved} />}
+    </Dialog>
+  );
+}
+
+function ChangeRoleForm({ target, onClose, withStepUp, onSaved }: { target: User; onClose: () => void; withStepUp: WithStepUp; onSaved: (name: string, role: string) => void }) {
+  const options = roleOptionsFor(target);
+  const initial = initialRoleSelection(target);
+  const current = initial.current;
+  const [role, setRole] = useState(initial.selected); // "" when the stored role is not one of the options: nothing preselected
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const stepUp = roleChangeNeedsStepUp(target, role);
+  const canSubmit = canSubmitRoleChange(role, current);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      const updated = await withStepUp(
+        stepUp,
+        { title: `Confirm role change for ${target.username}`, reason: isAdmin({ role }) ? "Granting the Admin role." : "Changing another administrator's role.", confirmLabel: "Change role" },
+        (confirmation) => api.updateUser(target.user_id, { role, ...(confirmation ? { confirmation } : {}) }),
+      );
+      if (updated) onSaved(target.username, updated.role);
+    } catch (err) {
+      setError(describeError(err, "Could not change the role."));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit} className="space-y-4">
+      {error && <InlineNotice tone="error">{error}</InlineNotice>}
+      <div className="space-y-1.5">
+        <p className="text-xs text-slate-400">Current role: <span className="font-semibold text-slate-200">{initial.stored || "none"}</span>{current === "" && " (not one of the roles below: choose the new role explicitly)"}</p>
+        <label htmlFor="role-select" className="text-xs font-semibold text-slate-300">New role</label>
+        <select id="role-select" value={role} onChange={(e) => setRole(e.target.value)} className={INPUT}>
+          {current === "" && <option value="" disabled>Choose a role...</option>}
+          {options.map((r) => <option key={r.role} value={r.role}>{r.role}</option>)}
+        </select>
+        <p className="text-[11px] text-slate-500">{options.find((r) => r.role === role)?.description}</p>
+      </div>
+      {stepUp && canSubmit && (
+        <InlineNotice tone="warning">This is a privileged change: you will be asked for your own password{target.is_service_account ? "" : " before it is applied"}. It is recorded in the audit log.</InlineNotice>
+      )}
+      <FormButtons busy={busy} onCancel={onClose} submitLabel="Change role" disabled={!canSubmit} />
+    </form>
+  );
+}
+
+function CreateOperatorDialog({ open, onClose, withStepUp, onCreated }: { open: boolean; onClose: () => void; withStepUp: WithStepUp; onCreated: (u: User & { temporary_password?: string }) => void }) {
   const [username, setUsername] = useState("");
   const [role, setRole] = useState(ROLE_SOC_ANALYST);
   const [busy, setBusy] = useState(false);
@@ -560,7 +690,13 @@ function CreateOperatorDialog({ open, onClose, onCreated }: { open: boolean; onC
     setBusy(true);
     setError(null);
     try {
-      const created = await api.createUser({ username: username.trim(), role });
+      // Granting Admin is a privileged change: when the server asks for the administrator's own password, prompt for it.
+      const created = await withStepUp(
+        false,
+        { title: `Confirm: create administrator ${username.trim()}`, reason: "Granting the Admin role.", confirmLabel: "Create operator" },
+        (confirmation) => api.createUser({ username: username.trim(), role, ...(confirmation ? { confirmation } : {}) }),
+      );
+      if (!created) return;
       setUsername("");
       setRole(ROLE_SOC_ANALYST);
       onCreated(created);
@@ -585,6 +721,7 @@ function CreateOperatorDialog({ open, onClose, onCreated }: { open: boolean; onC
             {ASSIGNABLE_ROLES.map((r) => <option key={r.role} value={r.role}>{r.role}</option>)}
           </select>
           <p className="text-[11px] text-slate-500">{ASSIGNABLE_ROLES.find((r) => r.role === role)?.description}</p>
+          {isAdmin({ role }) && <p className="text-[11px] text-amber-300">Granting Admin is a privileged change and is recorded in the audit log.</p>}
         </div>
         <FormButtons busy={busy} onCancel={close} submitLabel="Create operator" disabled={!username.trim()} />
       </form>
