@@ -19,6 +19,8 @@ providers, and it has not had an independent security audit.
   key reports `not_configured`; with no keys indicators stay `Unknown`. Rate limits are respected and retried.
 * **Playbooks**: 13 templates (ransomware, brute force, phishing, privilege escalation, web shell, exfiltration, lateral
   movement, DDoS, credential dumping, SQL injection, supply chain, insider threat, reconnaissance), editable in the console.
+  Administrators can import more from a validated JSON pack (always created inactive and in approval mode):
+  [docs/PLAYBOOK_IMPORT.md](docs/PLAYBOOK_IMPORT.md).
 * **Response actions** (12): isolate/unisolate endpoint, terminate process, quarantine file, block/unblock IP, rate limit
   (all through Wazuh active response), disable account, revoke sessions, force password reset (Okta), create ticket (Jira),
   send notification (Slack).

@@ -18,16 +18,18 @@ import {
   Check,
   RefreshCw,
   Zap,
-  Lock
+  Lock,
+  Upload
 } from "lucide-react";
 import { ExecutionMode, JsonObject, Playbook, PlaybookStep, WorkflowLogic } from "@/lib/types";
 import { api } from "@/lib/api";
 import { describeError } from "@/lib/errors";
-import { canEditPlaybooks as roleCanEditPlaybooks } from "@/lib/roles";
+import { canAdminister, canEditPlaybooks as roleCanEditPlaybooks } from "@/lib/roles";
 import { ActionCatalog, ActionSpec, FALLBACK_ACTIONS, PSEUDO_STEP_LABELS, formatParams, parseParams } from "@/lib/actions";
 import { useAuth } from "@/components/AuthGate";
 import { useConfirm } from "@/components/ConfirmDialog";
 import { useModalBehavior } from "@/components/Dialog";
+import PlaybookImportDialog from "@/components/PlaybookImportDialog";
 import { useToast } from "@/components/Toast";
 
 // Names accepted by the runner for older playbooks (backend ACTION_ALIASES).
@@ -78,6 +80,8 @@ function stepsOf(logic: WorkflowLogic): PlaybookStep[] {
 export default function PlaybooksPage() {
   const { user } = useAuth();
   const canEditPlaybooks = roleCanEditPlaybooks(user);
+  const canImportPlaybooks = canAdminister(user);
+  const [isImportOpen, setIsImportOpen] = useState<boolean>(false);
   const toast = useToast();
   const confirm = useConfirm();
   const editRef = useRef<HTMLDivElement>(null);
@@ -440,6 +444,17 @@ export default function PlaybooksPage() {
         </div>
 
         <div className="flex items-center space-x-3">
+          {canImportPlaybooks && (
+            <button
+              type="button"
+              onClick={() => setIsImportOpen(true)}
+              className="flex items-center space-x-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded-xl text-xs font-bold transition flex-shrink-0"
+              title="Import a playbook pack (administrators only). Imported playbooks start inactive, in HITL mode."
+            >
+              <Upload className="h-4 w-4" />
+              <span>Import</span>
+            </button>
+          )}
           {canEditPlaybooks ? (
             <button
               onClick={openCreate}
@@ -768,6 +783,14 @@ export default function PlaybooksPage() {
             </form>
           </div>
         </div>
+      )}
+
+      {canImportPlaybooks && (
+        <PlaybookImportDialog
+          open={isImportOpen}
+          onClose={() => setIsImportOpen(false)}
+          onImported={() => void loadPlaybooks()}
+        />
       )}
 
       {/* CREATE MODAL */}

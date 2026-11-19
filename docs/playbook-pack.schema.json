@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://phantom-soar.invalid/schemas/playbook-pack-v1.json",
+  "title": "Phantom SOAR playbook pack, format version 1",
+  "description": "Describes the JSON pack accepted by Admin > Playbooks > Import (docs/PLAYBOOK_IMPORT.md). The server validates more than a schema can express (parameter ranges per action, connector match, duplicate keys, total size); the importer is the authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "format_version",
+    "pack",
+    "playbooks"
+  ],
+  "properties": {
+    "format": {
+      "const": "phantom-playbook-pack"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "pack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "license"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "author": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "license": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "description": "SPDX identifier or the license text/notice. Stored with every imported playbook and in the audit log."
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      }
+    },
+    "playbooks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/playbook"
+      }
+    }
+  },
+  "$defs": {
+    "playbook": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "target_threat",
+        "description",
+        "workflow_logic"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 150
+        },
+        "target_threat": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "execution_mode": {
+          "enum": [
+            "HITL",
+            "HOTL"
+          ],
+          "description": "Accepted, but every import is stored as HITL."
+        },
+        "is_active": {
+          "type": "boolean",
+          "description": "Accepted, but every import is stored inactive."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 1000
+        },
+        "source_framework": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "workflow_logic": {
+          "$ref": "#/$defs/workflow_logic"
+        }
+      }
+    },
+    "workflow_logic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "steps"
+      ],
+      "properties": {
+        "mitre_id": {
+          "type": "string",
+          "pattern": "^T\\d{4}(\\.\\d{3})?$"
+        },
+        "mitre_tactic": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "mitre_technique": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "picerl_phase": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "keywords": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60
+          }
+        },
+        "triggers": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          }
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 30,
+          "items": {
+            "$ref": "#/$defs/step"
+          }
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "order": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional and informational; steps run in list order."
+        },
+        "action": {
+          "enum": [
+            "isolate_endpoint",
+            "unisolate_endpoint",
+            "terminate_process",
+            "quarantine_file",
+            "block_ip",
+            "unblock_ip",
+            "apply_rate_limit",
+            "disable_account",
+            "revoke_user_sessions",
+            "force_password_reset",
+            "create_ticket",
+            "send_notification",
+            "await_analyst_approval",
+            "enrich_ioc",
+            "query_abuseipdb",
+            "query_virustotal",
+            "query_virustotal_url",
+            "query_otx",
+            "generate_report",
+            "generate_pdf_report"
+          ]
+        },
+        "connector": {
+          "type": "string",
+          "description": "Optional; for the 12 response actions it must equal the action's connector."
+        },
+        "params": {
+          "type": "object",
+          "description": "Only the parameters listed for the action by GET /api/playbooks/actions; 'agent_id' is not allowed."
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    }
+  }
+}

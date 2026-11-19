@@ -4,6 +4,7 @@
 // authority; this only gives instant feedback before a save is attempted.
 
 import { ConfigEntry } from "./types";
+import { CONFIDENCE_HELP, confidenceOptions, customConfidenceLabel, matchConfidenceLevel } from "./confidenceLevels";
 
 export type FieldKind = "secret" | "text" | "url" | "bool" | "list" | "number" | "select";
 
@@ -19,6 +20,12 @@ export interface FieldMeta {
   help?: string;
   placeholder?: string;
   options?: SelectOption[];
+  /** Select only: hide the raw value after the label (the label already shows it, e.g. "Default (85%)"). */
+  hideValueInLabel?: boolean;
+  /** Select only: the option value a stored value corresponds to ("0.90" -> "0.9"), or null if not listed. */
+  canonicalValue?: (value: string) => string | null;
+  /** Select only: label for a stored value that is not in the list ("Custom (87%)"). */
+  customLabel?: (value: string) => string | null;
 }
 
 export interface NumericRule {
@@ -167,7 +174,7 @@ export function validateConfigValue(key: string, rawValue: string): string | nul
 export function inferFieldKind(key: string, entry: ConfigEntry | undefined): FieldKind {
   if (entry?.is_secret) return "secret";
   if (BOOL_KEYS.has(key)) return "bool";
-  if (key === "agent_autonomy") return "select";
+  if (key === "agent_autonomy" || key === "agent_min_confidence") return "select";
   if (NUMERIC_RULES[key]) return "number";
   if (URL_KEYS.has(key) || key.endsWith("_url")) return "url";
   if (LIST_KEYS.has(key) || key.endsWith("_ids")) return "list";
@@ -279,7 +286,15 @@ export const FIELD_META: Record<string, FieldMeta> = {
   protected_users: { label: "Protected users", placeholder: "breakglass-admin\nsvc-backup" },
   protected_ips: { label: "Protected IPs / CIDR ranges", placeholder: "10.0.0.1\n192.168.10.0/24" },
   agent_autonomy: { label: "Agent autonomy", kind: "select", options: AUTONOMY_OPTIONS },
-  agent_min_confidence: { label: "Minimum confidence for automatic execution (0 - 1)", help: "Model-stated confidence is not calibrated: keep autonomy on recommend only until you have measured accuracy." },
+  agent_min_confidence: {
+    label: "AI minimum confidence for automatic execution",
+    kind: "select",
+    options: confidenceOptions(),
+    hideValueInLabel: true,
+    canonicalValue: matchConfidenceLevel,
+    customLabel: customConfidenceLabel,
+    help: `${CONFIDENCE_HELP} Model-stated confidence is not calibrated: keep autonomy on recommend only until you have measured accuracy.`,
+  },
   openrouter_api_key: { label: "OpenRouter API key", help: "Write-only. Never sent back to the browser and never shown to the model." },
   openrouter_model: { label: "OpenRouter model", placeholder: "vendor/model", help: "Model slug from openrouter.ai/models." },
   ai_enabled: { label: "Enable built-in AI triage", help: "Master switch. Off: no alert data is ever sent to a model." },

@@ -5,6 +5,7 @@ import {
   Activity, Bot, CheckCircle2, Database, Eye, EyeOff, FlaskConical, KeyRound, Lock, Radio, Save, ShieldCheck, Sliders, Trash2, Undo2,
   AlertTriangle, XCircle, Bell,
 } from "lucide-react";
+import { confidenceLabel } from "@/lib/confidenceLevels";
 import { api } from "@/lib/api";
 import { ApiError, describeError, errorBlockers } from "@/lib/errors";
 import {
@@ -34,7 +35,7 @@ const HIGH_IMPACT: Record<string, (next: string) => string | null> = {
       ? "HOTL ON: HOTL playbooks may contain automatically when there is real evidence and policy allows it."
       : "HOTL OFF: every containment action waits for an analyst.",
   agent_autonomy: (n) => `AI agent autonomy becomes "${n}": ${n === "recommend_only" ? "every proposal waits for an analyst." : "some AI actions may run without a human decision."}`,
-  agent_min_confidence: (n) => `Minimum confidence for automatic AI execution becomes ${n || "the default"}.`,
+  agent_min_confidence: (n) => `Minimum confidence for automatic AI execution becomes ${confidenceLabel(n)}.`,
   ai_enabled: (n) => (n === "true" ? "Built-in AI triage ON: alert summaries are sent to the configured model provider." : "Built-in AI triage OFF: no alert data is sent to a model."),
   ai_send_raw_payload: (n) =>
     n === "true"
@@ -404,15 +405,20 @@ export default function ConfigurationPage() {
 
     if (kind === "select") {
       const options = meta?.options ?? [];
-      const selected = options.find((o) => o.value === value);
+      // A stored value may be spelled differently from the option ("0.90" vs "0.9") or not be listed at all.
+      const canonical = meta?.canonicalValue ? meta.canonicalValue(value) : value;
+      const selected = options.find((o) => o.value === canonical);
+      const selectValue = selected ? selected.value : value;
+      const customLabel = !selected && value !== "" ? meta?.customLabel?.(value) ?? value : null;
       return (
         <div key={key} className="space-y-1">
           {head}
-          <select id={id} value={value} disabled={disabled} aria-describedby={describedBy} onChange={(e) => setValue(category, key, e.target.value)} className={`${inputClass} ${borderClass}`}>
-            {!selected && value !== "" && <option value={value}>{value}</option>}
-            {options.map((o) => <option key={o.value} value={o.value}>{o.label} ({o.value})</option>)}
+          <select id={id} value={selectValue} disabled={disabled} aria-describedby={describedBy} onChange={(e) => setValue(category, key, e.target.value)} className={`${inputClass} ${borderClass}`}>
+            {customLabel !== null && <option value={value}>{customLabel}</option>}
+            {options.map((o) => <option key={o.value} value={o.value}>{meta?.hideValueInLabel ? o.label : `${o.label} (${o.value})`}</option>)}
           </select>
           {selected?.help && <p className="text-[10px] text-slate-500">{selected.help}</p>}
+          {customLabel !== null && <p className="text-[10px] text-amber-400">This value was set outside the console and is not one of the listed levels. Pick a level to replace it.</p>}
           {foot}
         </div>
       );

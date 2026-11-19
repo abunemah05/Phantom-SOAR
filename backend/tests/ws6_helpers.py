@@ -40,10 +40,13 @@ def _clean_state(monkeypatch):
 
 
 def make_user(client, admin_h, username, role="SOC Analyst"):
+    # Creating an Admin and deleting an administrator need the acting admin's step-up confirmation (docs/ACCESS_CONTROL.md);
+    # the acting admin here is the bootstrap administrator, whose password is ADMIN_PASSWORD.
+    confirmation = {"confirmation": {"current_password": ADMIN_PASSWORD}}
     for u in client.get("/api/users", headers=admin_h).json():
         if u["username"] == username:
-            client.delete(f"/api/users/{u['user_id']}", headers=admin_h)
-    res = client.post("/api/users", json={"username": username, "role": role}, headers=admin_h)
+            client.request("DELETE", f"/api/users/{u['user_id']}", headers=admin_h, json=confirmation)
+    res = client.post("/api/users", json={"username": username, "role": role, **confirmation}, headers=admin_h)
     assert res.status_code == 201, res.text
     return res.json()
 

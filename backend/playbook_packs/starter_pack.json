@@ -1,0 +1,487 @@
+{
+  "format": "phantom-playbook-pack",
+  "format_version": 1,
+  "pack": {
+    "name": "Phantom starter pack: additional incident types",
+    "version": "1.0.0",
+    "author": "Phantom SOAR project",
+    "license": "Written for Phantom SOAR from public frameworks (NIST SP 800-61, CISA playbooks, CERT-SG IRM style). Summaries in our own words; no third-party text copied. Same terms as this repository (see its LICENSE file).",
+    "source": "backend/playbook_packs/starter_pack.json",
+    "description": "Eight response playbooks for incident types that are not among the 13 built-in templates. Every step uses Phantom's own actions."
+  },
+  "playbooks": [
+    {
+      "name": "Business Email Compromise and Mailbox Takeover",
+      "target_threat": "Account Takeover",
+      "execution_mode": "HITL",
+      "is_active": false,
+      "description": "Own summary of the containment path for a hijacked mailbox or business account: confirm, cut the attacker's access, force new credentials, notify. Source framework: NIST SP 800-61 containment, eradication and recovery stages, in the style of CERT-SG IRM cheat sheets.",
+      "source_framework": "NIST SP 800-61 / CERT-SG IRM style",
+      "workflow_logic": {
+        "mitre_id": "T1078",
+        "mitre_tactic": "Initial Access",
+        "mitre_technique": "Valid Accounts",
+        "picerl_phase": "Containment",
+        "keywords": [
+          "business email compromise",
+          "bec",
+          "mailbox rule",
+          "impossible travel",
+          "account takeover"
+        ],
+        "triggers": [
+          "suspicious_inbox_rule_created",
+          "impossible_travel_login",
+          "mfa_fatigue_burst"
+        ],
+        "steps": [
+          {
+            "action": "enrich_ioc",
+            "connector": "tip"
+          },
+          {
+            "action": "await_analyst_approval",
+            "role": "SOC Analyst L2"
+          },
+          {
+            "action": "revoke_user_sessions",
+            "connector": "iam"
+          },
+          {
+            "action": "force_password_reset",
+            "connector": "iam"
+          },
+          {
+            "action": "create_ticket",
+            "connector": "itsm",
+            "params": {
+              "priority": "High",
+              "summary": "Business email compromise: mailbox takeover suspected"
+            }
+          },
+          {
+            "action": "send_notification",
+            "connector": "itsm",
+            "params": {
+              "level": "WARNING",
+              "title": "Possible mailbox takeover",
+              "message": "Sessions revoked and password reset requested. Review inbox rules and forwarding."
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Malware Outbreak on Workstations",
+      "target_threat": "Malware",
+      "execution_mode": "HITL",
+      "is_active": false,
+      "description": "Own summary of a generic malware infection response: identify the malicious process and file, quarantine, isolate the host if analysts agree, then document. Source framework: NIST SP 800-61 containment and eradication, in the style of CERT-SG IRM malware cheat sheets.",
+      "source_framework": "NIST SP 800-61 / CERT-SG IRM style",
+      "workflow_logic": {
+        "mitre_id": "T1204",
+        "mitre_tactic": "Execution",
+        "mitre_technique": "User Execution",
+        "picerl_phase": "Containment & Eradication",
+        "keywords": [
+          "malware",
+          "trojan",
+          "dropper",
+          "malicious attachment",
+          "av detection"
+        ],
+        "triggers": [
+          "av_malware_detected",
+          "suspicious_child_process"
+        ],
+        "steps": [
+          {
+            "action": "enrich_ioc",
+            "connector": "tip"
+          },
+          {
+            "action": "terminate_process",
+            "connector": "edr"
+          },
+          {
+            "action": "quarantine_file",
+            "connector": "edr"
+          },
+          {
+            "action": "await_analyst_approval",
+            "role": "SOC Analyst L2"
+          },
+          {
+            "action": "isolate_endpoint",
+            "connector": "edr"
+          },
+          {
+            "action": "create_ticket",
+            "connector": "itsm",
+            "params": {
+              "priority": "Medium"
+            }
+          },
+          {
+            "action": "generate_report",
+            "connector": "reporter"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Cryptojacking and Resource Hijacking",
+      "target_threat": "Cryptomining",
+      "execution_mode": "HITL",
+      "is_active": false,
+      "description": "Own summary of the response to unauthorised cryptocurrency mining: stop the miner, quarantine its binary, block the mining pool address and open a ticket. Source framework: NIST SP 800-61 containment and eradication.",
+      "source_framework": "NIST SP 800-61",
+      "workflow_logic": {
+        "mitre_id": "T1496",
+        "mitre_tactic": "Impact",
+        "mitre_technique": "Resource Hijacking",
+        "picerl_phase": "Containment & Eradication",
+        "keywords": [
+          "cryptominer",
+          "cryptojacking",
+          "xmrig",
+          "mining pool",
+          "stratum"
+        ],
+        "triggers": [
+          "miner_process_detected",
+          "stratum_protocol_traffic",
+          "sustained_cpu_spike"
+        ],
+        "steps": [
+          {
+            "action": "terminate_process",
+            "connector": "edr"
+          },
+          {
+            "action": "quarantine_file",
+            "connector": "edr"
+          },
+          {
+            "action": "block_ip",
+            "connector": "firewall",
+            "params": {
+              "duration_hours": 168,
+              "direction": "outbound"
+            }
+          },
+          {
+            "action": "create_ticket",
+            "connector": "itsm",
+            "params": {
+              "priority": "Medium",
+              "summary": "Cryptomining activity detected"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Actively Exploited Vulnerability on a Public Service",
+      "target_threat": "Vulnerability Exploitation",
+      "execution_mode": "HITL",
+      "is_active": false,
+      "description": "Own summary for an internet-facing service under active exploitation: slow the attacker, require analyst approval before isolating the host, then track remediation. Source framework: CISA Federal Government Vulnerability Response Playbook (published as TLP:CLEAR) and NIST SP 800-61, summarised in our own words.",
+      "source_framework": "CISA Vulnerability Response Playbook / NIST SP 800-61",
+      "workflow_logic": {
+        "mitre_id": "T1190",
+        "mitre_tactic": "Initial Access",
+        "mitre_technique": "Exploit Public-Facing Application",
+        "picerl_phase": "Identification & Containment",
+        "keywords": [
+          "exploit",
+          "known exploited vulnerability",
+          "kev",
+          "rce attempt",
+          "exploitation attempt"
+        ],
+        "triggers": [
+          "waf_exploit_signature_match",
+          "ids_exploit_alert"
+        ],
+        "steps": [
+          {
+            "action": "enrich_ioc",
+            "connector": "tip"
+          },
+          {
+            "action": "block_ip",
+            "connector": "firewall",
+            "params": {
+              "duration_hours": 72
+            }
+          },
+          {
+            "action": "apply_rate_limit",
+            "connector": "firewall",
+            "params": {
+              "rate": "10/minute",
+              "duration_hours": 72
+            }
+          },
+          {
+            "action": "await_analyst_approval",
+            "role": "SOC Analyst L2"
+          },
+          {
+            "action": "isolate_endpoint",
+            "connector": "edr"
+          },
+          {
+            "action": "create_ticket",
+            "connector": "itsm",
+            "params": {
+              "priority": "High",
+              "summary": "Actively exploited vulnerability: patch or mitigate"
+            }
+          },
+          {
+            "action": "send_notification",
+            "connector": "itsm",
+            "params": {
+              "level": "CRITICAL",
+              "title": "Exploitation of a public service",
+              "message": "Attacker address blocked and rate limited. Patch or mitigate the vulnerable service."
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Compromised Service Account or API Credential",
+      "target_threat": "Credential Compromise",
+      "execution_mode": "HITL",
+      "is_active": false,
+      "description": "Own summary for a leaked or abused non-human credential: confirm misuse, suspend the identity, revoke its sessions and open a ticket so the secret is rotated. Source framework: NIST SP 800-61 containment and recovery.",
+      "source_framework": "NIST SP 800-61",
+      "workflow_logic": {
+        "mitre_id": "T1552",
+        "mitre_tactic": "Credential Access",
+        "mitre_technique": "Unsecured Credentials",
+        "picerl_phase": "Containment & Recovery",
+        "keywords": [
+          "leaked credential",
+          "api key exposed",
+          "service account abuse",
+          "secret in repository",
+          "token misuse"
+        ],
+        "triggers": [
+          "secret_scanning_alert",
+          "service_account_unusual_source"
+        ],
+        "steps": [
+          {
+            "action": "enrich_ioc",
+            "connector": "tip"
+          },
+          {
+            "action": "await_analyst_approval",
+            "role": "SOC Analyst L2"
+          },
+          {
+            "action": "disable_account",
+            "connector": "iam",
+            "params": {
+              "reason": "Credential suspected compromised"
+            }
+          },
+          {
+            "action": "revoke_user_sessions",
+            "connector": "iam"
+          },
+          {
+            "action": "create_ticket",
+            "connector": "itsm",
+            "params": {
+              "priority": "High",
+              "summary": "Rotate compromised service credential"
+            }
+          },
+          {
+            "action": "send_notification",
+            "connector": "itsm",
+            "params": {
+              "level": "WARNING",
+              "title": "Service credential suspended",
+              "message": "Rotate the secret and review the audit trail before re-enabling."
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Website Defacement",
+      "target_threat": "Web Attack",
+      "execution_mode": "HITL",
+      "is_active": false,
+      "description": "Own summary of a defaced public website: block the source, quarantine the changed file, isolate the web server once approved, and record the incident. Source framework: CERT-SG IRM style defacement cheat sheet and NIST SP 800-61 containment and eradication.",
+      "source_framework": "CERT-SG IRM style / NIST SP 800-61",
+      "workflow_logic": {
+        "mitre_id": "T1491.002",
+        "mitre_tactic": "Impact",
+        "mitre_technique": "External Defacement",
+        "picerl_phase": "Containment & Eradication",
+        "keywords": [
+          "defacement",
+          "defaced",
+          "index.html modified",
+          "website tampering"
+        ],
+        "triggers": [
+          "web_content_integrity_alert",
+          "unexpected_file_change_web_root"
+        ],
+        "steps": [
+          {
+            "action": "block_ip",
+            "connector": "firewall"
+          },
+          {
+            "action": "quarantine_file",
+            "connector": "edr"
+          },
+          {
+            "action": "await_analyst_approval",
+            "role": "SOC Analyst L2"
+          },
+          {
+            "action": "isolate_endpoint",
+            "connector": "edr"
+          },
+          {
+            "action": "create_ticket",
+            "connector": "itsm",
+            "params": {
+              "priority": "High"
+            }
+          },
+          {
+            "action": "generate_report",
+            "connector": "reporter"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Unauthorised Remote Access Tool",
+      "target_threat": "Unauthorized Access",
+      "execution_mode": "HITL",
+      "is_active": false,
+      "description": "Own summary for remote administration software that was not installed by IT: stop the process, block the relay address, and get analyst approval before isolating the host. Source framework: NIST SP 800-61 detection, containment and eradication.",
+      "source_framework": "NIST SP 800-61",
+      "workflow_logic": {
+        "mitre_id": "T1219",
+        "mitre_tactic": "Command and Control",
+        "picerl_phase": "Identification & Containment",
+        "keywords": [
+          "anydesk",
+          "teamviewer",
+          "remote access tool",
+          "unauthorized rat",
+          "screenconnect"
+        ],
+        "triggers": [
+          "unapproved_remote_tool_executed",
+          "rmm_relay_connection"
+        ],
+        "steps": [
+          {
+            "action": "enrich_ioc",
+            "connector": "tip"
+          },
+          {
+            "action": "terminate_process",
+            "connector": "edr"
+          },
+          {
+            "action": "block_ip",
+            "connector": "firewall",
+            "params": {
+              "direction": "outbound"
+            }
+          },
+          {
+            "action": "await_analyst_approval",
+            "role": "SOC Analyst L2"
+          },
+          {
+            "action": "isolate_endpoint",
+            "connector": "edr"
+          },
+          {
+            "action": "create_ticket",
+            "connector": "itsm",
+            "params": {
+              "priority": "Medium"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Malware from Removable Media",
+      "target_threat": "Malware",
+      "execution_mode": "HITL",
+      "is_active": false,
+      "description": "Own summary for malware that arrives on a USB or other removable drive: stop the process, quarantine the file, isolate with approval, and notify the owner's team. Source framework: CERT-SG IRM style malware handling and NIST SP 800-61 containment.",
+      "source_framework": "CERT-SG IRM style / NIST SP 800-61",
+      "workflow_logic": {
+        "mitre_id": "T1091",
+        "mitre_tactic": "Initial Access",
+        "mitre_technique": "Replication Through Removable Media",
+        "picerl_phase": "Containment & Eradication",
+        "keywords": [
+          "usb",
+          "removable media",
+          "autorun",
+          "usb malware",
+          "external drive"
+        ],
+        "triggers": [
+          "usb_autorun_execution",
+          "removable_media_executable_written"
+        ],
+        "steps": [
+          {
+            "action": "terminate_process",
+            "connector": "edr"
+          },
+          {
+            "action": "quarantine_file",
+            "connector": "edr"
+          },
+          {
+            "action": "await_analyst_approval",
+            "role": "SOC Analyst L2"
+          },
+          {
+            "action": "isolate_endpoint",
+            "connector": "edr"
+          },
+          {
+            "action": "send_notification",
+            "connector": "itsm",
+            "params": {
+              "level": "INFO",
+              "title": "Removable media malware",
+              "message": "File quarantined. Check other hosts used with the same drive."
+            }
+          },
+          {
+            "action": "create_ticket",
+            "connector": "itsm",
+            "params": {
+              "priority": "Medium"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
