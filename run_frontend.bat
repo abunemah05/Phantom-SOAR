@@ -12,7 +12,14 @@ if errorlevel 1 goto :nonode
 
 cd /d "%~dp0frontend"
 
-if exist "node_modules" goto :run
+rem Install on first run, and again when a newly added package (the self-hosted
+rem Inter / JetBrains Mono fonts) is missing from an older node_modules.
+if not exist "node_modules" goto :install
+if not exist "node_modules\@fontsource-variable\inter" goto :install
+if not exist "node_modules\@fontsource-variable\jetbrains-mono" goto :install
+goto :run
+
+:install
 echo [setup] Installing frontend dependencies ...
 call npm ci --no-audit --no-fund
 if errorlevel 1 goto :error
