@@ -8,7 +8,6 @@ import {
   ShieldAlert,
   ScrollText,
   Sliders,
-  Shield,
   LogOut,
   Users,
   Terminal,
@@ -18,6 +17,7 @@ import {
   Bot,
   KeyRound
 } from "lucide-react";
+import BrandMark from "@/components/BrandMark";
 import { useAuth } from "@/components/AuthGate";
 import { useRuntimeStatus } from "@/components/RuntimeStatusProvider";
 import { accessLabel, isAdmin, isSecEngOrAdmin } from "@/lib/roles";
@@ -72,15 +72,13 @@ export default function Sidebar() {
       {/* Brand Header */}
       <div className="p-5 border-b border-slate-800/80 flex items-center justify-between">
         <div className="flex items-center space-x-3">
-          <div className="h-10 w-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center shadow-lg shadow-blue-500/20">
-            <Shield className="h-6 w-6 text-white" />
+          <div className="h-10 w-10 rounded-xl bg-black border border-slate-700 flex items-center justify-center shadow-lg shadow-blue-500/20">
+            <BrandMark className="h-6 w-6" />
           </div>
           <div>
             <div className="flex items-center space-x-1.5">
               <span className="font-extrabold text-base tracking-wider text-white">PHANTOM</span>
-              <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400 font-bold border border-blue-500/30">
-                SOAR
-              </span>
+              <span className="text-base font-light tracking-wider text-slate-400">SOAR</span>
             </div>
             <p className="text-[10px] text-slate-400 uppercase tracking-widest font-semibold mt-0.5">
               SecOps Console v2.0
@@ -108,7 +106,7 @@ export default function Sidebar() {
               title={restricted ? `${item.name} needs the ${badge} role; the backend will refuse access for your role.` : undefined}
               className={`flex items-center justify-between px-3.5 py-2.5 rounded-lg text-sm font-medium transition-all duration-150 group focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
                 isActive
-                  ? "bg-blue-600 text-white shadow-md shadow-blue-600/25"
+                  ? "bg-slate-800 text-white border border-slate-700 shadow-md shadow-black/40"
                   : restricted
                   ? "text-slate-500 hover:text-slate-400 hover:bg-slate-900/40 opacity-80"
                   : "text-slate-400 hover:text-slate-200 hover:bg-slate-900/80"
@@ -117,7 +115,7 @@ export default function Sidebar() {
               <div className="flex items-center space-x-3">
                 <Icon className={`h-4 w-4 ${
                   isActive
-                    ? "text-white"
+                    ? "text-blue-400"
                     : restricted
                     ? "text-slate-600"
                     : "text-slate-400 group-hover:text-slate-200"
@@ -189,7 +187,7 @@ export default function Sidebar() {
       <div className="p-3 border-t border-slate-800/80 bg-slate-950/80 space-y-2">
         <div className="flex items-center justify-between p-2 rounded-xl bg-slate-900 border border-slate-800/80">
           <div className="flex items-center space-x-2.5 overflow-hidden">
-            <div className="h-8 w-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center font-bold text-xs text-white flex-shrink-0 shadow-sm shadow-blue-500/20">
+            <div className="h-8 w-8 rounded-lg bg-blue-600 flex items-center justify-center font-bold text-xs text-white flex-shrink-0 shadow-sm shadow-blue-500/20">
               {userInitials}
             </div>
             <div className="overflow-hidden">

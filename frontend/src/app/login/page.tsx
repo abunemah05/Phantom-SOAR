@@ -12,7 +12,6 @@ import {
   Lock,
   LogIn,
   Radio,
-  Shield,
   ShieldCheck,
   Smartphone,
   User as UserIcon,
@@ -22,6 +21,7 @@ import { clearAuth, getStoredToken, getStoredUser, setStoredAuth, setStoredToken
 import { describeError } from "@/lib/errors";
 import { needsMfaEnrollment, needsPasswordChange } from "@/lib/roles";
 import { User } from "@/lib/types";
+import BrandMark from "@/components/BrandMark";
 import MfaSetup from "@/components/MfaSetup";
 
 type Step = "credentials" | "mfa" | "change_password" | "enroll_mfa";
@@ -218,18 +218,18 @@ export default function LoginPage() {
 
   return (
     <div className="min-h-screen bg-slate-950 flex flex-col justify-center items-center px-4 sm:px-6 lg:px-8 relative overflow-hidden font-sans">
-      <div className="absolute inset-0 bg-[radial-gradient(#1e293b_1px,transparent_1px)] [background-size:24px_24px] opacity-25 pointer-events-none" aria-hidden="true" />
+      <div className="absolute inset-0 bg-[radial-gradient(#262626_1px,transparent_1px)] [background-size:24px_24px] opacity-25 pointer-events-none" aria-hidden="true" />
       <div className="absolute -top-40 -left-40 w-96 h-96 bg-blue-600/10 rounded-full blur-3xl pointer-events-none" aria-hidden="true" />
       <div className="absolute -bottom-40 -right-40 w-96 h-96 bg-indigo-600/10 rounded-full blur-3xl pointer-events-none" aria-hidden="true" />
 
       <div className="w-full max-w-md z-10">
         <div className="text-center mb-6">
-          <div className="inline-flex items-center justify-center h-14 w-14 rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-500 shadow-xl shadow-blue-500/25 mb-3 border border-blue-400/30">
-            <Shield className="h-8 w-8 text-white" aria-hidden="true" />
+          <div className="inline-flex items-center justify-center h-14 w-14 rounded-2xl bg-black shadow-xl shadow-blue-500/25 mb-3 border border-slate-700">
+            <BrandMark className="h-8 w-8" />
           </div>
           <h1 className="text-2xl font-black tracking-wider text-white flex items-center justify-center space-x-2">
             <span>PHANTOM</span>
-            <span className="text-sm px-2 py-0.5 rounded bg-blue-500/20 text-blue-400 font-extrabold border border-blue-500/30">SOAR</span>
+            <span className="font-light text-slate-400">SOAR</span>
           </h1>
           <p className="text-xs text-slate-400 font-medium tracking-wide mt-1">Security Orchestration, Automation & Response</p>
         </div>

@@ -113,7 +113,7 @@ export default function DashboardPage() {
 
   return (
     <div className="space-y-8 animate-fade-in">
-      <div className="bg-gradient-to-r from-slate-900 via-indigo-950/40 to-slate-900 border border-slate-800 rounded-2xl p-6 lg:p-8 flex flex-col md:flex-row md:items-center justify-between gap-6 shadow-xl shadow-black/40">
+      <div className="bg-gradient-to-r from-slate-900 via-blue-950/30 to-slate-900 border border-slate-800 rounded-2xl p-6 lg:p-8 flex flex-col md:flex-row md:items-center justify-between gap-6 shadow-xl shadow-black/40">
         <div className="space-y-1.5">
           <div className="flex items-center gap-2.5 flex-wrap">
             <h1 className="text-2xl font-black text-white tracking-tight">Phantom SOAR Mission Control</h1>
@@ -144,9 +144,9 @@ export default function DashboardPage() {
                 onClick={() => void seedDemo()}
                 disabled={seeding || purging}
                 title="Sends lab alert payloads through the real ingestion pipeline (simulation mode only)"
-                className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-sm shadow-xl shadow-blue-600/30 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-300"
+                className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm shadow-xl shadow-blue-600/30 disabled:opacity-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-300"
               >
-                <Zap className={`h-4 w-4 ${seeding ? "animate-spin text-amber-300" : "text-amber-400"}`} aria-hidden="true" />
+                <Zap className={`h-4 w-4 ${seeding ? "animate-spin text-amber-600" : "text-amber-600"}`} aria-hidden="true" />
                 <span>{seeding ? "Ingesting lab alerts..." : "Generate demo data"}</span>
               </button>
             )}
