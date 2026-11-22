@@ -9,7 +9,8 @@ import { Alert, DashboardMetrics } from "@/lib/types";
 import { api } from "@/lib/api";
 import { describeError } from "@/lib/errors";
 import { formatDuration } from "@/lib/format";
-import { canAdminister } from "@/lib/roles";
+import { canAdminister, canViewConfig } from "@/lib/roles";
+import BadgeWrap from "@/components/BadgeWrap";
 import { useResource } from "@/hooks/useResource";
 import InvestigateModal from "@/components/InvestigateModal";
 import { useAuth } from "@/components/AuthGate";
@@ -119,11 +120,16 @@ export default function DashboardPage() {
             <h1 className="text-2xl font-black text-white tracking-tight">Phantom SOAR Mission Control</h1>
             {runtime &&
               (simulationMode ? (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-fuchsia-500/20 text-fuchsia-300 font-bold border border-fuchsia-500/30 flex items-center gap-1">
+                <BadgeWrap href={canViewConfig(user) ? "/configuration" : null} title={canViewConfig(user) ? "Open Configuration to switch to live mode" : "Simulation mode is ON: no real system is contacted"} className="text-xs px-2 py-0.5 rounded-full bg-fuchsia-500/20 text-fuchsia-300 font-bold border border-fuchsia-500/30 flex items-center gap-1">
                   <FlaskConical className="h-3 w-3" aria-hidden="true" /> SIMULATION
-                </span>
+                </BadgeWrap>
               ) : (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold border border-emerald-500/30">LIVE CONNECTORS ONLY</span>
+                <BadgeWrap href={canViewConfig(user) ? "/configuration" : null} title="Response actions act on real systems through the connectors that have credentials" className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold border border-emerald-500/30">
+                  {(() => {
+                    const n = ["wazuh", "okta", "jira", "slack"].filter((k) => runtime?.integrations?.[k]).length;
+                    return `LIVE (${n}/4 response connectors configured)`;
+                  })()}
+                </BadgeWrap>
               ))}
           </div>
           <p className="text-sm text-slate-400 max-w-2xl leading-relaxed">

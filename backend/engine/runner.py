@@ -646,7 +646,12 @@ def _finish_run(
     db.commit()
     db.refresh(alert)
 
-    mttr = elapsed_seconds_since(alert.created_at) if alert.status == "Contained" else 0.0
+    # MTTR is counted once, by the run that actually performed a new live containment; a re-approval that only
+    # reuses earlier successes (or changed nothing) must not add another sample.
+    new_live_containment = any(
+        r.connector in CONTAINMENT_CONNECTORS and is_live_success(r.status, r.execution_mode) for r in run["records"]
+    )
+    mttr = elapsed_seconds_since(alert.created_at) if alert.status == "Contained" and new_live_containment else 0.0
     execution = _upsert_execution(db, alert, playbook, outcome["execution_status"], mttr, lease_id=lease_id)
     pdf_path = generate_and_save_report(db, alert)
 

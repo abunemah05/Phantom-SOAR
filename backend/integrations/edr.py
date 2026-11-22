@@ -274,6 +274,8 @@ class WazuhActiveResponse:
             "message": "; ".join(messages) or None,
             "attempts": attempts,
             "token_cached": token_cached,
+            "delivery": "queued_by_manager",
+            "confirmation": "Wazuh manager accepted and sent the command to the agent; the agent's own result is only in its active-responses.log",
             **tls_details,
         }
         if failed_items or not affected:

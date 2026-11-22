@@ -256,6 +256,49 @@ export default function ConfigurationPage() {
     }
   };
 
+  // One-click mode switch (admins only). Saves only simulation_mode; going live needs a typed confirmation.
+  const switchMode = async (goLive: boolean) => {
+    setSaveError(null);
+    const ok = await confirm(
+      goLive
+        ? {
+            title: "Switch to LIVE mode?",
+            message: "Every response action will now run against real systems for every connector that has credentials saved. Connectors without credentials record SKIPPED.",
+            items: [
+              "Wazuh, Okta, Jira and Slack actions are really sent (isolate host, block IP, disable account, tickets, messages).",
+              "Demo (lab) alerts can no longer drive real systems; threat-intel lab fixtures stop answering.",
+              "Keep protected hosts/users/IPs filled in, and leave HOTL off until you have tested.",
+              "You can switch back to simulation here at any time.",
+            ],
+            confirmLabel: "Go live",
+            tone: "danger",
+            requireText: "GO LIVE",
+          }
+        : {
+            title: "Switch back to SIMULATION mode?",
+            message: "Nothing will be sent to any real system; actions are only recorded as SIMULATED.",
+            confirmLabel: "Use simulation",
+            tone: "default",
+          }
+    );
+    if (!ok) return;
+    setSaving(true);
+    try {
+      await api.updateConfigurations([
+        { category: "ORCHESTRATION", key_name: "simulation_mode", key_value: goLive ? "false" : "true", is_secret: false },
+      ]);
+      toast.success(goLive ? "Live mode is ON. Response actions now act on real systems." : "Simulation mode is ON. No real system will be contacted.");
+      await resource.reload();
+      await refreshRuntime();
+      // refreshRuntime keeps the old status if its own request fails: re-poll once so the banner cannot stay stale.
+      window.setTimeout(() => void refreshRuntime(), 1500);
+    } catch (err) {
+      setSaveError({ message: `Could not switch mode: ${describeError(err, "the server refused the change.")}`, blockers: errorBlockers(err) });
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const runTest = async (category: string, serviceId: string, label: string, overrides: { api_key?: string; endpoint_url?: string; username?: string }) => {
     setTesting(serviceId);
     const send: { api_key?: string; endpoint_url?: string; username?: string } = {};
@@ -480,6 +523,49 @@ export default function ConfigurationPage() {
           </div>
         )}
       </div>
+
+      {runtime && (
+        <div
+          className={`rounded-xl border p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 ${
+            runtime.simulation_mode ? "border-fuchsia-500/30 bg-fuchsia-500/5" : "border-emerald-500/30 bg-emerald-500/5"
+          }`}
+          data-testid="mode-banner"
+        >
+          <div className="text-xs leading-relaxed">
+            <p className={`font-bold text-sm ${runtime.simulation_mode ? "text-fuchsia-300" : "text-emerald-400"}`}>
+              {runtime.simulation_mode ? "SIMULATION MODE: no real system is contacted" : "LIVE MODE: response actions act on real systems"}
+            </p>
+            <p className="text-slate-400 mt-1 max-w-3xl">
+              {runtime.simulation_mode
+                ? "Threat-intel lookups are real, but every response action is only recorded as SIMULATED. Connect your integrations below, test each one, then switch to live mode."
+                : "Connectors with saved credentials really act; connectors without credentials record SKIPPED. Use the Test buttons to confirm each integration works."}
+              {runtime.simulation_source === "environment" && runtime.simulation_mode
+                ? " (The current value comes from the PHANTOM_SIMULATION_MODE environment variable; switching here overrides it.)"
+                : ""}
+            </p>
+          </div>
+          {canEdit ? (
+            <button
+              type="button"
+              onClick={() => void switchMode(runtime.simulation_mode)}
+              disabled={saving || resource.loading || dirtyIds.length > 0}
+              title={dirtyIds.length > 0 ? "Save or discard your other unsaved changes first" : undefined}
+              className={`shrink-0 px-5 py-2.5 rounded-xl font-bold text-xs disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus-visible:ring-2 ${
+                runtime.simulation_mode
+                  ? "bg-emerald-600 hover:bg-emerald-500 text-white focus-visible:ring-emerald-300"
+                  : "bg-fuchsia-600 hover:bg-fuchsia-500 text-white focus-visible:ring-fuchsia-300"
+              }`}
+            >
+              {runtime.simulation_mode ? "Switch to LIVE mode" : "Switch back to simulation"}
+            </button>
+          ) : (
+            <span className="text-xs text-slate-400 flex items-center gap-1.5">
+              <Lock className="h-3.5 w-3.5 text-amber-400" aria-hidden="true" />
+              Only an Administrator can change the mode{user?.role ? ` (your role: ${user.role})` : ""}
+            </span>
+          )}
+        </div>
+      )}
 
       {saveError && (
         <InlineNotice tone="error" onDismiss={() => setSaveError(null)}>

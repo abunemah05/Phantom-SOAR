@@ -465,10 +465,38 @@ def test_nvd_allow_live_false_serves_cache_and_live_fills_it(nvd_key):
     assert cached["vulnerabilities"][0]["cached"] is True
 
 
-def test_nvd_without_key_stays_not_configured_even_when_not_live(monkeypatch):
+def test_nvd_without_key_is_pending_when_not_live_and_never_invents_data(monkeypatch):
     monkeypatch.setattr(nvd_module.integration_config, "get_setting", lambda key, db=None, default=None: default or "")
     nvd = NationalVulnerabilityDatabase(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
-    assert nvd.analyze_alert_vulnerabilities(ALERT, None, allow_live=False)["lookup_status"] == "not_configured"
+    assert nvd.analyze_alert_vulnerabilities(ALERT, None, allow_live=False)["lookup_status"] == "pending"
+
+
+def test_nvd_works_without_a_key_and_sends_no_api_key_header(monkeypatch):
+    """NVD allows keyless requests (5 per 30 s): a missing key must not stop lookups."""
+    monkeypatch.setattr(nvd_module.integration_config, "get_setting", lambda key, db=None, default=None: default or "")
+    seen = {}
+
+    def handler(req: httpx.Request):
+        seen["has_key_header"] = "apikey" in {k.lower() for k in req.headers.keys()}
+        return httpx.Response(200, json={"vulnerabilities": [{"cve": {
+            "id": "CVE-2021-44228",
+            "descriptions": [{"lang": "en", "value": "Log4j JNDI RCE"}],
+            "metrics": {"cvssMetricV31": [{"type": "Primary", "cvssData": {
+                "baseScore": 10.0, "baseSeverity": "CRITICAL", "attackVector": "NETWORK",
+                "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"}}]},
+        }}]})
+
+    nvd = NationalVulnerabilityDatabase(transport=httpx.MockTransport(handler))
+    record = nvd.get_vulnerability_details("CVE-2021-44228")
+    assert record["status"] == "live" and record["cvss_score"] == 10.0 and record["auth"] == "keyless"
+    assert seen["has_key_header"] is False
+
+
+def test_nvd_keyless_403_is_reported_as_rate_limited(monkeypatch):
+    monkeypatch.setattr(nvd_module.integration_config, "get_setting", lambda key, db=None, default=None: default or "")
+    nvd = NationalVulnerabilityDatabase(transport=httpx.MockTransport(lambda r: httpx.Response(403)))
+    record = nvd.get_vulnerability_details("CVE-2021-44229")
+    assert record["status"] == "rate_limited" and record["cvss_score"] is None
 
 
 def test_nvd_accepts_alert_objects_with_to_dict(nvd_key):

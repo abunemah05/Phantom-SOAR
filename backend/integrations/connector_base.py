@@ -158,7 +158,8 @@ def describe_http_error(exc: Exception) -> str:
     if isinstance(exc, httpx.TimeoutException):
         return f"Timed out contacting {_host_of(exc)}"
     if isinstance(exc, httpx.ConnectError):
-        return f"Unreachable: could not connect to {_host_of(exc)}"
+        cause = str(exc).replace("\n", " ")[:160]
+        return f"Unreachable: could not connect to {_host_of(exc)}" + (f" ({cause})" if cause else "")
     if isinstance(exc, httpx.HTTPError):
         return f"HTTP error contacting {_host_of(exc)}: {exc.__class__.__name__}"
     return f"{exc.__class__.__name__}: {exc}"

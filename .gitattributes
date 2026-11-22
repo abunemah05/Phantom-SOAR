@@ -1,0 +1,4 @@
+# Scripts that run on Linux (shebang lines break with CRLF line endings), even when checked out on Windows.
+*.sh                text eol=lf
+wazuh/linux/*       text eol=lf
+wazuh/manager/*     text eol=lf

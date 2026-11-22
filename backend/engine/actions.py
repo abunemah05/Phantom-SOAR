@@ -333,7 +333,7 @@ def _default_ticket_text(alert: Alert) -> Dict[str, str]:
         lines.extend(
             f"- {i.artifact_type} {i.value}: verdict {i.verdict or 'Unknown'} (score {i.threat_score})" for i in iocs
         )
-    actions = list(alert.containment_actions or [])
+    actions = [a for a in (alert.containment_actions or []) if a.execution_mode != "simulated"]  # rehearsals are not shown to ticket readers
     if actions:
         lines.append("Response actions so far:")
         lines.extend(
@@ -439,7 +439,16 @@ def execute_action(
         target = str(target).strip()
 
     try:
-        result = _dispatch(alert, canonical, target, params)
+        if (alert.source or "").endswith("(lab simulation)") and not integration_config.is_simulation_mode(db):
+            # Lab demo alerts use made-up hosts/users whose agent ids can collide with real ones: never let them
+            # drive a real system once simulation mode has been switched off.
+            result = connector_base.failed(
+                canonical, target, spec["connector"],
+                "Refused: this is a lab demo alert, so it may not contact real systems while simulation mode is off. "
+                "Purge the demo cases and ingest real alerts.",
+            )
+        else:
+            result = _dispatch(alert, canonical, target, params)
     except Exception as exc:
         logger.exception(f"Connector error running {canonical} for alert #{alert.alert_id}")
         result = connector_base.failed(canonical, target, spec["connector"], f"{exc.__class__.__name__}: {exc}")

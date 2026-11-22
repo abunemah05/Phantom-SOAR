@@ -115,6 +115,13 @@ def test_virustotal_scoring_and_url_id():
     assert seen[-1].headers["x-apikey"] == "vt-key"
 
 
+def test_virustotal_engines_total_excludes_timeouts_and_failures():
+    stats = {"malicious": 2, "suspicious": 1, "harmless": 60, "undetected": 20, "timeout": 5, "failure": 3, "type-unsupported": 9}
+    tip = _tip(lambda req: httpx.Response(200, json={"data": {"attributes": {"last_analysis_stats": stats}}}))
+    res = tip.enrich_ioc("Domain", "example.org", settings=TipSettings(virustotal_api_key="vt-key"))
+    assert res["providers"]["virustotal"]["summary"]["engines_total"] == 83
+
+
 @pytest.mark.parametrize("code,needle", [(401, "authentication failed"), (403, "authentication failed"), (429, "rate limited")])
 def test_virustotal_errors_are_reported(code, needle):
     tip = _tip(lambda req: httpx.Response(code))
@@ -432,11 +439,11 @@ def test_demo_seed_refused_outside_simulation_mode(client, admin_headers):
 
 # -- NVD --------------------------------------------------------------------------------
 
-def test_nvd_without_key_reports_not_configured_and_infers_nothing():
+def test_nvd_failure_without_key_reports_unavailable_and_infers_nothing():
     nvd = NationalVulnerabilityDatabase(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
     assert nvd.extract_cves_from_text("cve-2021-44228 then CVE-2024-3094 and CVE-2021-44228") == ["CVE-2021-44228", "CVE-2024-3094"]
     detail = nvd.get_vulnerability_details("CVE-2024-3094")
-    assert detail["status"] == "not_configured" and detail["cvss_score"] is None and detail["hotl_action"] == "none"
+    assert detail["status"] == "unavailable" and detail["cvss_score"] is None and detail["hotl_action"] == "none"
 
     # Keywords such as "log4j" or a High severity never produce a CVE.
     analysis = nvd.analyze_alert_vulnerabilities({"rule_id": "x", "severity": "Critical", "raw_payload": {"full_log": "log4j jndi backdoor"}})
