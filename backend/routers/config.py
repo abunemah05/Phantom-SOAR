@@ -645,7 +645,9 @@ def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict
         if not (base and user and password):
             return not_configured("siem_manager_url (http/https), siem_user and siem_password")
         bundle = (setting("wazuh_ca_bundle", "") or "").strip()
-        verify = bundle if bundle and os.path.isfile(bundle) else get_bool("siem_verify_tls", db=db)
+        if bundle and not os.path.isfile(bundle):
+            return _result(service, ERROR, "CA bundle not found", "wazuh_ca_bundle does not point to a readable file on the server.")
+        verify = bundle if bundle else get_bool("siem_verify_tls", db=db)
         return _probe(service, "POST", f"{base}/security/user/authenticate", auth=(user, password), verify=verify,
                       guarded=overridden)
 

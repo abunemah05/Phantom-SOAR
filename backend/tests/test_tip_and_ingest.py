@@ -115,6 +115,13 @@ def test_virustotal_scoring_and_url_id():
     assert seen[-1].headers["x-apikey"] == "vt-key"
 
 
+def test_virustotal_engines_total_excludes_timeouts_and_failures():
+    stats = {"malicious": 2, "suspicious": 1, "harmless": 60, "undetected": 20, "timeout": 5, "failure": 3, "type-unsupported": 9}
+    tip = _tip(lambda req: httpx.Response(200, json={"data": {"attributes": {"last_analysis_stats": stats}}}))
+    res = tip.enrich_ioc("Domain", "example.org", settings=TipSettings(virustotal_api_key="vt-key"))
+    assert res["providers"]["virustotal"]["summary"]["engines_total"] == 83
+
+
 @pytest.mark.parametrize("code,needle", [(401, "authentication failed"), (403, "authentication failed"), (429, "rate limited")])
 def test_virustotal_errors_are_reported(code, needle):
     tip = _tip(lambda req: httpx.Response(code))

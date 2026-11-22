@@ -290,6 +290,8 @@ export default function ConfigurationPage() {
       toast.success(goLive ? "Live mode is ON. Response actions now act on real systems." : "Simulation mode is ON. No real system will be contacted.");
       await resource.reload();
       await refreshRuntime();
+      // refreshRuntime keeps the old status if its own request fails: re-poll once so the banner cannot stay stale.
+      window.setTimeout(() => void refreshRuntime(), 1500);
     } catch (err) {
       setSaveError({ message: `Could not switch mode: ${describeError(err, "the server refused the change.")}`, blockers: errorBlockers(err) });
     } finally {

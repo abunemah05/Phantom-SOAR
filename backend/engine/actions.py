@@ -439,7 +439,7 @@ def execute_action(
         target = str(target).strip()
 
     try:
-        if (alert.source or "").endswith("(lab simulation)") and not integration_config.is_simulation_mode():
+        if (alert.source or "").endswith("(lab simulation)") and not integration_config.is_simulation_mode(db):
             # Lab demo alerts use made-up hosts/users whose agent ids can collide with real ones: never let them
             # drive a real system once simulation mode has been switched off.
             result = connector_base.failed(

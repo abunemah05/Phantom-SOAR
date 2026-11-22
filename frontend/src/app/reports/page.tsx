@@ -465,7 +465,7 @@ export default function AdminReportsPage() {
 
         <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
           <div className="flex items-center justify-between text-slate-400 text-xs font-medium mb-1">
-            <span>Live Containment Executions</span>
+            <span>Live Response Actions</span>
             <ShieldCheck className="h-4 w-4 text-emerald-400" />
           </div>
           <div className="text-2xl font-black text-emerald-400">

@@ -237,7 +237,15 @@ def test_lab_demo_alert_never_drives_real_systems_when_simulation_is_off(setting
     monkeypatch.setattr(actions, "_dispatch", boom)
     record = execute_action(db, alert, "isolate_endpoint", "srv-prod-db01")
     assert record.status == "Failed" and record.execution_mode == "failed"
-    assert "lab demo alert" in json.dumps(record.details if hasattr(record, "details") else record.__dict__, default=str)
+    assert "lab demo alert" in json.dumps(record.details, default=str)
+
+    # Negative control: the same action on a real (non-lab) alert is dispatched to the connector.
+    alert.source = "Wazuh SIEM"
+    db.commit()
+    calls = []
+    monkeypatch.setattr(actions, "_dispatch", lambda *a, **k: calls.append(a) or connector_base.make_result("isolate_endpoint", "srv-prod-db01", "Wazuh EDR", "live", {}))
+    execute_action(db, alert, "isolate_endpoint", "srv-prod-db01")
+    assert len(calls) == 1
 
 
 def test_execute_action_live_uses_alert_agent_id(settings, db, alert, monkeypatch):

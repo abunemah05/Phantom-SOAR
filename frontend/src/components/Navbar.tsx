@@ -5,7 +5,8 @@ import Link from "next/link";
 import { ShieldCheck, ShieldAlert, Power, AlertCircle, FlaskConical, Plug } from "lucide-react";
 import { api } from "@/lib/api";
 import { describeError, errorBlockers } from "@/lib/errors";
-import { isAdmin, isSecEngOrAdmin } from "@/lib/roles";
+import { canViewConfig, isAdmin, isSecEngOrAdmin } from "@/lib/roles";
+import BadgeWrap from "@/components/BadgeWrap";
 import { usePolling } from "@/hooks/usePolling";
 import { useAuth } from "@/components/AuthGate";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -134,14 +135,14 @@ export default function Navbar() {
         </div>
 
         {simulation && (
-          <Link
-            href="/configuration"
-            className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-fuchsia-500/15 border border-fuchsia-500/40 text-fuchsia-300 text-xs font-black tracking-wider hover:bg-fuchsia-500/25"
-            title="Click to open Configuration and switch to live mode. Simulation mode is ON: no response action is sent to any system, even where credentials are saved (actions are recorded as SIMULATED, nothing is changed on real systems, alerts are NOT contained). Threat-intel lookups are read-only and unaffected; lab fixtures answer for documentation IPs and demo IOCs. Turn simulation mode off in Configuration to act for real."
+          <BadgeWrap
+            href={canViewConfig(user) ? "/configuration" : null}
+            className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-fuchsia-500/15 border border-fuchsia-500/40 text-fuchsia-300 text-xs font-black tracking-wider"
+            title="Simulation mode is ON: no response action is sent to any system, even where credentials are saved (actions are recorded as SIMULATED, nothing is changed on real systems, alerts are NOT contained). Threat-intel lookups are read-only and unaffected; lab fixtures answer for documentation IPs and demo IOCs. Turn simulation mode off in Configuration to act for real."
           >
             <FlaskConical className="h-3.5 w-3.5" aria-hidden="true" />
             <span>SIMULATION MODE</span>
-          </Link>
+          </BadgeWrap>
         )}
 
         {statusError && (
