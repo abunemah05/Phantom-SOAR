@@ -602,7 +602,7 @@ class ThreatIntelligencePlatform:
         suspicious = int(stats.get("suspicious", 0) or 0)
         harmless = int(stats.get("harmless", 0) or 0)
         undetected = int(stats.get("undetected", 0) or 0)
-        engines = sum(int(v or 0) for v in stats.values() if isinstance(v, (int, float)))
+        engines = malicious + suspicious + harmless + undetected  # excludes timeout / failure / unsupported
         summary = {
             "malicious": malicious,
             "suspicious": suspicious,

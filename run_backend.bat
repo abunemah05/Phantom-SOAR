@@ -52,7 +52,8 @@ echo ========================================================
 echo  PHANTOM SOAR - BACKEND SERVICE (development)
 echo  API:                http://%BACKEND_HOST%:8000/api/health
 echo  Interactive docs:   http://%BACKEND_HOST%:8000/docs
-echo  Simulation mode:    %PHANTOM_SIMULATION_MODE%
+echo  Simulation mode (start-up default): %PHANTOM_SIMULATION_MODE%
+echo  A value saved on the Configuration page overrides this; switch it there.
 echo  Development secrets are kept in .phantom_dev_secrets (git-ignored, not shown).
 echo  Create a per-sender webhook token in the console (Accounts) or use the
 echo  PHANTOM_INGEST_TOKEN line of .phantom_dev_secrets for local tests.

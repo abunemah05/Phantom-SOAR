@@ -102,7 +102,7 @@ Legend: **Do** = steps, **Expect** = the passing result, **Capture** = what to s
 1. **Token.** *Do:* Accounts, create an ingest token named for the sender; copy it (shown once). *Expect:* the list shows only a prefix afterwards.
 2. **Post a test alert from the sender host.** *Do:* the `curl` from `docs/DEPLOYMENT.md` section 4 against your real hostname with the token. *Expect:* HTTP 201,
    `"status":"Success"`, alert visible in the console. Without the header: 401. With a wrong token: 401; after many failures: 429. *Capture:* terminal output, alert in the console.
-3. **Real Wazuh forwarder.** *Do:* configure Wazuh's custom integration (see Wazuh docs; the repo ships none) to POST alert JSON to `https://<domain>/api/webhooks/wazuh` with
+3. **Real Wazuh forwarder.** *Do:* install `wazuh/manager/custom-phantom` and the `<integration>` block from `wazuh/ossec-manager-snippets.xml` (Wazuh custom integration) to POST alert JSON to `https://<domain>/api/webhooks/wazuh` with
    the header. Trigger a harmless rule (for example a failed `sudo`). *Expect:* the alert appears, severity matches `rule.level`. *Capture:* the Wazuh integration config (token masked), the alert.
 4. **TLS check.** *Do:* `curl -v https://<domain>/` from another host. *Expect:* a valid certificate chain (no `-k`), `Strict-Transport-Security` present, HTTP redirects to HTTPS.
 5. *Undo:* revoke the token on the Accounts page; the sender then gets 401.
@@ -120,11 +120,11 @@ These lookups are read-only and really contact the provider even with simulation
 
 | Provider | Test indicator | Expect | Capture |
 |---|---|---|---|
-| VirusTotal | a public known-malicious hash (EICAR: `275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f`) and a clean one | provider status `ok` with detection counts; clean one scores low. Free tier is 4 requests/min: with several indicators expect `rate_limited` and a later automatic retry, not a hang | drawer with provider evidence |
+| VirusTotal | a public known-malicious hash (EICAR: `275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f`) and a clean one | provider status `live` with detection counts; clean one scores low. Free tier is 4 requests/min: with several indicators expect `rate_limited` and a later automatic retry, not a hang | drawer with provider evidence |
 | AbuseIPDB | a public IP with reports (look one up on the AbuseIPDB site first) | confidence score shown; private/documentation IPs are **not** sent | drawer |
 | AlienVault OTX | a public IP or domain known to OTX | pulse count shown | drawer |
 | ThreatFox | a known IOC from threatfox.abuse.ch | match shown, or a clear "no match" | drawer |
-| NVD | an alert mentioning a CVE (for example `CVE-2021-44228`) | CVSS score and description; without a key, expect slower, rate-limited answers | vulnerability panel |
+| NVD | an alert mentioning a CVE (for example `CVE-2021-44228`) | CVSS score and description; works without a key at 5 requests per 30 s (a free NVD key raises it to 50) | vulnerability panel |
 
 Also check: a wrong key gives a clear provider error (not a crash), and an indicator that only one provider calls malicious is **not** escalated more than one severity step.
 *Undo:* clear the key on the Configuration page.

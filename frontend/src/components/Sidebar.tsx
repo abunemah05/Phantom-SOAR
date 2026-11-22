@@ -165,8 +165,11 @@ export default function Sidebar() {
                 </div>
                 <div className="flex items-center justify-between text-slate-300">
                   <span className="font-medium">NVD CVE lookup</span>
-                  <span className="text-[10px] text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded font-mono">
-                    {integrations?.nvd ? "API key set" : "No API key"}
+                  <span
+                    className={`text-[10px] px-1.5 py-0.5 rounded font-mono ${integrations?.nvd ? "text-emerald-400 bg-emerald-500/10" : "text-sky-300 bg-sky-500/10"}`}
+                    title={integrations?.nvd ? "NVD API key saved (50 requests per 30 s)" : "No NVD key: lookups still work, limited to 5 requests per 30 s"}
+                  >
+                    {integrations?.nvd ? "API key set" : "Keyless (5/30s)"}
                   </span>
                 </div>
               </>

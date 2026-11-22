@@ -111,9 +111,10 @@ curl -sS -X POST https://soar.example.org/api/webhooks/wazuh \
 ```
 
 Endpoints: `/api/webhooks/wazuh`, `/api/webhooks/edr`, `/api/webhooks/xdr`; bodies over 1 MiB are rejected. The repository
-does **not** ship a Wazuh-side forwarder (the part of Wazuh that sends alerts out); use Wazuh's custom integration
-mechanism from the Wazuh documentation, or any tool that can POST the alert JSON. The scripts in `wazuh/` are only
-the response (active response) side.
+ships a Wazuh-side forwarder: `wazuh/manager/custom-phantom` plus the `<integration>` block in
+`wazuh/ossec-manager-snippets.xml` (install it on the Wazuh manager, put your ingest token in `<api_key>`). Any other tool
+that can POST the alert JSON with the token header also works. The other scripts in `wazuh/` are the response
+(active response) side.
 
 ## 5. Backups and restore
 

@@ -538,6 +538,9 @@ export interface ConfigUpdateResult {
 
 export interface RuntimeStatus {
   simulation_mode: boolean;
+  /** Where the effective simulation value comes from: database (saved in the console), environment or default. */
+  simulation_source?: "database" | "environment" | "default" | null;
+  nvd_mode?: "api_key" | "keyless";
   hotl_enabled: boolean;
   /** ai = an OpenRouter key exists (not that AI triage is enabled; see ai_enabled). */
   integrations: Record<string, boolean>;

@@ -10,7 +10,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -38,6 +38,7 @@ from backend.integration_config import (
     hotl_enable_blockers,
     is_configured,
     is_simulation_mode,
+    setting_source,
 )
 from backend.models import SystemConfig, User
 from backend.routers.logs import record_log
@@ -385,13 +386,15 @@ def get_runtime_status(db: Session = Depends(get_db), user: User = Depends(get_c
         min_confidence = float(DEFAULTS["agent_min_confidence"])
     return {
         "simulation_mode": is_simulation_mode(db=db),
+        "simulation_source": setting_source("simulation_mode", db=db),
+        "nvd_mode": "api_key" if is_configured("nvd_api_key", db=db) else "keyless",
         "hotl_enabled": hotl_effective(db),  # as applied, not the raw switch
         "integrations": {
             "virustotal": is_configured("virustotal_api_key", db=db),
             "abuseipdb": is_configured("abuseipdb_api_key", db=db),
             "otx": is_configured("otx_api_key", db=db),
             "threatfox": is_configured("threatfox_api_key", db=db),
-            "nvd": is_configured("nvd_api_key", db=db),
+            "nvd": is_configured("nvd_api_key", db=db),  # key saved; NVD also answers keyless (see nvd_mode)
             "wazuh": is_configured("siem_manager_url", "siem_user", "siem_password", db=db),
             "okta": is_configured("okta_domain", "okta_api_token", db=db),
             "jira": is_configured("jira_base_url", "jira_email", "jira_api_token", "jira_project_key", db=db)
@@ -474,7 +477,7 @@ def _result(service: str, status: str, health: str, message: str,
 
 
 def _probe(service: str, method: str, url: str, ok: Optional[Callable[[httpx.Response], Optional[bool]]] = None,
-           verify: bool = True, guarded: bool = False, **kwargs) -> Dict[str, Any]:
+           verify: Union[bool, str] = True, guarded: bool = False, **kwargs) -> Dict[str, Any]:
     """Make one read-only request and classify the outcome without guessing.
 
     `guarded` (used for any URL that did not come from the stored settings) connects only to public
@@ -608,11 +611,13 @@ def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict
 
     if service == "nvd":
         key = setting("nvd_api_key", override_key)
-        if not key:
-            return _result(service, NOT_CONFIGURED, "No API key",
-                           "No NVD API key is set. NVD can still be queried without one at a much lower rate limit.")
+        keyless = not key
         result = _probe(service, "GET", "https://services.nvd.nist.gov/rest/json/cves/2.0",
-                        params={"cveId": "CVE-2021-44228"}, headers={"apiKey": key})
+                        params={"cveId": "CVE-2021-44228"}, headers={} if keyless else {"apiKey": key})
+        if keyless:
+            if result["status"] == CONNECTED:
+                result["message"] = "Connected without an API key (NVD allows 5 requests per 30 s keyless; a free key allows 50)."
+            return result
         if result["http_status"] == 404:
             result.update(status=AUTH_FAILED, is_connected=False,
                           message="NVD returned HTTP 404 for a known CVE, which is how it rejects an invalid API key.")
@@ -639,7 +644,8 @@ def _test_service(service: str, req: TestConnectionRequest, db: Session) -> Dict
             user, password = setting("siem_user", override_user), setting("siem_password", override_key)
         if not (base and user and password):
             return not_configured("siem_manager_url (http/https), siem_user and siem_password")
-        verify = get_bool("siem_verify_tls", db=db)
+        bundle = (setting("wazuh_ca_bundle", "") or "").strip()
+        verify = bundle if bundle and os.path.isfile(bundle) else get_bool("siem_verify_tls", db=db)
         return _probe(service, "POST", f"{base}/security/user/authenticate", auth=(user, password), verify=verify,
                       guarded=overridden)
 

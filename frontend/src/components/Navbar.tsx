@@ -134,19 +134,20 @@ export default function Navbar() {
         </div>
 
         {simulation && (
-          <div
-            className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-fuchsia-500/15 border border-fuchsia-500/40 text-fuchsia-300 text-xs font-black tracking-wider"
-            title="Simulation mode is ON: no response action is sent to any system, even where credentials are saved (actions are recorded as SIMULATED, nothing is changed on real systems, alerts are NOT contained). Threat-intel lookups are read-only and unaffected; lab fixtures answer for documentation IPs and demo IOCs. Turn simulation mode off in Configuration to act for real."
+          <Link
+            href="/configuration"
+            className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-fuchsia-500/15 border border-fuchsia-500/40 text-fuchsia-300 text-xs font-black tracking-wider hover:bg-fuchsia-500/25"
+            title="Click to open Configuration and switch to live mode. Simulation mode is ON: no response action is sent to any system, even where credentials are saved (actions are recorded as SIMULATED, nothing is changed on real systems, alerts are NOT contained). Threat-intel lookups are read-only and unaffected; lab fixtures answer for documentation IPs and demo IOCs. Turn simulation mode off in Configuration to act for real."
           >
             <FlaskConical className="h-3.5 w-3.5" aria-hidden="true" />
             <span>SIMULATION MODE</span>
-          </div>
+          </Link>
         )}
 
         {statusError && (
           <div
             role="alert"
-            className="hidden lg:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-slate-900 border border-amber-500/30 text-amber-300 text-xs"
+            className="flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-slate-900 border border-amber-500/30 text-amber-300 text-xs"
             title={statusError}
           >
             <AlertCircle className="h-3.5 w-3.5" aria-hidden="true" />

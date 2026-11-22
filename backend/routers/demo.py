@@ -178,7 +178,7 @@ def seed_demo_data(db: Session = Depends(get_db), current_user: User = Depends(r
         "message": (
             f"Playbook catalogue ready ({playbook_count} playbooks); ran {len(seeded)} lab alerts through the "
             "real ingestion pipeline. Threat-intel results are simulation-mode lab fixtures; connector "
-            "actions are simulated unless the connector is configured."
+            "actions are always simulated while simulation mode is ON."
             + (" Enrichment and playbook runs continue in the background worker; refresh the alert list shortly."
                if any(s["enrichment_pending"] for s in seeded) else "")
         ),

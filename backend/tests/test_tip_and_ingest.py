@@ -432,11 +432,11 @@ def test_demo_seed_refused_outside_simulation_mode(client, admin_headers):
 
 # -- NVD --------------------------------------------------------------------------------
 
-def test_nvd_without_key_reports_not_configured_and_infers_nothing():
+def test_nvd_failure_without_key_reports_unavailable_and_infers_nothing():
     nvd = NationalVulnerabilityDatabase(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
     assert nvd.extract_cves_from_text("cve-2021-44228 then CVE-2024-3094 and CVE-2021-44228") == ["CVE-2021-44228", "CVE-2024-3094"]
     detail = nvd.get_vulnerability_details("CVE-2024-3094")
-    assert detail["status"] == "not_configured" and detail["cvss_score"] is None and detail["hotl_action"] == "none"
+    assert detail["status"] == "unavailable" and detail["cvss_score"] is None and detail["hotl_action"] == "none"
 
     # Keywords such as "log4j" or a High severity never produce a CVE.
     analysis = nvd.analyze_alert_vulnerabilities({"rule_id": "x", "severity": "Critical", "raw_payload": {"full_log": "log4j jndi backdoor"}})

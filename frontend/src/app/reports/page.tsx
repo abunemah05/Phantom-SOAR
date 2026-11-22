@@ -465,13 +465,18 @@ export default function AdminReportsPage() {
 
         <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
           <div className="flex items-center justify-between text-slate-400 text-xs font-medium mb-1">
-            <span>Containment Executions</span>
+            <span>Live Containment Executions</span>
             <ShieldCheck className="h-4 w-4 text-emerald-400" />
           </div>
           <div className="text-2xl font-black text-emerald-400">
-            {report?.total_containment_actions ?? 0}
+            {report?.containment_by_mode?.live ?? 0}
           </div>
-          <span className="text-[11px] text-slate-500 mt-1 block">Response actions recorded (live and simulated)</span>
+          <span className="text-[11px] text-slate-500 mt-1 block">
+            Confirmed by the connector. All records: {report?.total_containment_actions ?? 0}
+            {report?.containment_by_mode
+              ? ` (${Object.entries(report.containment_by_mode).filter(([m]) => m !== "live").map(([m, n]) => `${m} ${n}`).join(", ") || "none other"})`
+              : ""}
+          </span>
         </div>
 
         <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">

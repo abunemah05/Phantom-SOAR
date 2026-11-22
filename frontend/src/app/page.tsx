@@ -119,11 +119,16 @@ export default function DashboardPage() {
             <h1 className="text-2xl font-black text-white tracking-tight">Phantom SOAR Mission Control</h1>
             {runtime &&
               (simulationMode ? (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-fuchsia-500/20 text-fuchsia-300 font-bold border border-fuchsia-500/30 flex items-center gap-1">
+                <Link href="/configuration" title="Open Configuration to switch to live mode" className="text-xs px-2 py-0.5 rounded-full bg-fuchsia-500/20 text-fuchsia-300 font-bold border border-fuchsia-500/30 flex items-center gap-1 hover:bg-fuchsia-500/30">
                   <FlaskConical className="h-3 w-3" aria-hidden="true" /> SIMULATION
-                </span>
+                </Link>
               ) : (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold border border-emerald-500/30">LIVE CONNECTORS ONLY</span>
+                <Link href="/configuration" title="Response actions act on real systems through the connectors that have credentials" className="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-bold border border-emerald-500/30 hover:bg-emerald-500/30">
+                  {(() => {
+                    const n = ["wazuh", "okta", "jira", "slack"].filter((k) => runtime?.integrations?.[k]).length;
+                    return `LIVE (${n}/4 response connectors configured)`;
+                  })()}
+                </Link>
               ))}
           </div>
           <p className="text-sm text-slate-400 max-w-2xl leading-relaxed">

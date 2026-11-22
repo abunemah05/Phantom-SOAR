@@ -371,7 +371,7 @@ def execute_cve_hotl_action(
         create_playbook_execution(
             db, alert_id=alert.alert_id, playbook_id=None,
             status="Completed (NVD response, simulated)" if simulated else "Completed (NVD response)",
-            mttr_seconds=runner.elapsed_seconds_since(alert.created_at),
+            mttr_seconds=0.0 if simulated else runner.elapsed_seconds_since(alert.created_at),
         )
     _log_analyst_action(db, alert, current_user.username, "nvd_response", f"{action} via NVD recommendation",
                         f"{len(executed)} of {len(records)} target(s) executed")

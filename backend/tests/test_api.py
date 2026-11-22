@@ -250,6 +250,8 @@ def test_runtime_status_shape(client, admin_headers):
                                          "ai"}
     assert all(isinstance(v, bool) for v in data["integrations"].values())
     assert not any(data["integrations"].values())  # tests run with no third-party credentials
+    assert data["nvd_mode"] == "keyless"  # NVD still answers without a key
+    assert data["simulation_source"] in ("database", "environment", "default")
 
 
 def _save_config(client, headers, **values):

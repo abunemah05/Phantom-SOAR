@@ -259,17 +259,21 @@ def test_multi_tip_aggregation_and_sources(client, admin_headers):
     assert bg_res.json()["alert_id"] == first_id
 
 
-def test_nvd_integration_and_hotl_execution(client, admin_headers):
+def test_nvd_integration_and_hotl_execution(client, admin_headers, monkeypatch):
+    import httpx
     from backend.integrations.nvd import nvd_client
+
+    # No real network in tests: NVD "is down", so no CVSS may be invented.
+    monkeypatch.setattr(nvd_client, "transport", httpx.MockTransport(lambda r: httpx.Response(500)))
 
     # 1. Test CVE extraction & knowledgebase lookup
     cves = nvd_client.extract_cves_from_text("Detected exploit attempt targeting CVE-2024-3094 in sshd process")
     assert "CVE-2024-3094" in cves
 
-    # No NVD key in tests: no live lookup, and no CVSS is invented.
+    # NVD unreachable: the failure is reported honestly and no CVSS is invented.
     cve_details = nvd_client.get_vulnerability_details("CVE-2024-3094")
     assert cve_details["cve_id"] == "CVE-2024-3094"
-    assert cve_details["status"] == "not_configured"
+    assert cve_details["status"] == "unavailable"
     assert cve_details["cvss_score"] is None
     assert len(cve_details["hitl_remediation"]) >= 2
     assert cve_details["hotl_action"] == "none"

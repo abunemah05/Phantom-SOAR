@@ -226,6 +226,20 @@ def test_execute_action_skipped_when_simulation_off(settings, db, alert):
     assert record.execution_mode == "skipped"
 
 
+def test_lab_demo_alert_never_drives_real_systems_when_simulation_is_off(settings, db, alert, monkeypatch):
+    settings["simulation_mode"] = "false"
+    alert.source = "Wazuh SIEM (lab simulation)"
+    db.commit()
+
+    def boom(*args, **kwargs):
+        raise AssertionError("a connector must not be contacted for a lab demo alert")
+
+    monkeypatch.setattr(actions, "_dispatch", boom)
+    record = execute_action(db, alert, "isolate_endpoint", "srv-prod-db01")
+    assert record.status == "Failed" and record.execution_mode == "failed"
+    assert "lab demo alert" in json.dumps(record.details if hasattr(record, "details") else record.__dict__, default=str)
+
+
 def test_execute_action_live_uses_alert_agent_id(settings, db, alert, monkeypatch):
     settings["simulation_mode"] = "false"  # live execution only happens with simulation mode off
     settings.update({"siem_manager_url": "https://wazuh.test:55000", "siem_user": "u", "siem_password": "p"})

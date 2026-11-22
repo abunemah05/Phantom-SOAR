@@ -36,3 +36,19 @@
 <active-response><disabled>no</disabled><command>phantom-block-ip</command>       <location>local</location><rules_id>999999</rules_id></active-response>
 <active-response><disabled>no</disabled><command>phantom-unblock-ip</command>     <location>local</location><rules_id>999999</rules_id></active-response>
 <active-response><disabled>no</disabled><command>phantom-rate-limit</command>     <location>local</location><rules_id>999999</rules_id></active-response>
+
+<!--
+  ALERT FORWARDER (Wazuh -> Phantom SOAR). This is what makes real alerts arrive in Phantom.
+  1. Copy wazuh/manager/custom-phantom to /var/ossec/integrations/custom-phantom on the MANAGER:
+       install -o root -g wazuh -m 750 custom-phantom /var/ossec/integrations/custom-phantom
+  2. Create an ingest token on the Phantom Accounts page and put it in <api_key>.
+  3. Put this block in /var/ossec/etc/ossec.conf (inside <ossec_config>) and run `systemctl restart wazuh-manager`.
+  <name> must start with "custom-". <level> is the minimum rule level to forward (5 = medium and up).
+-->
+<integration>
+  <name>custom-phantom</name>
+  <hook_url>https://YOUR-PHANTOM-HOST/api/webhooks/wazuh</hook_url>
+  <api_key>PASTE_PHANTOM_INGEST_TOKEN_HERE</api_key>
+  <level>5</level>
+  <alert_format>json</alert_format>
+</integration>

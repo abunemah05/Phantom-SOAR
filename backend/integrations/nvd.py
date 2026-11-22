@@ -137,8 +137,10 @@ class NationalVulnerabilityDatabase:
             "queried_at": _now_iso(),
         }
 
-    def query_nvd_api(self, cve_id: str, api_key: str) -> Dict[str, Any]:
-        headers = {"apiKey": api_key, "Accept": "application/json"}
+    def query_nvd_api(self, cve_id: str, api_key: str = "") -> Dict[str, Any]:
+        headers = {"Accept": "application/json"}
+        if api_key:  # keyless requests are allowed by NVD at 5 requests / rolling 30 s
+            headers["apiKey"] = api_key
         try:
             with httpx.Client(timeout=httpx.Timeout(self.timeout, connect=3.0), transport=self.transport) as client:
                 resp = client.get(self.BASE_URL, params={"cveId": cve_id}, headers=headers)
@@ -149,6 +151,9 @@ class NationalVulnerabilityDatabase:
 
         if resp.status_code == 404:
             return self._base_record(cve_id, "not_found")
+        if resp.status_code == 403 and not api_key:  # NVD answers 403 when the keyless budget is used up
+            self._limiter.block(30)
+            return self._base_record(cve_id, "rate_limited", "NVD keyless rate limit reached (HTTP 403); add an API key", 30)
         if resp.status_code in (401, 403):
             return self._base_record(cve_id, "unavailable", f"NVD rejected the request (HTTP {resp.status_code}); check the API key or rate limit")
         if resp.status_code == 429:
@@ -228,13 +233,13 @@ class NationalVulnerabilityDatabase:
             if cached:
                 return cached
 
-        api_key = integration_config.get_setting("nvd_api_key", db=db)
-        if not api_key:
-            return self._base_record(cve_id, "not_configured", "NVD API key is not configured; no live lookup was made")
+        api_key = integration_config.get_setting("nvd_api_key", db=db)  # may be "": NVD allows keyless use
         if not allow_live:
             return self._base_record(cve_id, "pending", "not cached yet; a background refresh will fetch it")
 
         per_window = _num(integration_config.get_setting("nvd_requests_per_30s", db=db, default="45"), 45, int)
+        if not api_key:
+            per_window = min(per_window, 5)  # NVD keyless budget: 5 per rolling 30 s
         max_wait = _num(integration_config.get_setting("tip_max_wait_seconds", db=db, default="2"), 2.0, float)
         self._limiter.configure(per_window)
         allowed, wait = self._limiter.acquire(max_wait=max_wait)
@@ -246,6 +251,7 @@ class NationalVulnerabilityDatabase:
             time.sleep(wait)
 
         record = self.query_nvd_api(cve_id, api_key)
+        record["auth"] = "api_key" if api_key else "keyless"
         if record["status"] in ("live", "not_found"):
             self._cache_put(cve_id, record)
         return record
