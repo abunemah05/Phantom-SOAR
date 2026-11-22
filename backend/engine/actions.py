@@ -333,7 +333,7 @@ def _default_ticket_text(alert: Alert) -> Dict[str, str]:
         lines.extend(
             f"- {i.artifact_type} {i.value}: verdict {i.verdict or 'Unknown'} (score {i.threat_score})" for i in iocs
         )
-    actions = list(alert.containment_actions or [])
+    actions = [a for a in (alert.containment_actions or []) if a.execution_mode != "simulated"]  # rehearsals are not shown to ticket readers
     if actions:
         lines.append("Response actions so far:")
         lines.extend(
