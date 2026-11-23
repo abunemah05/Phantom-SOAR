@@ -178,6 +178,25 @@ def setting_source(key_name: str, db: Optional[Session] = None) -> Optional[str]
     return "default" if DEFAULTS.get(key_name) else None
 
 
+def log_setting_sources() -> None:
+    """One start-up log line per source with the NAMES of settings that are set (never values), so a user can
+    see at once whether the keys they put in .env or on the Configuration page were picked up."""
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    try:
+        with SessionLocal() as session:
+            for key in INTEGRATION_KEYS:
+                source = setting_source(key, db=session)
+                if source in ("database", "environment"):
+                    grouped[source].append(key)
+    except Exception as exc:  # never block start-up on a diagnostics line
+        logger.warning(f"Could not summarise settings sources: {exc}")
+        return
+    for source in ("environment", "database"):
+        names = ", ".join(sorted(grouped[source])) or "none"
+        logger.info(f"Settings from {source}: {names}")
+
+
 def get_bool(key_name: str, db: Optional[Session] = None) -> bool:
     return get_setting(key_name, db=db).lower() in _TRUE
 

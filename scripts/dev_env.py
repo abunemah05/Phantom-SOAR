@@ -29,8 +29,23 @@ def parse_env_file(path):
     """KEY -> value for every usable line; invalid lines are reported on stderr and skipped."""
     values = {}
     try:
-        text = path.read_text(encoding="utf-8-sig")
+        raw_bytes = path.read_bytes()
     except OSError:
+        return values
+    # Notepad's "Unicode" option saves UTF-16; accept it (and a UTF-8 BOM) instead of crashing the launcher.
+    if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings = ("utf-16",)
+    else:
+        encodings = ("utf-8-sig", "cp1252")
+    text = None
+    for encoding in encodings:
+        try:
+            text = raw_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        print(f"[dev] WARNING: {path.name} could not be read (save it as plain UTF-8 text); its values were ignored", file=sys.stderr)
         return values
     for number, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
@@ -84,6 +99,8 @@ def main():
     env_file = parse_env_file(ROOT / ".env")
     if env_file:
         print(f"[dev] loaded {len(env_file)} value(s) from .env", file=sys.stderr)
+    elif not (ROOT / ".env").exists() and (ROOT / ".env.txt").exists():
+        print("[dev] WARNING: found .env.txt but no .env. Rename it to exactly .env (Windows added .txt); its values were NOT loaded.", file=sys.stderr)
 
     def effective(name):
         return os.environ.get(name) or env_file.get(name) or ""
