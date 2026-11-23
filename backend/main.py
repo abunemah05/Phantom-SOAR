@@ -108,6 +108,7 @@ async def lifespan(app: FastAPI):
     errors = integration_config.production_safety_errors()
     if errors:
         raise RuntimeError("Refusing to start: " + "; ".join(errors))
+    integration_config.log_setting_sources()
     yield
     logger.info("Shutting down Phantom SOAR platform.")
 
